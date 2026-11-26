@@ -349,6 +349,15 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange`: VGPR values the same in every lane of a console wave that holds them
+    /// ([`super::wave_same`]), where not every lane may run; a first-lane read of one is this host
+    /// wave's own.
+    wave_same: HashSet<Value>,
+    /// [`with_live_entry`]: EXEC on entry holds the group's started threads.
+    live: bool,
+    /// With `live`: this thread started, and the started lanes of its console wave as the EXEC
+    /// words (low, high), made in the entry block.
+    live_words: Option<(V, V, V)>,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -587,7 +596,18 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 }
                 _ => true,
             });
-            if alike {
+            // and every VGPR value it reads beyond the named operands: the old value of a
+            // destination it writes only in part (16-bit halves, SDWA, v_fma_mix, v_swap's second
+            // result, M0-relative moves) and accumulators
+            let whole = matches!(&inst.fields, Fields::Valu(v) if v.sdwa.is_none() && v.opsel & 8 == 0)
+                && !["mac", "fma_mix", "swap", "movrel", "16"].iter().any(|k| name.contains(k));
+            let old: Vec<Value> = if whole {
+                inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).filter_map(|w| inst.read(w.0)).collect()
+            } else {
+                Vec::new()
+            };
+            let rest = inst.reads.iter().all(|&(r, x)| !matches!(r, Reg::V(_)) || old.contains(&x) || same.contains(&x));
+            if alike && rest {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
             }
         }
@@ -1043,6 +1063,37 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_live_entry`].
+    static LIVE_ENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the program lowered for its group's started threads alone in EXEC on entry
+/// (structured by [`crate::structure::structure_live`]): a dispatch counted in threads whose
+/// last group is short (`USER_DISPATCH_THREADS_X`). Instead of the threads past the count
+/// leaving at once ([`lower_with_thread_limit`]'s `partial`), every thread runs the program
+/// with EXEC on entry holding the console wave's started lanes – the first ones, up to the
+/// count – as the console's does: vector instructions keep it as their guard, branches on EXEC
+/// leave the other lanes behind, and whole-wave sections (`s_or_saveexec_b64 -1`) take them in
+/// as the console's take in its idle lanes. So a console wave run as two host waves of 32 still
+/// has both halves at every meeting (a group barrier), where threads that had left would be
+/// missing.
+pub(super) fn with_live_entry<R>(f: impl FnOnce() -> R) -> R {
+    let was = LIVE_ENTRY.replace(true);
+    let r = f();
+    LIVE_ENTRY.set(was);
+    r
+}
+
+/// Whether [`with_live_entry`] is in force on this thread.
+pub(super) fn live_entry() -> bool {
+    LIVE_ENTRY.get()
+}
+
+/// `VICTORY_WAVE_LIVE=0`: short groups of console wave64 programs on 32-lane hosts are not
+/// lowered with their started lanes in EXEC ([`with_live_entry`]); they keep 64-lane waves.
+pub(super) fn live_entry_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_LIVE").is_none_or(|v| v != "0"))
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1158,6 +1209,13 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     let result = translate();
     FIRST_HALF_PAIRS.set(before);
     result
+}
+
+/// `VICTORY_WAVE_SAME=0` turns off [`super::wave_same`]: a first-lane read of a value the same
+/// in every lane of the console wave, where the two host waves cannot meet, is refused again.
+fn wave_same_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_SAME").is_none_or(|v| v != "0"))
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -1607,6 +1665,15 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // values the same in every lane of a console wave, for first-lane reads where the two
+        // host waves cannot meet (`super::wave_same`)
+        let wave_same = match (&exchange, s.threads) {
+            (Some((_, false, _)), Some(threads)) if !LOCAL_WAVES.get() && x.native.wave64 && wave_same_on() => {
+                let tid = x.io.inputs.iter().find(|i| matches!(i.1, Input::ThreadIdInGroup(0))).map(|i| i.0);
+                super::wave_same::wave_same(p, x.st, threads, lane_regions(x.st).as_deref(), tid)
+            }
+            _ => HashSet::new(),
+        };
         Lower {
             s,
             x,
@@ -1681,6 +1748,9 @@ impl<'a> Lower<'a> {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
             },
+            wave_same,
+            live: LIVE_ENTRY.get(),
+            live_words: None,
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -2453,6 +2523,15 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                // the started lanes ([`with_live_entry`])
+                Reg::S(EXEC) if self.live => {
+                    let (_, lo, _) = self.live_words();
+                    Val::I32(lo)
+                }
+                Reg::S(n) if self.live && n == EXEC + 1 => {
+                    let (_, _, hi) = self.live_words();
+                    Val::I32(hi)
+                }
                 // Most programs only interpolate with them: loaded on first
                 // use as a value (`get`).
                 Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
@@ -4039,6 +4118,10 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // EXEC on entry with the started lanes alone: whether this thread started
+            Atom::Opaque(v) if self.live && self.x.p.inputs.iter().any(|&(r, x)| r == Reg::S(EXEC) && x == v) => {
+                Ok(self.live_words().0)
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -4108,6 +4191,58 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         self.s.m.bin(e, Bin::Add, base, lane)
+    }
+
+    /// [`with_live_entry`]: whether this thread started (its index in the dispatch below
+    /// `USER_DISPATCH_THREADS_X`, or that count 0: every thread), and the started lanes of its
+    /// console wave – the first `r` (0..=64) – as two EXEC words. Made in the entry block. A
+    /// group's threads in one row (one dimension); a console wave is 64 consecutive ones.
+    fn live_words(&mut self) -> (V, V, V) {
+        if let Some(w) = self.live_words {
+            return w;
+        }
+        let e = self.s.entry;
+        let width = self.s.threads.expect("compute thread count")[0];
+        let limit = self.host_word(RootType::Other(super::USER_DISPATCH_THREADS_X), 0, width);
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else { unreachable!() };
+        let Val::I32(thread) = self.thread_id(0) else { unreachable!() };
+        let m = &mut self.s.m;
+        let (zero, one) = (m.i32(0), m.i32(1));
+        let (k31, k32, k64, ones, low6) = (m.i32(31), m.i32(32), m.i32(64), m.i32(u32::MAX), m.i32(!63));
+        let w = m.i32(width);
+        let first = m.bin(e, Bin::Mul, group, w);
+        let x = m.bin(e, Bin::Add, first, thread);
+        let unlimited = m.cmp(e, pred::EQ, limit, zero);
+        let inside = m.cmp(e, pred::IULT, x, limit);
+        let started = m.bin(e, Bin::Or, unlimited, inside);
+        // r: the lanes of this console wave below the count
+        let wave = m.bin(e, Bin::And, thread, low6);
+        let wave_first = m.bin(e, Bin::Add, first, wave);
+        let none = m.cmp(e, pred::IULE, limit, wave_first);
+        let left = m.bin(e, Bin::Sub, limit, wave_first);
+        let all = m.cmp(e, pred::IUGE, left, k64);
+        // (past the count first: `left` wraps there and would read as a whole wave)
+        let r = m.select(e, all, k64, left);
+        let r = m.select(e, none, zero, r);
+        let r = m.select(e, unlimited, k64, r);
+        // low word: r >= 32 ? all : (1 << r) - 1
+        let rl = m.bin(e, Bin::And, r, k31);
+        let bit = m.bin(e, Bin::Shl, one, rl);
+        let below = m.bin(e, Bin::Sub, bit, one);
+        let lo_all = m.cmp(e, pred::IUGE, r, k32);
+        let lo = m.select(e, lo_all, ones, below);
+        // high word: r >= 64 ? all : r > 32 ? (1 << (r - 32)) - 1 : 0
+        let rh = m.bin(e, Bin::Sub, r, k32);
+        let rh = m.bin(e, Bin::And, rh, k31);
+        let bit = m.bin(e, Bin::Shl, one, rh);
+        let below = m.bin(e, Bin::Sub, bit, one);
+        let hi_some = m.cmp(e, pred::IUGT, r, k32);
+        let hi = m.select(e, hi_some, below, zero);
+        let hi_all = m.cmp(e, pred::IUGE, r, k64);
+        let hi = m.select(e, hi_all, ones, hi);
+        let words = (started, lo, hi);
+        self.live_words = Some(words);
+        words
     }
 
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
@@ -8787,9 +8922,13 @@ impl<'a> Lower<'a> {
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
-                    Some(&Operand::Vector { reg, .. }) => {
-                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
-                    }
+                    Some(&Operand::Vector { reg, .. }) => inst
+                        .read(Reg::V(reg))
+                        // (`wave_same` only where the host waves cannot meet: elsewhere the exchange
+                        // is exact and stays)
+                        .is_some_and(|x| {
+                            self.uniform.contains(&x) || !self.all_lanes(self.cur_ir) && self.wave_same.contains(&x)
+                        }),
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;

@@ -111,6 +111,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod wave_same;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -429,6 +430,16 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// XboxBvhBuilder's Box32/16 rehydration kernels encode one header per *active* thread of the
+/// group. Their last group can be short.
+fn box_rehydration(c: &Container, native: &NativeProgram) -> bool {
+    matches!(
+        u128::from_be_bytes(c.digest),
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
+            | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1])
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -440,6 +451,33 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // A program whose last group can be short, on a host of 32-lane waves: its threads past the
+    // count kept in the program with EXEC holding only the started lanes, as on the console
+    // ([`lower::with_live_entry`]), so that the two host waves of a console wave can meet.
+    if lower::live_entry_on()
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+        && box_rehydration(c, native)
+    {
+        let live = structure::structure_live(p).and_then(|st| {
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            lower::take_needs();
+            lower::with_live_entry(|| emit_program(c, native, p, &st, io, &res))
+        });
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &live {
+                Ok((_, wave)) => eprintln!("WAVE64-LIVE started lanes in EXEC: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-LIVE started lanes in EXEC: {e}"),
+            }
+        }
+        if let Ok((shader, wave)) = live
+            && wave != Some(64)
+        {
+            return Ok(shader);
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every

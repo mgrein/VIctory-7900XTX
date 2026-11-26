@@ -469,8 +469,24 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
+    structure_from(program, wide, false)
+}
+
+/// [`structure`] of a program whose waves may start with lanes outside EXEC: a group shorter
+/// than its declared size (the last of a dispatch counted in threads) launches only its first
+/// threads, and the console's EXEC holds only those. EXEC on entry is then the lane's bit of
+/// the EXEC the program starts with ([`Atom::Opaque`] of its low dword), not every lane:
+/// each vector instruction keeps it as a guard, and branches on EXEC leave the lanes outside
+/// it behind, as the console's do – while those lanes still run the program's every-lane
+/// blocks, where the halves of a console wave run as two host waves meet.
+pub fn structure_live(program: &Program) -> Result<Structured, ShaderError> {
+    structure_from(program, &HashSet::new(), true)
+}
+
+fn structure_from(program: &Program, wide: &HashSet<usize>, live_entry: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
+    l.live_entry = live_entry;
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -537,6 +553,8 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// EXEC on entry is the lanes the program started with, not every lane ([`structure_live`]).
+    live_entry: bool,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -617,6 +635,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            live_entry: false,
         })
     }
 
@@ -647,7 +666,12 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            let entry = if self.live_entry {
+                self.b.atom(Atom::Opaque(lo), 0)
+            } else {
+                Bool::TRUE
+            };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =

@@ -736,3 +736,370 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+/// the second console wave takes; inside it, a first-lane read of `(s0 + wave) << 3`, the same in
+/// every lane of that wave, where the two host waves cannot meet. `v_mbcnt` (stored past the
+/// first 128 dwords) makes the program read lanes. `read`: the VGPR the first-lane read takes
+/// (9: the wave's value; 1: the lane's number).
+fn wave_number_program(read: u8) -> NativeProgram {
+    native_of(
+        &[
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xD765_0001, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0xD766_0001, 0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+            0x4A06_04FF, 0x0000_0200, // v_add_nc_u32 v3, 0x200, v2
+            0xE070_1000, 0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+            0xBE8C_047E, // s_mov_b64 s[12:13], exec
+            0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+            0xBF88_0006, // s_cbranch_execz to the restore
+            0x4A12_0E00, // v_add_nc_u32 v9, s0, v7
+            0x3412_1283, // v_lshlrev_b32 v9, 3, v9
+            0x7E0C_0500 | 0x100 | u32::from(read), // v_readfirstlane_b32 s6, v<read>
+            0x7E14_0206, // v_mov_b32 v10, s6
+            0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+            0xBEFE_040C, // restore: s_mov_b64 exec, s[12:13]
+        ],
+        true,
+        128,
+    )
+}
+
+#[test]
+fn a_first_lane_read_of_the_waves_number_needs_no_meeting() {
+    let native = wave_number_program(9);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { eprintln!("no hardware compute device"); return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("hardware does not take this pipeline"); return;
+    };
+    for s0 in [0u32, 5, 1000] {
+        let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        for input in &shader.user_data {
+            if input.root == RootType::Constants && input.dword == 0 {
+                constants[input.index as usize] = s0;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &[View::RawUav(256)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("dispatch");
+        for t in 0..128usize {
+            let expected = if t < 64 { 0 } else { (s0 + 1) << 3 };
+            assert_eq!(out[0][t], expected, "s0 {s0}, thread {t}");
+            assert_eq!(out[0][128 + t], t as u32 & 63, "s0 {s0}, lane of thread {t}");
+        }
+    }
+    eprintln!("ran on the hardware device: a first-lane read of the wave's number inside its branch");
+}
+
+#[test]
+fn a_first_lane_read_of_the_lanes_number_still_needs_every_lane() {
+    let native = wave_number_program(1);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::take_needs();
+    let lowered = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&lowered, Err(ShaderError::Unsupported { what, .. }) if *what == "a first-lane read where not every lane runs"),
+        "{:?}",
+        lowered.err()
+    );
+}
+
+/// `lowered_for_dispatch` with the started lanes alone in EXEC on entry
+/// ([`lower::with_live_entry`]), for a host of 32-lane waves.
+fn lowered_live(native: &NativeProgram, p: &ir::Program) -> Result<HostShader, ShaderError> {
+    let st = structure::structure_live(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::with_live_entry(|| {
+        lower::lower(&lower::Parts {
+            native,
+            p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    })
+}
+
+#[test]
+fn a_short_group_keeps_its_idle_lanes_out_of_exec_in_two_host_waves() {
+    // The structure builder's code for a wave sum and an exclusive wave prefix sum of
+    // v10 = t + 1, whole-wave sections that zero the lanes outside the saved EXEC. Every started
+    // thread adds, at 16 t: the started lanes' count (`s_bcnt1` of EXEC), the wave's sum, its
+    // prefix, and its place among the started lanes + 1 (`v_mbcnt` of EXEC).
+    let native = native(&[
+        0x4A14_0081, // v_add_nc_u32 v10, 1, v0
+        0xBE94_107E, // s_bcnt1_i32_b64 s20, exec
+        // the sum, to s21
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001, 0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x4A02_02E9, 0xDE54_C101, // v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x4A02_02E9, 0x9360_1201, // v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x4A02_02E9, 0x0009_2401, // v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x4A02_02FA, 0xFF09_4001, // v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+        0xD760_0016, 0x0001_4101, // v_readlane_b32 s22, v1, 32
+        0x4A02_0216, // v_add_nc_u32 v1, s22, v1
+        0xD760_0015, 0x0001_0101, // v_readlane_b32 s21, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        // the exclusive prefix, to v4
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001, 0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x7E04_0301, // v_mov_b32 v2, v1
+        0x4A04_04FA, 0xFF09_1102, // v_add_nc_u32 v2, v2, v2 row_shr:1 bound_ctrl:1
+        0x4A04_04FA, 0xFF01_1202, // v_add_nc_u32 v2, v2, v2 row_shr:2
+        0x4A04_04FA, 0xFF01_1402, // v_add_nc_u32 v2, v2, v2 row_shr:4
+        0x4A04_04FA, 0xFF01_1802, // v_add_nc_u32 v2, v2, v2 row_shr:8
+        0xBEFE_03FF, 0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xBEFF_03FF, 0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+        0xD778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+        0xD760_0016, 0x0001_3F02, // v_readlane_b32 s22, v2, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4A04_0416, // v_add_nc_u32 v2, s22, v2
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4C04_0302, // v_sub_nc_u32 v2, v2, v1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E08_0302, // v_mov_b32 v4, v2
+        // the stores
+        0x340E_0084, // v_lshlrev_b32 v7, 4, v0
+        0x7E06_0214, // v_mov_b32 v3, s20
+        0xE0C8_1000, 0x8002_0307, // buffer_atomic_add v3, v7, s[8:11], 0 offen
+        0x7E0C_0215, // v_mov_b32 v6, s21
+        0xE0C8_1004, 0x8002_0607, // buffer_atomic_add v6, v7, s[8:11], 0 offen offset:4
+        0xE0C8_1008, 0x8002_0407, // buffer_atomic_add v4, v7, s[8:11], 0 offen offset:8
+        0xD765_0001, 0x0001_007E, // v_mbcnt_lo_u32_b32 v1, exec_lo, 0
+        0xD766_0001, 0x0002_027F, // v_mbcnt_hi_u32_b32 v1, exec_hi, v1
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xE0C8_100C, 0x8002_0107, // buffer_atomic_add v1, v7, s[8:11], 0 offen offset:12
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_live(&native, &p).expect("lower");
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .expect("the thread count is read");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { eprintln!("no hardware compute device"); return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("a pipeline of 32-lane waves");
+    for count in [0u32, 1, 7, 31, 32, 33, 63, 64, 65, 74, 96, 127, 128] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &[View::RawUav(256)],
+            samplers: &[],
+            groups: [2, 1, 1],
+        }).expect("dispatch");
+        let mut expected = [0u32; 256];
+        for g in 0..2u32 {
+            let r = if count == 0 { 64 } else { count.saturating_sub(64 * g).min(64) };
+            for t in 0..r {
+                let at = t as usize * 4;
+                expected[at] += r;
+                expected[at + 1] += r * (r + 1) / 2;
+                expected[at + 2] += t * (t + 1) / 2;
+                expected[at + 3] += t + 1;
+            }
+        }
+        assert_eq!(out[0][..256], expected[..], "count {count}");
+    }
+    eprintln!("ran on the hardware device: short groups in two host waves with their idle lanes out of EXEC");
+}
+
+// ---- first-lane reads of values that differ between lanes (an adversarial review's probes):
+// each must be refused, or give the console's value in every thread ----
+
+fn probe_run(name: &str, words: &[u32], expected: u32) {
+    let native = native_of(words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::take_needs();
+    let shader = match lowered(&native, &p, &HashSet::new()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{name}: refused: {e:?}");
+            return;
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { eprintln!("{name}: no hardware compute device"); return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("{name}: hardware does not take this pipeline"); return;
+    };
+    let constants = vec![0; shader.user_data_dwords().max(1) as usize];
+    let out = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(constants))],
+        views: &[View::RawUav(256)],
+        samplers: &[],
+        groups: [1, 1, 1],
+    }).expect("dispatch");
+    let wrong: Vec<(usize, u32)> = (0..128usize).filter(|&t| out[0][t] != expected).map(|t| (t, out[0][t])).collect();
+    assert!(wrong.is_empty(), "{name}: expected {expected:#x} everywhere; {} threads differ; first: {:x?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+}
+
+const MBCNT_V1: [u32; 4] = [0xD765_0001, 0x0001_00C1, 0xD766_0001, 0x0002_02C1];
+
+/// every-lane block: v9 = float(lane); v_fmac_f32 v9, s0, v7 (v7 = tid >> 6); first lane of v9.
+#[test]
+fn first_lane_probe_fmac_accumulator_every_lane() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0x7E12_0D01, // v_cvt_f32_u32 v9, v1
+        0x5612_0E00, // v_fmac_f32 v9, s0, v7
+        0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+        0x7E14_0206, // v_mov_b32 v10, s6
+        0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+    ]);
+    probe_run("fmac every-lane", &w, 0);
+}
+
+/// the same inside the lane branch only the second console wave takes (not every lane runs).
+#[test]
+fn first_lane_probe_fmac_accumulator_in_branch() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0006, // s_cbranch_execz to the restore
+        0x7E12_0D01, // v_cvt_f32_u32 v9, v1
+        0x5612_0E00, // v_fmac_f32 v9, s0, v7
+        0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+        0x7E14_0206, // v_mov_b32 v10, s6
+        0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    // threads 0..63 store nothing (0); 64..127 store the first lane's 0.0
+    probe_run("fmac in branch", &w, 0);
+}
+
+/// bool hit = false; if (lane < 5) hit = true; first lane of (hit ? 1 : 0). Console: 1.
+#[test]
+fn first_lane_probe_mask_phi_divergent_join() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xBE8E_0480, // s_mov_b64 s[14:15], 0
+        0x7D88_0285, // v_cmp_gt_u32 vcc, 5, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz to the join
+        0x888E_7E0E, // s_or_b64 s[14:15], s[14:15], exec
+        0x88FE_0C7E, // join: s_or_b64 exec, exec, s[12:13]
+        0xD501_0009, 0x0039_0280, // v_cndmask_b32 v9, 0, 1, s[14:15]
+        0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+        0x7E14_0206, // v_mov_b32 v10, s6
+        0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+    ]);
+    probe_run("mask phi join", &w, 1);
+}
+
+/// found = false; for (i = 0; i < (lane >> 5); i++) found = true; first lane of (found ? 1 : 0).
+/// Console: lane 0 does no iteration: 0.
+#[test]
+fn first_lane_probe_mask_phi_loop_exit() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x2C06_0285, // v_lshrrev_b32 v3, 5, v1
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBE8E_0480, // s_mov_b64 s[14:15], 0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        // LOOP
+        0x7D82_0704, // v_cmp_lt_u32 vcc, v4, v3
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0003, // s_cbranch_execz EXIT
+        0x888E_7E0E, // s_or_b64 s[14:15], s[14:15], exec
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0xBF82_FFFA, // s_branch LOOP
+        // EXIT
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD501_0009, 0x0039_0280, // v_cndmask_b32 v9, 0, 1, s[14:15]
+        0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+        0x7E14_0206, // v_mov_b32 v10, s6
+        0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+    ]);
+    probe_run("mask phi loop", &w, 0);
+}
+
+const TAIL: [u32; 4] = [
+    0x7E0C_0509, // v_readfirstlane_b32 s6, v9
+    0x7E14_0206, // v_mov_b32 v10, s6
+    0xE070_1000, 0x8002_0A02, // buffer_store_dword v10, v2, s[8:11], 0 offen
+];
+
+/// v9 = lane; v_cvt_f16_f32 v9, s0 op_sel:[0,1] (high half written, low half kept).
+#[test]
+fn first_lane_probe_half_write_keeps_low() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E12_0301, // v_mov_b32 v9, v1
+        0xD58A_4009, 0x0000_0000, // v_cvt_f16_f32_e64 v9, s0 op_sel:[0,1]
+    ]);
+    w.extend_from_slice(&TAIL);
+    probe_run("cvt_f16 hi", &w, 0);
+}
+
+/// v9 = 0; v_swap_b32 v1, v9: v9 takes the lane.
+#[test]
+fn first_lane_probe_swap() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0x7E02_CB09, // v_swap_b32 v1, v9
+    ]);
+    w.extend_from_slice(&TAIL);
+    probe_run("swap", &w, 0);
+}
+
+/// v3 = 0, v4 = lane, m0 = 1: v_movrels_b32 v9, v3 reads v4.
+#[test]
+fn first_lane_probe_movrels() {
+    let mut w = MBCNT_V1.to_vec();
+    w.extend_from_slice(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_0301, // v_mov_b32 v4, v1
+        0xBEFC_0381, // s_mov_b32 m0, 1
+        0x7E12_8703, // v_movrels_b32 v9, v3
+    ]);
+    w.extend_from_slice(&TAIL);
+    probe_run("movrels", &w, 0);
+}
