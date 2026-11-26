@@ -140,9 +140,11 @@ pub(crate) enum C {
     /// (`crate::list::warm`).
     ListsMissed,
     ListsAhead,
-    /// Host lists that ran and did not go back to the pool: retired for
-    /// the size of a recording (`VICTORY_LIST_FAT`), dropped for a full
-    /// pool, and let go by the sweep after waiting unused.
+    /// Host lists that ran and recorded too much for the pool
+    /// (`VICTORY_LIST_FAT`: given a new allocator, or retired with
+    /// `VICTORY_LIST_FAT_SWAP=0`), and those that did not go back to the
+    /// pool: dropped for a full pool, and let go by the sweep after waiting
+    /// unused.
     ListsFat,
     ListsDropped,
     ListsAged,
@@ -1017,7 +1019,7 @@ fn log_memory() {
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, {} retired for their size, private bytes \
+         made by the host, {} preludes made for them, {} fat ones shrunk or retired, private bytes \
          grew {:.0} MB while lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
@@ -1474,7 +1476,7 @@ pub(crate) fn log(frames: f64) {
          putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms ({:.1} for an empty pool, {:.1} \
-         ahead of need; {:.1} retired fat, {:.1} dropped for a full pool, {:.1} let go idle; \
+         ahead of need; {:.1} fat (VICTORY_LIST_FAT), {:.1} dropped for a full pool, {:.1} let go idle; \
          preludes {:.1} made, {:.1} reused); {:.0} parts of held submissions \
          ran alone that the next part could have run with",
         ms(c[C::UntilRecordUs as usize]),

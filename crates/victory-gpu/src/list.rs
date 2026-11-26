@@ -282,6 +282,19 @@ fn list_fat() -> u32 {
     *FAT.get_or_init(|| std::env::var("VICTORY_LIST_FAT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16384))
 }
 
+/// Whether a fat host list ([`list_fat`]) that ran gets a new command
+/// allocator and goes back to the pool (on by default;
+/// `VICTORY_LIST_FAT_SWAP=0`: the whole list is retired, as before). Its
+/// allocator is what holds the big recording's memory; retiring the list
+/// with its prelude and buffers had the pool run short, and the lists made
+/// for it were made on the submitting thread (`Host::new_list` under
+/// `detach`, 8 % of it in profile x28, and their preludes 5 %).
+#[cfg(windows)]
+fn fat_swap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_FAT_SWAP").is_none_or(|v| v != "0"))
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -358,15 +371,18 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // A list that once recorded a big frame: its allocators keep that
-        // memory for good ([`list_fat`]).
+        // memory for good ([`list_fat`]). It gets a new allocator here, on
+        // the thread that lets go of landed lists ([`fat_swap`]), or goes.
         let fat = list_fat();
         if fat > 0 && host.list.recorded_most() > fat {
             LISTS_FAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::ListsFat, 1);
-            host.give_back_buffers();
-            crate::host::retire(host);
-            continue;
+            if !(fat_swap() && host.new_allocator()) {
+                host.give_back_buffers();
+                crate::host::retire(host);
+                continue;
+            }
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay (and with [`pool_closed`] the list

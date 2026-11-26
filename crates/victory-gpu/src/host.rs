@@ -6884,6 +6884,36 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
+    /// For a closed list that ran, whose command allocator kept the memory
+    /// of a big recording (`crate::list::recycle`, `VICTORY_LIST_FAT`): a
+    /// new allocator takes its place and the old one is retired
+    /// ([`retire`]), so the list shrinks and stays, with its prelude and
+    /// buffers, where the whole list was retired and another made for the
+    /// pool. The list is reset onto the new allocator and closed again,
+    /// recording nothing. `false` (nothing changed) if no allocator could
+    /// be made.
+    pub(crate) fn new_allocator(&mut self) -> bool {
+        let Some(host) = host() else {
+            return false;
+        };
+        // SAFETY: plain object creation.
+        let Ok(allocator) =
+            (unsafe { host.device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT) })
+        else {
+            return false;
+        };
+        let old = std::mem::replace(&mut self.allocator, allocator);
+        // SAFETY: the list is closed and not executing (it ran); the new
+        // allocator is no other list's.
+        let moved = unsafe { self.list.Reset(&self.allocator, None).and_then(|()| self.list.Close()) };
+        if let Err(e) = moved {
+            fail(format_args!("a host command list did not move to a new allocator ({e})"));
+        }
+        retire(old);
+        self.list.forget_most();
+        true
+    }
+
     /// The bookkeeping of [`HostList::reset`] and [`HostList::let_go_recording`].
     fn forget_recording(&self) {
         self.changed_something();
@@ -10613,6 +10643,30 @@ mod list_buffer_tests {
         list.let_go_recording();
         list.reset();
         list.close();
+    }
+
+    /// A list that ran moves to a new allocator: it forgets its biggest
+    /// recording, stays closed, and records and runs again.
+    #[test]
+    fn a_fat_list_moves_to_a_new_allocator() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let mut list = host.new_list().expect("a host list");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        assert!(list.list.recorded_most() > 0);
+        let old = list.allocator.as_raw();
+        assert!(list.new_allocator());
+        assert_ne!(list.allocator.as_raw(), old, "a new allocator");
+        assert_eq!(list.list.recorded_most(), 0, "nothing recorded on it yet");
+        list.let_go_recording();
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
     }
 }
 

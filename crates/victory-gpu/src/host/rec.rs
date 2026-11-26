@@ -98,6 +98,13 @@ impl Rec {
         self.most.fetch_max(n, Relaxed);
     }
 
+    /// The list has a new command allocator (`HostList::new_allocator`):
+    /// no recording made it grow yet.
+    pub(crate) fn forget_most(&self) {
+        self.recorded.store(0, Relaxed);
+        self.most.store(0, Relaxed);
+    }
+
     /// Records `barriers` now, or holds them for the next use of the list.
     ///
     /// # Safety
