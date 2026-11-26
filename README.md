@@ -72,6 +72,49 @@ described in a comment where it is read.
 
 ## NVIDIA
 
+Measured on an RTX 4070 12 GB, 32 GB RAM, 12 threads, Series X profile, the
+same scripted path into the world each time, warm driver cache, 8-10 minutes
+per run (median of the last 15 five-second lines):
+
+| | before (main 85d5641) | now |
+|---|---|---|
+| World frame time | 160 ms (6.2 fps) | 79 ms (12.7 fps) |
+| Draws dropped a frame | ~850 | ~350 (4 with ray tracing on) |
+| Peak private memory | 29.5 GB | 26-27 GB |
+| Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.4 fps, no device loss in 10 min |
+| Device losses in 10-minute runs | none | none |
+
+What made the difference on NVIDIA (each behind a `VICTORY_...` switch
+described where it is read):
+
+- **The ray tracing structure builder translates for 32-lane waves**: a
+  first-lane read of a value the same in every lane of the console wave takes
+  the host wave's own lane (`VICTORY_WAVE_SAME`), the box rehydration kernels'
+  short last groups keep only their started lanes in EXEC (`VICTORY_WAVE_LIVE`),
+  and the builder never runs on an approximate translation.
+- **Translator fixes for 32-lane hosts** from upstream and the forks: wave64
+  `ds_bpermute` scoped to its 32-lane half, LDS bounds, the constant table
+  after the instructions, divergent barriers in one-wave groups that keep
+  their fence but stop waiting (`VICTORY_GROUP_SYNC` auto), `s_pack_*`.
+- **The capped view heap** gives its upper 606,784 slots to dynamic tables
+  (from DexNom #68), and indirect dispatches past 65,535 groups run as asked.
+- **Memory**: streamed BC textures without their largest levels as the card
+  fills (`VICTORY_TEXTURE_MAX`), finer windows of title memory (256 KiB with
+  tails), fewer pooled host lists, a governor that lets go of what is kept
+  for reuse when commit headroom is short (`VICTORY_RAM_TRIM_MB`).
+- **Latency**: at most two frames ahead of what the card finished
+  (`VICTORY_FRAMES_AHEAD`), a tearing-capable swap chain for VRR, input polled
+  every 4 ms on a high-priority thread, a frame-wait race fixed; optional
+  NVIDIA Reflex (`VICTORY_REFLEX=1`) and pacing after the present
+  (`VICTORY_PACE_AFTER=1`).
+- **Frame time**: thin LTO with x86-64-v3, thread pools sized to the CPU, small
+  title buffers' copies in the card's memory, the submission's list resets on
+  a thread of ours.
+
+Known: with ray tracing on, the card's 11 GB fill and about 7 GB of the PC's
+memory is used as the card's, so 32 GB is tight. Whether interiors are lit
+correctly with the builder running was not checked by eye.
+
 `scripts\play.ps1` takes an NVIDIA profile by itself when it finds an NVIDIA
 card (or with `-Nvidia`): device-removed data keeps only the faulting address
 (`VICTORY_D3D12_DRED=faults`, not `light`), no book of the card's memory
