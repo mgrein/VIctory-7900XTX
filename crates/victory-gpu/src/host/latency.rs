@@ -3,7 +3,8 @@
 //! (tearing, a frame-latency waitable object) and sync interval, and the
 //! throttle of failed swap chain creation. The title's thread comes here
 //! once a frame, at the end of its present ([`title_presented`]); the host's
-//! `Present` asks [`present_args`] and reports to [`presented`].
+//! `Present` asks [`present_args`] (and [`retry_args`] when it fails) and
+//! reports to [`presented`].
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -284,6 +285,25 @@ pub(super) fn present_args(flags: u32) -> (u32, DXGI_PRESENT) {
     }
 }
 
+/// The arguments to present again with after a `Present` with `args`
+/// returned `hr`: a refused tearing present (DXGI refuses
+/// `DXGI_PRESENT_ALLOW_TEARING` while the swap chain is full screen, as
+/// after Alt+Enter) is presented again without tearing, at the same sync
+/// interval, so the frame still shows (from Marvisak PR #250, wbkepler).
+pub(super) fn retry_args(args: (u32, DXGI_PRESENT), hr: HRESULT) -> Option<(u32, DXGI_PRESENT)> {
+    if !hr.is_err() || args.1 & DXGI_PRESENT_ALLOW_TEARING != DXGI_PRESENT_ALLOW_TEARING {
+        return None;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            hr = format_args!("{:#010x}", hr.0 as u32),
+            "a tearing Present was refused (full screen?); such presents are shown again without tearing (logged once)"
+        );
+    });
+    Some((args.0, DXGI_PRESENT(args.1.0 & !DXGI_PRESENT_ALLOW_TEARING.0)))
+}
+
 /// A `Present` returned `hr`: anything but S_OK is logged once per code;
 /// one that showed counts for the waitable object.
 pub(super) fn presented(hr: HRESULT) {
@@ -351,6 +371,16 @@ mod tests {
     fn tearing_is_dropped_on_retry() {
         assert_eq!(without_tearing(TEARING | WAITABLE), Some(WAITABLE));
         assert_eq!(without_tearing(WAITABLE), None);
+    }
+
+    #[test]
+    fn a_refused_tearing_present_is_shown_again_without_tearing() {
+        let invalid = DXGI_ERROR_INVALID_CALL;
+        assert_eq!(retry_args((0, DXGI_PRESENT_ALLOW_TEARING), invalid), Some((0, DXGI_PRESENT(0))));
+        // A present that showed, or one without tearing, is not repeated.
+        assert_eq!(retry_args((0, DXGI_PRESENT_ALLOW_TEARING), HRESULT(0)), None);
+        assert_eq!(retry_args((0, DXGI_PRESENT_ALLOW_TEARING), windows::Win32::Foundation::DXGI_STATUS_OCCLUDED), None);
+        assert_eq!(retry_args((1, DXGI_PRESENT(0)), invalid), None);
     }
 
     #[test]

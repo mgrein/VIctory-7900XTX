@@ -9106,9 +9106,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let (sync, flags) = latency::present_args(p.flags);
+            let args = latency::present_args(p.flags);
             reflex::mark(reflex::Marker::PresentStart, frame);
-            latency::presented(p.swap_chain.Present(sync, flags));
+            let mut hr = p.swap_chain.Present(args.0, args.1);
+            if let Some(again) = latency::retry_args(args, hr) {
+                hr = p.swap_chain.Present(again.0, again.1);
+            }
+            latency::presented(hr);
             reflex::mark(reflex::Marker::PresentEnd, frame);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
