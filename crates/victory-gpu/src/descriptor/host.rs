@@ -1301,9 +1301,21 @@ impl TextureQueue {
 pub(crate) fn is_texture_view(view: &View) -> bool {
     match view {
         View::Placed(false, resource, _) => resource[0] != 1,
-        View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
+        View::Shader(r, desc) => {
+            !structure_view(*r, desc.as_ref()) && crate::resource::buffer_bytes(*r as crate::object::This).is_none()
+        }
         _ => false,
     }
+}
+
+/// Whether a shader view (resource `r`, description `desc`) is of a ray
+/// tracing acceleration structure that native DXR serves
+/// (`VICTORY_NATIVE_RT=1`, `crate::dxr`): no resource, the structure's
+/// address in the description.
+fn structure_view(r: usize, desc: Option<&[u32; 10]>) -> bool {
+    r == 0
+        && desc.is_some_and(|d| d[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32)
+        && crate::dxr::enabled()
 }
 
 /// Buffer views left null because the host would refuse them
@@ -2791,7 +2803,9 @@ impl HostHeap {
                 PLACED_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
-            Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
+            Some(View::Shader(r, desc))
+                if !structure_view(*r, desc.as_ref()) && crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
+            {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
@@ -4466,6 +4480,31 @@ fn make_twinned(
             Some(Some(shadow.buffer.clone().into()))
         }
         View::Shader(resource, desc) => {
+            if structure_view(*resource, desc.as_ref())
+                && let Some(desc) = desc
+            {
+                // The host's top-level structure for the title's (native DXR).
+                let guest_tlas_va = u64::from(desc[4]) | (u64::from(desc[5]) << 32);
+                let (host_tlas_gpu_va, slab_buf) = crate::dxr::tlas_srv(guest_tlas_va)?;
+                let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV {
+                            Location: host_tlas_gpu_va,
+                        },
+                    },
+                };
+                // SAFETY: slots of our heap; `slab_buf` is held with the slot.
+                unsafe {
+                    device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&srv_desc), at);
+                    if let Some(twin) = twin {
+                        device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&srv_desc), twin);
+                    }
+                }
+                return Some(Some(slab_buf.into()));
+            }
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
@@ -5175,6 +5214,25 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 && crate::dxr::enabled() {
+        // Native DXR: an empty top-level structure (no instances), so a ray
+        // query through the slot misses.
+        let Some(host) = host() else { return };
+        let location = crate::dxr::empty_tlas_srv().map_or(0, |(va, _)| va);
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV { Location: location },
+            },
+        };
+        // SAFETY: a slot of our heap; points to the permanent empty structure (or 0 if unavailable).
+        unsafe {
+            host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+        }
+        return;
+    }
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);

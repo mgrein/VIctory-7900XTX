@@ -1186,7 +1186,12 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            if crate::dxr::requested() {
+                let _ = host.raytracing_tier_1_1();
+            }
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -1587,7 +1592,7 @@ pub(crate) struct HostList {
 }
 
 /// A list's prelude: an allocator and a closed list.
-type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+pub(crate) type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -2792,6 +2797,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Native DXR acceleration structure operations queued during recording
+    /// and replayed on the submission thread (`crate::dxr`, `VICTORY_NATIVE_RT=1`).
+    dxr_ops: Vec<crate::dxr::DxrOp>,
 }
 
 impl Deferred {
@@ -3134,6 +3142,9 @@ struct Sent {
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Native DXR pooled lists and scratch kept alive until the submission
+    /// finishes (`crate::dxr`).
+    dxr: Option<crate::dxr::DxrSubmission>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -3150,6 +3161,8 @@ struct Flight {
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// Native DXR pooled lists and scratch kept alive until it has run.
+    dxr: Option<crate::dxr::DxrSubmission>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3462,6 +3475,38 @@ fn read_blocked(written: &[(usize, usize)], src: usize, len: usize) -> bool {
 fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) -> Option<bool> {
     let read = read_blocked(written, src, len);
     (read || touches(written, dst, dst + len)).then_some(read)
+}
+
+/// Diagnostics: the timing marks of a submission's lists (`marks`, places in
+/// `before`) moved to where those lists are in `after`, which has lists put
+/// in among them (native DXR, `crate::dxr::record_submission`). A list put in
+/// ahead of the first mark gets a mark of its own: under `VICTORY_GPU_TIMING`
+/// only marked groups are sent.
+#[cfg(feature = "diagnostics")]
+fn remark(
+    before: &[Option<ID3D12CommandList>],
+    after: &[Option<ID3D12CommandList>],
+    marks: &mut Vec<(usize, crate::copystat::Timed)>,
+) {
+    let raw = |l: &Option<ID3D12CommandList>| l.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    // Where each list of `before` is in `after` (in order; the lists put in
+    // are new ones).
+    let mut moved = Vec::with_capacity(before.len() + 1);
+    let mut at = 0;
+    for list in before {
+        while at < after.len() && raw(&after[at]) != raw(list) {
+            at += 1;
+        }
+        moved.push(at.min(after.len()));
+        at = (at + 1).min(after.len());
+    }
+    moved.push(after.len());
+    for mark in marks.iter_mut() {
+        mark.0 = moved[mark.0.min(before.len())];
+    }
+    if marks.first().is_none_or(|m| m.0 > 0) && !after.is_empty() {
+        marks.insert(0, (0, crate::copystat::Timed::Other));
+    }
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
@@ -4569,6 +4614,30 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU supports DXR Tier 1.1 (inline raytracing / `TraceRayInline`)
+    /// and exposes `ID3D12Device5`; logged once.
+    pub(crate) fn raytracing_tier_1_1(&self) -> bool {
+        static TIER11: OnceLock<bool> = OnceLock::new();
+        *TIER11.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, (&raw mut options).cast(), size_of_val(&options) as u32)
+                    .is_ok()
+            };
+            let has_device5 = self.device.cast::<ID3D12Device5>().is_ok();
+            let supported = ok && options.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0 && has_device5;
+            tracing::info!(
+                supported,
+                tier = options.RaytracingTier.0,
+                has_device5,
+                "host DXR Tier 1.1 support (VICTORY_NATIVE_RT)"
+            );
+            supported
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -4591,7 +4660,7 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    pub(crate) fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
@@ -5517,6 +5586,9 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
+                    if let Some(dxr) = flight.dxr {
+                        crate::dxr::finish_submission(dxr);
+                    }
                     if let Some(own) = flight.own {
                         own.landed();
                     }
@@ -5791,6 +5863,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                dxr: sent.dxr,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5854,6 +5927,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
+                dxr: sent.dxr,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5995,6 +6069,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if let Some(dxr) = flight.dxr {
+                            crate::dxr::finish_submission(dxr);
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -6324,11 +6401,6 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            #[cfg(feature = "diagnostics")]
-            marks.push((lists.len(), crate::copystat::Timed::Compare));
-            lists.push(Some(check));
-        }
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6336,6 +6408,28 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // Native DXR (`VICTORY_NATIVE_RT=1`): the acceleration structure
+        // builds, copies and extractions the lists queued, each run's after
+        // its list, and any empty structures just made, from here (after the
+        // uploads of `card_before`, before the lists go to the card).
+        let dxr = if crate::dxr::enabled() {
+            #[cfg(feature = "diagnostics")]
+            let before: Vec<Option<ID3D12CommandList>> = lists.clone();
+            let dxr = crate::dxr::record_submission(self, runs, &mut lists, &mut firsts);
+            // The timing marks follow the lists they named.
+            #[cfg(feature = "diagnostics")]
+            if dxr.is_some() {
+                remark(&before, &lists, &mut marks);
+            }
+            dxr
+        } else {
+            None
+        };
+        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            #[cfg(feature = "diagnostics")]
+            marks.push((lists.len(), crate::copystat::Timed::Compare));
+            lists.push(Some(check));
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -6403,6 +6497,7 @@ impl Host {
                 own,
                 texture_back_ranges,
                 writes,
+                dxr,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -6535,6 +6630,9 @@ impl Host {
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
+        }
+        if let Some(dxr) = dxr {
+            crate::dxr::finish_submission(dxr);
         }
         #[cfg(feature = "diagnostics")]
         if !back.is_empty() {
@@ -7502,6 +7600,23 @@ impl HostList {
         }
     }
 
+    /// Queues a native DXR operation onto this list and schedules shadow
+    /// refreshes for its guest input/postbuild buffers.
+    pub(crate) fn push_dxr_op(&self, op: crate::dxr::DxrOp) {
+        crate::dxr::prepare_list_op(self, &op);
+        self.deferred().dxr_ops.push(op);
+    }
+
+    /// Whether any native DXR operations are queued on this list.
+    pub(crate) fn has_dxr_ops(&self) -> bool {
+        !self.deferred().dxr_ops.is_empty()
+    }
+
+    /// Clones the queued native DXR operations in recorded order.
+    pub(crate) fn dxr_ops(&self) -> Vec<crate::dxr::DxrOp> {
+        self.deferred().dxr_ops.clone()
+    }
+
     /// Whether nothing recorded since the list was opened does any work:
     /// no draw or dispatch (the first keeps its pipeline), no copy, clear,
     /// upload or resolve (they defer a step or move a texture's state), no
@@ -7515,7 +7630,8 @@ impl HostList {
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
-                && deferred.texture_backs.is_empty())
+                && deferred.texture_backs.is_empty()
+                && deferred.dxr_ops.is_empty())
             {
                 return false;
             }
@@ -9797,6 +9913,7 @@ impl Meter {
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            crate::dxr::log_stats(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);

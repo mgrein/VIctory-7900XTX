@@ -87,6 +87,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// Inline ray tracing (`RayQuery` or `RaytracingAccelerationStructure`).
+    pub raytracing_tier_1_1: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1094,13 +1096,18 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name.starts_with("allocateRayQuery") || name.starts_with("rayQuery_") {
+                    u.raytracing_tier_1_1 = true;
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
                 } else if name == "annotateHandle" {
-                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
+                    if let Some((kind, _)) = annotation(V::Inst(i)) {
+                        u.rovs |= kind & 0x2000 != 0;
+                        u.raytracing_tier_1_1 |= (kind & 0xff) == 16;
+                    }
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
@@ -2224,5 +2231,65 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn rayquery_effects_and_usage_are_tracked() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i1 = m.int(1);
+        let i32t = m.int(32);
+        let alloc_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let proceed_ty = m.func_ty(i1, vec![i32t, i32t]);
+        let state_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let store_ty = m.func_ty(void, vec![i32t, i32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [alloc_ty, proceed_ty, state_ty, store_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let alloc = m.function("dx.op.allocateRayQuery", alloc_ty, Some(Attr::NoUnwind), false);
+        let proceed = m.function(
+            "dx.op.rayQuery_Proceed.i1",
+            proceed_ty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+        let state = m.function(
+            "dx.op.rayQuery_StateScalar.i32",
+            state_ty,
+            Some(Attr::ReadOnly),
+            false,
+        );
+        let store = m.function("dx.op.rawBufferStore.i32", store_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+        let b = m.new_block();
+        let op_alloc = m.i32(178);
+        let op_proceed = m.i32(180);
+        let op_status = m.i32(184);
+        let zero = m.i32(0);
+        let rq1 = m.call(b, alloc, vec![op_alloc, zero]);
+        let rq2 = m.call(b, alloc, vec![op_alloc, zero]);
+        let s_before = m.call(b, state, vec![op_status, rq1]);
+        let s_same = m.call(b, state, vec![op_status, rq1]);
+        let _p = m.call(b, proceed, vec![op_proceed, rq1]);
+        let s_after = m.call(b, state, vec![op_status, rq1]);
+        let _dead_state = m.call(b, state, vec![op_status, rq2]);
+        let sum = m.bin(b, Bin::Add, s_before, s_same);
+        m.call(b, store, vec![sum, s_after]);
+        m.terminate(b, Term::Ret);
+        m.optimise(MODULE);
+        assert!(m.usage().raytracing_tier_1_1);
+        // Two distinct allocateRayQuery calls, one proceed, two kept state reads
+        // (before and after proceed; s_same reused s_before, _dead_state dropped),
+        // one add, and one store = 7 instructions.
+        assert_eq!(body(&m, b), 7);
+        let s = stores(&m, b);
+        let V::Inst(add_i) = s[0][0] else { panic!() };
+        assert!(
+            matches!(m.insts[add_i as usize].op, Op::Bin(Bin::Add, x, y) if x == s_before && y == s_before),
+            "identical state reads before proceed merge"
+        );
+        assert_ne!(s[0][1], s_before, "proceed invalidates cached state reads");
+        m.write();
     }
 }

@@ -71,6 +71,14 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Programs with ray node tests (`image_bvh*_intersect_ray`) that every
+    /// earlier stage handled; of them emitted, emitted with DXR 1.1 ray
+    /// queries (`VICTORY_NATIVE_RT=1` lifted a traversal loop), and of those
+    /// with a host pipeline.
+    rt_programs: usize,
+    rt_emitted: usize,
+    rt_lifted: usize,
+    rt_lifted_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// Emitted programs by the form they took (`emit::take_form`), and
@@ -135,6 +143,10 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.rt_programs += other.rt_programs;
+        self.rt_emitted += other.rt_emitted;
+        self.rt_lifted += other.rt_lifted;
+        self.rt_lifted_pipelines += other.rt_lifted_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -387,6 +399,12 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if t.rt_programs > 0 {
+        println!(
+            "ray tracing  {} emitted of {} programs with ray node tests; {} with ray queries (VICTORY_NATIVE_RT), {} of them with pipelines",
+            t.rt_emitted, t.rt_programs, t.rt_lifted, t.rt_lifted_pipelines
+        );
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -616,9 +634,11 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
+                let mut rays = false;
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
+                        rays = !r.bvh.is_empty();
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
@@ -669,6 +689,10 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
+                    t.rt_programs += usize::from(rays);
+                    if t.list && rays {
+                        t.lines.push(format!("{}  ray node tests", label()));
+                    }
                     let emitted = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
                     let form = emit::take_form();
                     *t.forms.entry(if emitted.is_ok() { form } else { "refused" }).or_default() += 1;
@@ -680,7 +704,19 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
+                            let lifted = rays && ray_queries(&shader.dxil);
+                            if rays {
+                                t.rt_emitted += 1;
+                                t.rt_lifted += usize::from(lifted);
+                                if t.list && lifted {
+                                    t.lines.push(format!("{}  ray queries", label()));
+                                }
+                            }
+                            let made = *counter(t, p.stage, 3);
                             check(shader, t, checks, label);
+                            if lifted && *counter(t, p.stage, 3) > made {
+                                t.rt_lifted_pipelines += 1;
+                            }
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -699,6 +735,16 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
             }
         }
     }
+}
+
+/// Whether an emitted module uses DXR 1.1 inline ray tracing (the
+/// `RaytracingTier1_1` bit of its `SFI0` feature flags).
+fn ray_queries(dxil: &[u8]) -> bool {
+    const RAYTRACING_TIER_1_1: u64 = 0x10_0000;
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| c.part(victory_shader::FourCC::SFI0).and_then(|part| part.data.get(..8)?.try_into().ok()))
+        .is_some_and(|flags: [u8; 8]| u64::from_le_bytes(flags) & RAYTRACING_TIER_1_1 != 0)
 }
 
 /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:

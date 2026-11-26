@@ -11,6 +11,8 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(windows)]
+pub mod bvh_builder;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -57,6 +59,13 @@ pub(crate) fn all() -> Vec<HleModule> {
     ];
     #[cfg(windows)]
     all.push(apu::module());
+    // `XboxBvhBuilder.dll` is served (and the title's own forwarded to) only
+    // with native ray tracing asked for (`VICTORY_NATIVE_RT=1`): otherwise
+    // the title's DLL loads as before.
+    #[cfg(windows)]
+    if victory_gpu::dxr::requested() {
+        all.push(bvh_builder::module());
+    }
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
