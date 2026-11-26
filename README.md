@@ -81,8 +81,9 @@ per run (median of the last 15 five-second lines):
 | World frame time | 160 ms (6.2 fps) | 79 ms (12.7 fps) |
 | Draws dropped a frame | ~850 | ~350 (4 with ray tracing on) |
 | Peak private memory | 29.5 GB | 26-27 GB |
-| Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.4 fps, no device loss in 10 min |
+| Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.4-8.5 fps, 28-29 GB peak, no device loss in 10 min |
 | Device losses in 10-minute runs | none | none |
+| Render queue (`VICTORY_REFLEX=1`, driver-measured) | not available | 0.2 ms |
 
 What made the difference on NVIDIA (each behind a `VICTORY_...` switch
 described where it is read):
