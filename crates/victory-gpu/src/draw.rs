@@ -3628,13 +3628,13 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                        let Some((buffer, gpu, to, views)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_at(index, &buffer, gpu, size, views.as_ref());
                     }
                     Some(view) => {
                         host.make_at(index, &view);

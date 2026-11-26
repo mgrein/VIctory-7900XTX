@@ -752,6 +752,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
     host::copies::line(frames);
+    host::scratch_views::line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -900,7 +901,7 @@ pub(crate) fn constant_slot(
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.constant_at(index, buffer, gpu, size);
+        host.constant_at(index, buffer, gpu, size, None);
     }
 }
 
