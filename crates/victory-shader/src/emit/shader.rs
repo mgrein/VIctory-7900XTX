@@ -101,6 +101,14 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// ([`super::bvh_no_hit`]): at 0 they answer no hit and read nothing.
 pub const USER_STRUCTURES: u32 = 0x110;
 
+#[cfg(test)]
+thread_local! {
+    /// The tests' record of the properties of each heap handle made on this
+    /// thread ([`Shader::heap_handle_at`]), in order.
+    pub(crate) static HEAP_HANDLES: std::cell::RefCell<Vec<(u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -515,6 +523,8 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        HEAP_HANDLES.with(|made| made.borrow_mut().push(props));
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,

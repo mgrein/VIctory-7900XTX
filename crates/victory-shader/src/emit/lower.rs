@@ -1834,7 +1834,8 @@ impl<'a> Lower<'a> {
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
-            match self.root_memory(&src, off, guard, false) {
+            let coherent = Self::needs_coherence(inst, false);
+            match self.root_memory(&src, off, guard, false, coherent) {
                 Some((h, byte)) => {
                     off = byte;
                     Some(h)
@@ -3089,8 +3090,9 @@ impl<'a> Lower<'a> {
     /// number is left for the host, for lanes that run (`guard`). Goes on in
     /// another block.
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
-    /// is the null view.
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+    /// is the null view. `coherent`: the access reads or writes what other
+    /// groups of the dispatch see ([`Lower::needs_coherence`]).
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool, coherent: bool) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3162,13 +3164,43 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        // refit climbs from children to parents): globally coherent. With
+        // `VICTORY_BVH_COHERENT=glc` only the accesses that say so
+        // ([`super::builder_coherent_glc`]).
+        let coherent = if crate::spill::is_spilled(self.x.native)
+            && (coherent || !super::builder_coherent_glc() || self.invalidates_caches())
+        {
+            0x4000
+        } else {
+            0
+        };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// Whether an access by `inst` to title memory must see other groups'
+    /// writes, or be seen by them: a store, an atomic, or a load the console
+    /// sends past its wave's cache (`glc`, or `dlc` past the next level).
+    fn needs_coherence(inst: &Inst, store: bool) -> bool {
+        store
+            || match &inst.fields {
+                Fields::Flat { cache, .. } | Fields::Buffer { cache, .. } | Fields::Smem { cache, .. } => {
+                    cache.glc || cache.dlc
+                }
+                _ => true,
+            }
+    }
+
+    /// Whether the program invalidates the console's caches itself: then a
+    /// plain load after it may expect what other groups wrote, and every
+    /// access is coherent ([`super::builder_coherent_glc`]).
+    fn invalidates_caches(&self) -> bool {
+        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i.name(), "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv")
+        })
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -3198,7 +3230,14 @@ impl<'a> Lower<'a> {
     /// another block.
     /// shortcut: an access of several dwords is taken not to cross the end
     /// of a host copy (the builder's records lie on their size).
-    fn root_memory(&mut self, src: &Source, off: V, guard: Option<V>, store: bool) -> Option<(V, V)> {
+    fn root_memory(
+        &mut self,
+        src: &Source,
+        off: V,
+        guard: Option<V>,
+        store: bool,
+        coherent: bool,
+    ) -> Option<(V, V)> {
         let (lo, hi) = self.root_address(src)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -3221,7 +3260,7 @@ impl<'a> Lower<'a> {
             sum = self.s.m.select(c, near, sum, zero);
             hi = self.s.m.select(c, near, hi, zero);
         }
-        let (h, byte) = self.memory(sum, hi, guard, store);
+        let (h, byte) = self.memory(sum, hi, guard, store, coherent);
         self.root_copy = Some(h);
         Some((h, byte))
     }
@@ -3271,7 +3310,8 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard, false);
+            let coherent = Self::needs_coherence(inst, false);
+            let (h, byte) = self.memory(lo, hi, guard, false, coherent);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -3293,7 +3333,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard, true);
+            let (h, byte) = self.memory(lo, hi, guard, true, true);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -3320,7 +3360,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard, true);
+        let (h, byte) = self.memory(lo, hi, guard, true, true);
         let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
@@ -3455,7 +3495,7 @@ impl<'a> Lower<'a> {
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None, false);
+            let (h, byte) = self.memory(lo, hi, None, false, Self::needs_coherence(inst, false));
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -6223,7 +6263,8 @@ impl<'a> Lower<'a> {
                 && matches!(soffset, Operand::Scalar { code: NULL, .. })
                 && super::builder_bounds();
             let mut root = false;
-            let h = match self.root_memory(src, addr, None, false) {
+            let coherent = Self::needs_coherence(inst, false);
+            let h = match self.root_memory(src, addr, None, false, coherent) {
                 Some((h, byte)) => {
                     addr = byte;
                     root = true;
@@ -11701,7 +11742,9 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, element, off);
                 index = None;
             }
-            if let Some((_, byte)) = self.root_memory(src, off, guard, store || atomic.is_some()) {
+            let written = store || atomic.is_some();
+            let coherent = Self::needs_coherence(inst, written);
+            if let Some((_, byte)) = self.root_memory(src, off, guard, written, coherent) {
                 off = byte;
             }
         }
@@ -12932,6 +12975,53 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    /// The properties of the heap handles of title memory by address that
+    /// a program of the structure builder (a spilled user-data table) makes
+    /// for a plain global load, a global load with `glc` and a global store,
+    /// in that order, with `VICTORY_BVH_COHERENT=glc` or without; with
+    /// `invalidate`, the program invalidates the console's caches first.
+    fn builder_memory_handles(glc_only: bool, invalidate: bool) -> Vec<u32> {
+        use super::super::{TEST_COHERENT_GLC, shader::HEAP_HANDLES};
+        let mut words = vec![
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0xDC30_8000,    // global_load_dword v3, v[0:1], off
+            0x037D_0000,
+            0xDC31_8000, // global_load_dword v4, v[0:1], off glc
+            0x047D_0000,
+            0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+            0xDC70_8000, // global_store_dword v[0:1], v3, off
+            0x007D_0300,
+            S_ENDPGM,
+        ];
+        if invalidate {
+            words.splice(0..0, [0xE1C4_0000, 0]); // buffer_gl0_inv
+        }
+        // One root constant in the spilled table (user-data index 16).
+        let layout = vec![root(RootType::Constants, 16, 0)];
+        TEST_COHERENT_GLC.set(Some(glc_only));
+        HEAP_HANDLES.with(|made| made.borrow_mut().clear());
+        let lowered = lower_with(&words, layout, vec![]);
+        TEST_COHERENT_GLC.set(None);
+        lowered.expect("lowers");
+        HEAP_HANDLES
+            .with(|made| made.take())
+            .into_iter()
+            .map(|p| p.0)
+            .filter(|p| p & 0xFF == 11 && p & 0x1000 != 0)
+            .collect()
+    }
+
+    /// The builder's loads by address through globally coherent views: all
+    /// of them as before, or with `VICTORY_BVH_COHERENT=glc` only the load
+    /// with `glc` (and the store), a plain load through a plain view; in a
+    /// program that invalidates the console's caches itself, every access.
+    #[test]
+    fn a_builder_load_without_glc_is_coherent_only_without_the_switch() {
+        assert_eq!(builder_memory_handles(false, false), [0x5000 | 11; 3]);
+        assert_eq!(builder_memory_handles(true, false), [0x1000 | 11, 0x5000 | 11, 0x5000 | 11]);
+        assert_eq!(builder_memory_handles(true, true), [0x5000 | 11; 3]);
     }
 
     /// Lowers a one-thread compute program that copies four root constants

@@ -249,6 +249,35 @@ pub fn bvh_no_hit() -> u8 {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to translate as with `VICTORY_BVH_COHERENT=glc`
+    /// ([`builder_coherent_glc`]).
+    pub(crate) static TEST_COHERENT_GLC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Which accesses of the ray-tracing structure builder to title memory by
+/// address go through globally coherent views (`VICTORY_BVH_COHERENT`):
+///
+/// - unset or `all`: every one (as before; false here).
+/// - `glc`: only atomics, stores, loads the console marks to miss its
+///   wave's cache (`glc` or `dlc`), and every access of a program that
+///   invalidates the console's caches itself (`buffer_gl0_inv`,
+///   `buffer_gl1_inv`, `s_gl1_inv`, `s_dcache_inv`): what the console
+///   compiler marks as reading other groups' writes (a refit climbing from
+///   children to parents). The other loads get plain views, which NVIDIA
+///   serves from the SM's L1 instead of going to L2 for each.
+///
+/// Opt-in. Part of the translation: the shader cache keys on it.
+pub fn builder_coherent_glc() -> bool {
+    #[cfg(test)]
+    if let Some(glc) = TEST_COHERENT_GLC.get() {
+        return glc;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_COHERENT").is_some_and(|v| v == "glc"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
