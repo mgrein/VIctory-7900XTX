@@ -3693,6 +3693,7 @@ pub(crate) mod latency;
 mod panel;
 mod place;
 pub(crate) mod rec;
+pub(crate) mod reflex;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -9106,7 +9107,9 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let (sync, flags) = latency::present_args(p.flags);
+            reflex::mark(reflex::Marker::PresentStart, frame);
             latency::presented(p.swap_chain.Present(sync, flags));
+            reflex::mark(reflex::Marker::PresentEnd, frame);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());

@@ -888,6 +888,8 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::host::reflex::mark(crate::host::reflex::Marker::SimulationEnd, frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -973,8 +975,8 @@ extern "system" fn present(
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
-    // How far the title runs ahead of the card and the swap chain's
-    // waitable object (`crate::host::latency`).
+    // How far the title runs ahead of the card, the swap chain's waitable
+    // object and Reflex's sleep (`crate::host::latency`).
     #[cfg(windows)]
     crate::host::latency::title_presented(frame);
     #[cfg(not(windows))]

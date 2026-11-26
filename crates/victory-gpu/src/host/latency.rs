@@ -119,7 +119,8 @@ static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// On the title's thread, at the end of its present of `frame` (once the
 /// present was given to the lane or shown), before any pacing: waits for
 /// the card to have run frame `frame - VICTORY_FRAMES_AHEAD`, then for the
-/// swap chain's waitable object (`VICTORY_FRAME_LATENCY`).
+/// swap chain's waitable object (`VICTORY_FRAME_LATENCY`), then Reflex's
+/// sleep (`VICTORY_REFLEX`).
 pub(crate) fn title_presented(frame: u64) {
     let Some(host) = made() else { return };
     STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -138,6 +139,7 @@ pub(crate) fn title_presented(frame: u64) {
         }
     }
     waitable_wait();
+    super::reflex::sleep_then_start(frame);
     line();
 }
 
@@ -243,8 +245,8 @@ static ISSUED: AtomicU64 = AtomicU64::new(0);
 static WAITED: AtomicU64 = AtomicU64::new(0);
 
 /// A swap chain was made with `flags`: its frame latency is set and its
-/// waitable object kept, and the configuration logged.
-pub(super) fn swap_chain_made(_host: &Host, swap_chain: &IDXGISwapChain3, flags: u32, size: (u32, u32), format: i32) {
+/// waitable object kept, Reflex is set up, and the configuration logged.
+pub(super) fn swap_chain_made(host: &Host, swap_chain: &IDXGISwapChain3, flags: u32, size: (u32, u32), format: i32) {
     let latency = frame_latency().filter(|_| flags & WAITABLE != 0);
     if let Some(n) = latency {
         // SAFETY: a swap chain made with the waitable flag.
@@ -258,6 +260,7 @@ pub(super) fn swap_chain_made(_host: &Host, swap_chain: &IDXGISwapChain3, flags:
             }
         }
     }
+    let reflex = vendor() == NVIDIA && super::reflex::wanted() && super::reflex::init(&host.device);
     tracing::info!(
         width = size.0,
         height = size.1,
@@ -265,6 +268,7 @@ pub(super) fn swap_chain_made(_host: &Host, swap_chain: &IDXGISwapChain3, flags:
         tearing = flags & TEARING != 0,
         frame_latency = latency.unwrap_or(0),
         sync = sync_interval(),
+        reflex,
         "presenting to a window"
     );
 }
