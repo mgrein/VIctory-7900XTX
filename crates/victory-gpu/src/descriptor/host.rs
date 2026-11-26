@@ -450,7 +450,40 @@ fn note_before(index: u32, was: u64, by: &'static str) {
 /// A 1x1 gray texture, in the place of one that is not there yet.
 fn neutral() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
+    one_texel(&TEXTURE, [0x80; 4])
+}
+
+/// With `VICTORY_NULL_MAGENTA=1` (a diagnostic, off unless set), a 2D
+/// colour texture view the title placed that the host cannot make shows
+/// magenta at `at` in place of a null view: on the screen, a texture that
+/// is not there is told from one whose contents are black, or from dark
+/// lighting. False if the view is to be null. (The idea of
+/// DexNom/VIctory's switch of that name.)
+fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
+    let colour = matches!(crate::resource::pc_format(desc[0]), 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
+        return false;
+    }
+    let Some(texture) = one_texel(&TEXTURE, [255, 0, 255, 255]) else {
+        return false;
+    };
+    // A live texture that is never let go; its own format, all of it.
+    create_srv(Some(texture), None, at);
+    true
+}
+
+/// A 1x1 RGBA8 texture of `texel`, made once and kept in `texture`.
+fn one_texel(
+    texture: &'static std::sync::OnceLock<Option<ID3D12Resource>>,
+    texel: [u8; 4],
+) -> Option<&'static ID3D12Resource> {
+    texture
         .get_or_init(|| {
             let host = host()?;
             let device = &host.device;
@@ -458,7 +491,8 @@ fn neutral() -> Option<&'static ID3D12Resource> {
             // SAFETY: the buffer's mapping; plain creation and recording,
             // waited for before what it names goes.
             unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
+                std::ptr::write_bytes(data, 0, 256);
+                std::ptr::copy_nonoverlapping(texel.as_ptr(), data, 4);
                 let mut made: Option<ID3D12Resource> = None;
                 device
                     .CreateCommittedResource(
@@ -1772,8 +1806,8 @@ impl Taken {
         changed
     }
 
-    /// The longest run of free slots.
-    #[cfg(test)]
+    /// The longest run of free slots (for the log of a search that found
+    /// none: every slot is looked at).
     fn longest_free(&self) -> usize {
         let (mut best, mut run) = (0, 0);
         for at in 0..self.len {
@@ -2241,7 +2275,18 @@ impl HostHeap {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            // With the longest free run, the free slots and all of them: slots
+            // that ran out (too few of them) are told from slots in pieces
+            // (after DoubleGhosty/cool_fox 8eb4f320).
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    largest_free = taken.longest_free(),
+                    free = self.free.load(std::sync::atomic::Ordering::Relaxed),
+                    capacity = self.dynamic,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -5584,6 +5629,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
+            if magenta_for(desc, at) {
+                return;
+            }
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         // Renderer port 5 through slots: translated shaders read the slot as
