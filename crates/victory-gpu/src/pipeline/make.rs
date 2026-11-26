@@ -293,7 +293,7 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get()), total_ram()) / 4).max(1)
         }
     })
 }
@@ -345,15 +345,25 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    #[cfg(test)]
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        self.pop_with(screens_only, slow_limit, true)
+    }
+
+    /// The next pipeline to make; with `early` false ([`short_of_commit`])
+    /// none that no draw asked for.
+    fn pop_with(&mut self, screens_only: bool, slow_limit: usize, early: bool) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
+            p = self.requested.pop_front();
+            if p.is_none() && early {
+                p = unclaimed(&mut self.early);
+            }
+            if p.is_none() && early && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
@@ -399,19 +409,57 @@ const SCREEN_WORKERS: usize = 2;
 fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        let early = !short_of_commit();
+        if let Some(p) = queue.pop_with(screens_only, slow_limit(), early) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = if early {
+            AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner())
+        } else {
+            // Early ones wait for the memory to come back: looked at again.
+            AVAILABLE.wait_timeout(queue, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0
+        };
     }
 }
 
+/// Whether the PC's commit headroom is under `VICTORY_PIPELINE_COMMIT_MB`
+/// (4096 by default; 0: never): only two workers make pipelines then, and
+/// only those draws asked for (no early ones). A driver's compile of a
+/// pipeline takes hundreds of MB of private memory for a while, and with
+/// eight at once on a 32 GB PC the commit limit came near. As
+/// fxceless/victory-fork PR #777 (fxceless), with its switch.
+fn short_of_commit() -> bool {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMMIT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20
+    });
+    #[cfg(windows)]
+    let headroom = crate::host::commit_headroom();
+    #[cfg(not(windows))]
+    let headroom: Option<u64> = None;
+    floor > 0 && headroom.is_some_and(|h| h < floor)
+}
+
+/// The workers that keep making pipelines while [`short_of_commit`].
+const SHORT_WORKERS: usize = 2;
+
+/// The PC's physical RAM.
+fn total_ram() -> Option<u64> {
+    #[cfg(windows)]
+    return crate::host::total_physical_ram();
+    #[cfg(not(windows))]
+    None
+}
+
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
+/// 64), else two thirds of the logical processors, 2 to 16, and at most 4 on
+/// a PC with 32 GiB of RAM or less (`total`): each compile takes hundreds of
+/// MB, as Marvisak/VIctory PR #2944 (workers by RAM). They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+fn worker_count(asked: Option<usize>, processors: usize, total: Option<u64>) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
+        None if total.is_some_and(|t| t <= 32 << 30) => (processors * 2 / 3).clamp(2, 4),
         None => (processors * 2 / 3).clamp(2, 16),
     }
 }
@@ -426,6 +474,7 @@ fn workers() -> bool {
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
+            total_ram(),
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
@@ -445,6 +494,11 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
+                        // Short of memory: two workers only (the screen's
+                        // own are not counted).
+                        while !screens_only && i >= SHORT_WORKERS && short_of_commit() {
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
                         let p = next(screens_only);
                         p.make();
                         if p.was_slow.load(Ordering::Relaxed) {
@@ -493,11 +547,17 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        const GIB: u64 = 1 << 30;
+        assert_eq!(worker_count(None, 1, None), 2);
+        assert_eq!(worker_count(None, 24, None), 16);
+        assert_eq!(worker_count(None, 64, Some(64 * GIB)), 16);
+        assert_eq!(worker_count(Some(0), 24, None), 1);
+        assert_eq!(worker_count(Some(20), 24, Some(16 * GIB)), 20);
+        // At most 4 with 32 GiB of RAM or less, unless asked.
+        assert_eq!(worker_count(None, 12, Some(32 * GIB - 1)), 4);
+        assert_eq!(worker_count(None, 4, Some(16 * GIB)), 2);
+        assert_eq!(worker_count(None, 12, Some(48 * GIB)), 8);
+        assert_eq!(worker_count(Some(8), 12, Some(32 * GIB)), 8);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -573,6 +633,18 @@ mod tests {
 
     /// Passes over the screen go before all others, and workers of their own
     /// take nothing else.
+    #[test]
+    fn early_pipelines_wait_while_short_of_memory() {
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let asked = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&early, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&asked, REQUESTED, false), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, false).unwrap(), &asked));
+        assert!(queue.pop_with(false, 1, false).is_none());
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, true).unwrap(), &early));
+    }
+
     #[test]
     fn passes_over_the_screen_go_first() {
         let of = |screen| {

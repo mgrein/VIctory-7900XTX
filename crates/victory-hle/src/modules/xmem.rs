@@ -178,6 +178,12 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
+        if constrained {
+            // A new reservation: what the GPU side still notes of these
+            // addresses (guarded, clean, kept by the guards) was memory
+            // freed with nobody telling, and is not true of this.
+            victory_gpu::title_memory_freed(at as usize, size);
+        }
         victory_gpu::title_memory_allocated(at as usize, size);
     }
     note_protection(asked, kind, flags, at as usize, size);
@@ -360,6 +366,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // What the GPU side noted of it goes first, as with the title's
+            // own `VirtualFree` (`title_virtual_free`).
+            victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }

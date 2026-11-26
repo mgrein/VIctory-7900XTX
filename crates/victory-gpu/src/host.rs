@@ -139,15 +139,117 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// The host's memory now, from `GlobalMemoryStatusEx`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryStatus {
+    /// Physical RAM free.
+    pub(crate) avail_phys: u64,
+    /// Commit headroom: what may still be committed before the commit
+    /// limit (RAM plus page file) is reached (`ullAvailPageFile`). Private
+    /// memory counts against it whether it is resident or not.
+    pub(crate) avail_commit: u64,
+    /// Physical RAM in all.
+    pub(crate) total_phys: u64,
+}
+
+/// See [`MemoryStatus`].
+pub(crate) fn memory_status() -> Option<MemoryStatus> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some(MemoryStatus { avail_phys: m.ullAvailPhys, avail_commit: m.ullAvailPageFile, total_phys: m.ullTotalPhys })
+}
+
+/// Physical RAM in all, asked once.
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|m| m.total_phys))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|m| m.avail_phys)
+}
+
+/// The commit headroom ([`MemoryStatus::avail_commit`]), asked of the
+/// system at most every 250 ms: the scratch pool asks at every list reset.
+pub(crate) fn commit_headroom() -> Option<u64> {
+    use std::sync::atomic::AtomicU64;
+    static AT: AtomicU64 = AtomicU64::new(0);
+    static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = now_ms() + 1;
+    let at = AT.load(Ordering::Relaxed);
+    if at == 0 || now >= at + 250 {
+        AT.store(now, Ordering::Relaxed);
+        HEADROOM.store(memory_status().map_or(u64::MAX, |m| m.avail_commit), Ordering::Relaxed);
+    }
+    Some(HEADROOM.load(Ordering::Relaxed)).filter(|&h| h != u64::MAX)
+}
+
+/// Below how much commit headroom the PC counts as short of memory
+/// ([`ram_pressure`]): `VICTORY_RAM_TRIM_MB=<MiB>` (0: never), else 4 GiB on
+/// a PC of 32 GiB of RAM or less and 2 GiB on a bigger one. Private memory
+/// of 40 to 46 GB was seen in the world (docs/findings.md), past the RAM of
+/// a 32 GB PC: what the host keeps for reuse is then paged, and the page
+/// file fills. As fxceless/victory-fork PR #1240 (fxceless), which measured
+/// free RAM and was off by default, and DexNom/VIctory PR #43.
+fn ram_trim_bytes() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = std::env::var("VICTORY_RAM_TRIM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        ram_trim_for(asked, total_physical_ram())
+    })
+}
+
+fn ram_trim_for(asked_mb: Option<u64>, total: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    match asked_mb {
+        Some(mb) => mb << 20,
+        None if total.is_some_and(|t| t <= 32 * GIB) => 4 * GIB,
+        None => 2 * GIB,
+    }
+}
+
+/// Whether the commit headroom is under [`ram_trim_bytes`]: the sweep then
+/// runs every 500 ms and lets go of what the host keeps for reuse
+/// ([`press`]), and idle host copies and staging buffers go after 2 s
+/// ([`ram_idle_ms`]).
+pub(crate) fn ram_pressure() -> bool {
+    let limit = ram_trim_bytes();
+    limit > 0 && commit_headroom().is_some_and(|h| h < limit)
+}
+
+/// At the sweep, with `pressed` ([`ram_pressure`]) and the idle host lists
+/// it let go: under pressure the pooled snapshot buffers
+/// (`crate::shadow::drain_pool`) and the spare scratch chunks
+/// ([`drain_spare_chunks`]) go too. One line when the pressure begins
+/// (saying what went) and one when it ends.
+fn press(pressed: bool, lists: usize) {
+    static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let was = PRESSED.swap(pressed, Ordering::Relaxed);
+    let headroom = commit_headroom().unwrap_or(0) >> 20;
+    if !pressed {
+        if was {
+            tracing::info!("memory pressure over: {headroom} MiB of commit headroom (VICTORY_RAM_TRIM_MB)");
+        }
+        return;
+    }
+    let (snaps, snap_bytes) = crate::shadow::drain_pool();
+    let (chunks, chunk_bytes) = drain_spare_chunks();
+    if !was {
+        tracing::info!(
+            "memory pressure: {headroom} MiB of commit headroom, under {} MiB (VICTORY_RAM_TRIM_MB): let go of {snaps} \
+             pooled snapshot buffers ({} MiB), {chunks} spare scratch chunks ({} MiB) and {lists} idle host lists; \
+             idle host copies and staging buffers go after 2 s while it lasts",
+            ram_trim_bytes() >> 20,
+            snap_bytes >> 20,
+            chunk_bytes >> 20
+        );
+    }
+    trail(|| format!("memory pressure: {snaps} snapshot buffers, {chunks} scratch chunks, {lists} idle host lists let go"));
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -374,17 +476,52 @@ static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic:
 /// 85 % of the card's budget, windows of title memory and staging buffers
 /// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
 /// scratch chunks.
+///
+/// It was a mitigation for device losses on AMD; on another card with less
+/// than 48 GiB of RAM it is off by default (`VICTORY_KEEP_FREED=1` turns it
+/// on, `=0` off, on any card): what it keeps is private memory a 32 GB PC
+/// does not have to spare. Until the host device is made the card is not
+/// known, and it counts as on.
 pub(crate) fn keep_freed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
+    if let Some(&on) = ON.get() {
+        return on;
+    }
+    if let Some(v) = std::env::var_os("VICTORY_KEEP_FREED") {
+        return *ON.get_or_init(|| v != "0");
+    }
+    let vendor = HOST_VENDOR.load(Ordering::Relaxed);
+    if vendor == 0 {
+        return true;
+    }
+    *ON.get_or_init(|| keep_freed_for(vendor, total_physical_ram()))
 }
+
+/// [`keep_freed`]'s default for a card of PCI vendor `vendor` on a PC with
+/// `total` bytes of RAM.
+fn keep_freed_for(vendor: u32, total: Option<u64>) -> bool {
+    const AMD: u32 = 0x1002;
+    vendor == AMD || total.is_none_or(|t| t >= 48 << 30)
+}
+
+/// The PCI vendor of the host device's adapter (0 until it is made).
+static HOST_VENDOR: AtomicU32 = AtomicU32::new(0);
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
+/// What counts is the lower of free RAM and commit headroom
+/// ([`commit_headroom`]), and under [`ram_pressure`] it is 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    if ram_pressure() {
+        return 2_000;
+    }
+    let free = match (avail_phys, commit_headroom()) {
+        (Some(phys), Some(commit)) => Some(phys.min(commit)),
+        (phys, commit) => phys.or(commit),
+    };
+    ram_idle_for(free, keep_freed())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -439,7 +576,10 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    // Twice as often while the PC is short of memory.
+    let pressed = ram_pressure();
+    let every = if pressed { 500 } else { 1000 };
+    if now < last + every
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -453,6 +593,42 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    let lists = crate::list::let_go_idle(pressed);
+    press(pressed, lists);
+}
+
+/// How often a submission behind flights makes a moment with nothing in the
+/// air for the sweep, with the present sent ahead ([`late_free_present`]),
+/// in milliseconds (`VICTORY_SWEEP_MS`, 1500). Each such settle waits for
+/// everything sent: a frame-sized hitch.
+fn sweep_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SWEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1500).max(1))
+}
+
+/// Whether the sweep's settle ([`sweep_ms`]) is made now, `waited` ms
+/// after the last sweep, with `(started, finished)` submissions
+/// ([`submissions`]): only when at most one is still running, so that
+/// settling costs little, else put off for up to four more periods, after
+/// which it settles whatever is in the air, as before.
+fn sweep_due((started, finished): (u64, u64), waited: u64) -> bool {
+    const PUT_OFF: u64 = 4;
+    finished + 1 >= started || waited > sweep_ms() * (1 + PUT_OFF)
+}
+
+/// Whether the sweep behind flights settles them first (on by default;
+/// `VICTORY_SWEEP_SETTLE=0`: it runs behind them, opt-in). What the sweep
+/// lets go of (shadow, texture and resource `let_go_idle`, idle host
+/// lists, spare scratch chunks) it picks by reference counts alone: a list
+/// in the air holds every copy, staging buffer and window it names until
+/// it is reset, a descriptor slot holds what it views, and a slot the
+/// title changed retires what it showed; and it hands what it picks to
+/// [`retire`], which drops nothing before every submission begun has run.
+/// What needs the card at rest is diagnostics only (`upcheck`), skipped
+/// there.
+fn sweep_settles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_SETTLE").is_none_or(|v| v != "0"))
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -514,9 +690,69 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        // Let go of on the reaper thread ([`reaper`]), if there is one.
+        let objects: Vec<Retired> = done.into_iter().map(|(_, r)| r).collect();
+        if let Some(tx) = reaper()
+            && let Err(std::sync::mpsc::SendError(Reaped::Objects(objects))) = tx.send(Reaped::Objects(objects))
+        {
+            drop(objects);
+        }
     }
 }
+
+/// The thread that lets go of what the host is done with
+/// (`VICTORY_REAPER=0`: whatever thread is done with it, as before):
+/// resetting the host lists of landed flights and keeping them for reuse
+/// ([`land`]), and dropping retired objects whose submissions have run
+/// ([`bury`]). Letting go of a list's upload memory, descriptor state and,
+/// past the pool's room, the list itself, and of retired resources, is the
+/// driver's work (allocations destroyed, addresses freed): on an RTX 4070 a
+/// seventh of the submitting thread's time for the lists, and as much again
+/// for the resources. Only what is already due is sent ([`bury_lag`] and
+/// [`land`]'s lag are unchanged). From local DexNom-tree work.
+fn reaper() -> Option<&'static std::sync::mpsc::Sender<Reaped>> {
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Reaped>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel::<Reaped>();
+            std::thread::Builder::new()
+                .name("victory-reaper".into())
+                .spawn(move || {
+                    for reaped in rx {
+                        match reaped {
+                            Reaped::Lists(landed) => {
+                                let _reaping = crate::timeline::span("reaper: landed lists reset and given back");
+                                for (lists, order) in landed {
+                                    crate::list::recycle(lists, &order);
+                                }
+                            }
+                            Reaped::Objects(objects) => {
+                                let _reaping = crate::timeline::span("reaper: retired objects dropped");
+                                drop(objects);
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// What goes to the reaper thread ([`reaper`]): landed flights' host lists
+/// ([`land`]), or retired objects whose submissions have run ([`bury`]).
+enum Reaped {
+    Lists(Vec<(Vec<crate::list::Detached>, Vec<usize>)>),
+    Objects(Vec<Retired>),
+}
+
+// SAFETY: the lists have run and nothing else names them; D3D12 objects
+// may be released and reset on any thread (as `Line`, which held them,
+// and [`Retired`]).
+unsafe impl Send for Reaped {}
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
@@ -969,6 +1205,10 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // For [`keep_freed`].
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            HOST_VENDOR.store(desc.VendorId, Ordering::Relaxed);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1852,8 +2092,34 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
-/// The same with [`keep_freed`].
+/// The same with [`keep_freed`] (below 6 GiB of commit headroom
+/// [`SPARE_MOST`] all the same: [`spare_most`]).
 const SPARE_KEPT: u64 = 1 << 30;
+
+/// The most bytes of scratch chunks kept now.
+fn spare_most() -> u64 {
+    if keep_freed() && commit_headroom().is_none_or(|h| h >= 6 << 30) { SPARE_KEPT } else { SPARE_MOST }
+}
+
+/// Under memory pressure ([`press`]): every spare scratch chunk goes
+/// (retired, [`retire`]). Their count and bytes.
+fn drain_spare_chunks() -> (usize, u64) {
+    let gone = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let bytes: u64 = gone.iter().map(|(_, size)| *size).sum();
+    let n = gone.len();
+    ALIVE[3].fetch_sub(n as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(n as u64, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    if n > 0 {
+        retire(gone);
+    }
+    (n, bytes)
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1934,7 +2200,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
@@ -3244,6 +3510,19 @@ fn land() {
         let mut line = line();
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
+    };
+    if landed.is_empty() {
+        return;
+    }
+    // On the reaper thread ([`reaper`]): the lists have run; nothing else
+    // holds them.
+    let landed = match reaper() {
+        Some(tx) => match tx.send(Reaped::Lists(landed)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(Reaped::Lists(landed))) => landed,
+            Err(_) => return,
+        },
+        None => landed,
     };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
@@ -5559,15 +5838,22 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            if upcheck::on() {
-                upcheck::at_rest(self);
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_ms() {
+            if !sweep_settles() {
+                // Behind the flights: what it lets go of is retired, and
+                // dropped once they have run ([`sweep_settles`]).
+                sweep();
+                SWEPT.store(now_ms(), Ordering::Relaxed);
+            } else if sweep_due(submissions(), now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed))) {
+                // With the present sent ahead nothing else brings a moment
+                // with nothing in the air: one is made for the sweep.
+                self.settle(&mut submitted, WHY_SYNC);
+                if upcheck::on() {
+                    upcheck::at_rest(self);
+                }
+                sweep();
+                SWEPT.store(now_ms(), Ordering::Relaxed);
             }
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
@@ -6302,6 +6588,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.list.reset_count();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6948,6 +7235,29 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((buffer, at, (data + at as usize) as *mut u8))
+    }
+
+    /// After a reset, before the list waits in the pool
+    /// (`crate::list::recycle`): an indirect-argument scratch buffer past
+    /// 1 MiB, grown for one big execution, and the batched clamps' buffers
+    /// past the first go (retired: [`retire_resource`]); the next recording
+    /// that needs them makes them again. Card memory a pooled list held
+    /// for the run otherwise.
+    pub(crate) fn trim_args(&self) {
+        let big = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > 1 << 20) { slot.take() } else { None }
+        };
+        if let Some((buffer, _)) = big {
+            retire_resource(buffer);
+        }
+        let extra = {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            if args.0.len() > 1 && args.1 == 0 { args.0.split_off(1) } else { Vec::new() }
+        };
+        for buffer in extra {
+            retire_resource(buffer);
+        }
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -10488,6 +10798,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::ram_idle_for(Some(12 << 30), true), 300_000);
         assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true), 10_000);
         assert_eq!(super::ram_idle_for(None, true), 10_000);
+
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
@@ -10500,6 +10811,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn sweep_settles_when_flights_are_few_or_late() {
+        let period = super::sweep_ms();
+        // None or one in the air: at once.
+        assert!(super::sweep_due((10, 10), period + 1));
+        assert!(super::sweep_due((10, 9), period + 1));
+        // More: put off for four more periods.
+        assert!(!super::sweep_due((10, 7), period + 1));
+        assert!(!super::sweep_due((10, 7), period * 5));
+        assert!(super::sweep_due((10, 7), period * 5 + 1));
+    }
+
+    #[test]
+    fn memory_governor_defaults() {
+        const GIB: u64 = 1 << 30;
+        // Kept freed memory: always on AMD, elsewhere from 48 GiB of RAM.
+        assert!(super::keep_freed_for(0x1002, Some(16 * GIB)));
+        assert!(!super::keep_freed_for(0x10de, Some(32 * GIB)));
+        assert!(!super::keep_freed_for(0x10de, Some(48 * GIB - 1)));
+        assert!(super::keep_freed_for(0x10de, Some(64 * GIB)));
+        assert!(super::keep_freed_for(0x10de, None));
+        // The pressure line: 4 GiB of commit headroom on 32 GiB and below.
+        assert_eq!(super::ram_trim_for(None, Some(32 * GIB - 1)), 4 * GIB);
+        assert_eq!(super::ram_trim_for(None, Some(64 * GIB)), 2 * GIB);
+        assert_eq!(super::ram_trim_for(None, None), 2 * GIB);
+        assert_eq!(super::ram_trim_for(Some(0), Some(16 * GIB)), 0);
+        assert_eq!(super::ram_trim_for(Some(1000), None), 1000 << 20);
     }
 }
 

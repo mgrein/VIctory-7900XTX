@@ -205,10 +205,11 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put there (`crate::host::now_ms`,
+/// for [`let_go_idle`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -231,8 +232,53 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+///
+/// The count goes with the PC's RAM ([`idle_cap_for`]): every idle list
+/// keeps its command allocators at the size of its biggest recording, some
+/// 9 GB of private memory between them in the world on a 7900 XTX.
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let count = *MOST.get_or_init(|| {
+        // `VICTORY_LIST_IDLE=<n>`: that many, whatever the RAM.
+        std::env::var("VICTORY_LIST_IDLE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| idle_cap_for(crate::host::total_physical_ram()))
+    });
+    (count, 256 << 20)
+}
+
+/// [`idle_most`]'s count for `total` bytes of physical RAM: 512 from
+/// 48 GiB on, 160 at 32 GiB and below, in a line between (512 if the RAM
+/// is not known, as before).
+fn idle_cap_for(total: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const LOW: (u64, usize) = (32 * GIB, 160);
+    const HIGH: (u64, usize) = (48 * GIB, 512);
+    let Some(total) = total else {
+        return HIGH.1;
+    };
+    if total >= HIGH.0 {
+        HIGH.1
+    } else if total <= LOW.0 {
+        LOW.1
+    } else {
+        let span = (HIGH.1 - LOW.1) as u64;
+        LOW.1 + ((total - LOW.0) * span / (HIGH.0 - LOW.0)) as usize
+    }
+}
+
+/// The most calls a recording of a host list may have made for the list
+/// to go back to the pool (`VICTORY_LIST_FAT=<calls>`, 16384 by default;
+/// 0: every list goes back, as before): its command allocators keep the
+/// memory of the biggest recording across resets, and a list past this is
+/// retired at [`recycle`] instead (`HostList` `rec::Rec::recorded_most`).
+#[cfg(windows)]
+fn list_fat() -> u32 {
+    static FAT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FAT.get_or_init(|| std::env::var("VICTORY_LIST_FAT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16384))
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -249,13 +295,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -273,19 +319,82 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let most = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
+            continue;
+        }
+        // A list that once recorded a big frame: its allocators keep that
+        // memory for good ([`list_fat`]).
+        let fat = list_fat();
+        if fat > 0 && host.list.recorded_most() > fat {
+            LISTS_FAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::retire(host);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        host.trim_args();
         let bytes = host.scratch_kept();
+        let now = crate::host::now_ms();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+        if idle.0.len() < most.0 && idle.1 + bytes <= most.1 {
+            idle.0.push(Idle(host, bytes, now));
             idle.1 += bytes;
         }
     }
+}
+
+/// Host lists retired at [`recycle`] for their size ([`list_fat`]) since
+/// the start.
+#[cfg(windows)]
+static LISTS_FAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a list may wait in the pool unused before [`let_go_idle`] lets
+/// it go, and how many are kept whatever their age (fewer under memory
+/// pressure, when every one past them goes).
+const IDLE_LIST_MS: u64 = 3_000;
+const IDLE_LIST_FLOOR: usize = 32;
+const IDLE_LIST_FLOOR_PRESSED: usize = 16;
+
+/// How many of the pool's lists, taken when (`stamps`, oldest first: lists
+/// are put at the end and taken from there) and `now`, [`let_go_idle`] lets
+/// go from the front: those unused for [`IDLE_LIST_MS`] past the floor, or
+/// with `pressed` every one past the smaller floor.
+fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool) -> usize {
+    if pressed {
+        return stamps.len().saturating_sub(IDLE_LIST_FLOOR_PRESSED);
+    }
+    let room = stamps.len().saturating_sub(IDLE_LIST_FLOOR);
+    stamps.iter().take(room).take_while(|&&at| now.saturating_sub(at) >= IDLE_LIST_MS).count()
+}
+
+/// At the sweep: lets go of pooled host lists nobody took for a while
+/// ([`idle_aged_out`]): after a burst of submissions (a loading screen, a
+/// busy frame) the pool keeps hundreds of lists, each with its allocators'
+/// memory, that the frames after it never take again. `pressed`: the PC is
+/// short of memory (`crate::host::ram_pressure`). They are retired
+/// (`crate::host::retire`), so the driver's work of freeing them is done
+/// where retired objects are dropped. As fxceless/victory-fork PR #1240's
+/// `list::let_go_idle` (fxceless), with an age.
+#[cfg(windows)]
+pub(crate) fn let_go_idle(pressed: bool) -> usize {
+    let now = crate::host::now_ms();
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let stamps: Vec<u64> = idle.0.iter().map(|Idle(_, _, at)| *at).collect();
+        let n = idle_aged_out(&stamps, now, pressed);
+        if n == 0 {
+            return 0;
+        }
+        let gone: Vec<Idle> = idle.0.drain(..n).collect();
+        idle.1 = idle.1.saturating_sub(gone.iter().map(|Idle(_, bytes, _)| *bytes).sum());
+        gone
+    };
+    let n = gone.len();
+    crate::host::trail(|| format!("sweep: {n} idle host lists let go{}", if pressed { " (memory pressure)" } else { "" }));
+    crate::host::retire(gone);
+    n
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2379,6 +2488,41 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_list_cap_follows_ram() {
+        use super::idle_cap_for;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(idle_cap_for(None), 512);
+        assert_eq!(idle_cap_for(Some(16 * GIB)), 160);
+        assert_eq!(idle_cap_for(Some(32 * GIB)), 160);
+        // A "32 GB" PC reports a little less than 32 GiB.
+        assert_eq!(idle_cap_for(Some(31 * GIB + 900 * (1 << 20))), 160);
+        assert_eq!(idle_cap_for(Some(40 * GIB)), 336);
+        assert_eq!(idle_cap_for(Some(48 * GIB)), 512);
+        assert_eq!(idle_cap_for(Some(64 * GIB)), 512);
+    }
+
+    #[test]
+    fn idle_lists_age_out_past_the_floor() {
+        use super::{IDLE_LIST_FLOOR, IDLE_LIST_FLOOR_PRESSED, IDLE_LIST_MS, idle_aged_out};
+        let now = 100_000;
+        // Few lists: none goes, however old.
+        assert_eq!(idle_aged_out(&vec![0; IDLE_LIST_FLOOR], now, false), 0);
+        // 40 old and 10 fresh: the old past the floor go, from the front.
+        let mut stamps = vec![now - IDLE_LIST_MS - 1; 40];
+        stamps.extend(std::iter::repeat_n(now - 10, 10));
+        assert_eq!(idle_aged_out(&stamps, now, false), 50 - IDLE_LIST_FLOOR);
+        // 10 old and 40 fresh: only the 10 old.
+        let mut stamps = vec![now - IDLE_LIST_MS; 10];
+        stamps.extend(std::iter::repeat_n(now - 10, 40));
+        assert_eq!(idle_aged_out(&stamps, now, false), 10);
+        // All fresh: none, unless the PC is short of memory.
+        let stamps = vec![now; 50];
+        assert_eq!(idle_aged_out(&stamps, now, false), 0);
+        assert_eq!(idle_aged_out(&stamps, now, true), 50 - IDLE_LIST_FLOOR_PRESSED);
+        assert_eq!(idle_aged_out(&stamps[..8], now, true), 0);
+    }
+
     use super::*;
     use crate::object::slot;
 
