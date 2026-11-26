@@ -76,6 +76,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_BVH_APPROXIMATE",
+            "VICTORY_WAVE_SAME",
+            "VICTORY_WAVE_LIVE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
