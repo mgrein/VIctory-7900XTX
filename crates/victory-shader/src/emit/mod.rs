@@ -131,7 +131,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_STRUCTURES,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_in_slot, constants_in_slot_switch, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -2698,14 +2698,28 @@ mod tests {
         }
     }
 
-    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a table's constant buffer is
-    /// read as raw bytes through the raw twin of its slot, at a constant and
-    /// at a computed offset, and gives the dwords the constant buffer read
-    /// gives without the switch; the slot itself (a constant buffer view, of
-    /// other bytes here) is not read.
-    #[test]
+    /// How renderer port 5 has a program read a table's constant buffer
+    /// ([`port5_tables`]).
     #[cfg(windows)]
-    fn table_constant_buffers_read_as_raw_bytes_through_their_twins() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Port5 {
+        /// Off: as a constant buffer.
+        Off,
+        /// `VICTORY_PORT_CBV=1` on a host with raw twins: through the twin.
+        Twins,
+        /// `VICTORY_PORT_CBV=1` on a host without them, `VICTORY_PORT_CBV_SLOT`
+        /// not 1: as a constant buffer, as with the port off.
+        NoTwins,
+        /// `VICTORY_PORT_CBV=1` and `VICTORY_PORT_CBV_SLOT=1` on a host without
+        /// them: through the slot itself, a raw view.
+        Slot,
+    }
+
+    /// The program of [`port5_tables`]: a constant buffer and a UAV in a
+    /// table; the constant buffer read at a constant (0x10, four dwords) and a
+    /// computed (`s0`) offset, the five dwords stored.
+    #[cfg(windows)]
+    fn port5_program() -> super::NativeProgram {
         let mut words: Vec<u32> = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202,
@@ -2734,7 +2748,7 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let native = super::NativeProgram {
+        super::NativeProgram {
             stage: super::HwStage::Cs,
             wave64: false,
             vgprs: 4,
@@ -2745,48 +2759,69 @@ mod tests {
             used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
+        }
+    }
+
+    /// [`port5_program`] translated as `mode` has it.
+    #[cfg(windows)]
+    fn port5_lowered(native: &super::NativeProgram, mode: Port5) -> super::lower::Lowered {
         // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
         const TWINS: u32 = 2;
-        let lowered = |raw: bool| {
-            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
-            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
-            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let l = super::lower::lower(&super::lower::Parts {
-                native: &native,
-                p: &p,
-                st: &st,
-                io: &io,
-                res: &res,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                prims: Vec::new(),
-                mesh_stride: 0,
-            })
-            .unwrap();
-            super::shader::CONSTANTS_RAW_HERE.set(None);
-            super::shader::RAW_VIEWS_HERE.set(None);
-            l
-        };
-        let (before, after) = (lowered(false), lowered(true));
-        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        super::shader::CONSTANTS_RAW_HERE.set(Some(mode != Port5::Off));
+        super::shader::RAW_VIEWS_HERE.set(Some(if mode == Port5::Twins { TWINS } else { 0 }));
+        super::shader::CONSTANTS_IN_SLOT_HERE.set(Some(mode == Port5::Slot));
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        super::shader::CONSTANTS_RAW_HERE.set(None);
+        super::shader::RAW_VIEWS_HERE.set(None);
+        super::shader::CONSTANTS_IN_SLOT_HERE.set(None);
+        l
+    }
+
+    /// Renderer port 5: [`port5_program`] translated as each of `modes` has
+    /// it, run on the software adapter (`warp`) or the card, reads the
+    /// dwords the constant buffer read gives with the port off. The slot a
+    /// mode does not read holds other bytes (a constant buffer view of
+    /// them). `false`: no such adapter, nothing run.
+    #[cfg(windows)]
+    fn port5_tables(modes: &[Port5], warp: bool) -> bool {
+        let native = port5_program();
+        let off = port5_lowered(&native, Port5::Off);
         let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
         let other: Vec<u32> = vec![0xdead_beef; 64];
         let s0 = 8u32;
         let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
         let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        for (raw, l) in [(false, before), (true, after)] {
+        let Ok(host) = super::host::Host::new(warp) else {
+            eprintln!("no {} adapter; the dispatch is skipped", if warp { "software" } else { "hardware" });
+            return false;
+        };
+        eprintln!("adapter: {:?}", host.adapter_name());
+        for &mode in modes {
+            let l = port5_lowered(&native, mode);
+            match mode {
+                Port5::Off => {}
+                Port5::NoTwins => assert_eq!(l.dxil, off.dxil, "without twins or the slot switch, translations stay"),
+                Port5::Twins | Port5::Slot => assert_ne!(l.dxil, off.dxil, "{mode:?} changes the translation"),
+            }
             let mut dxil = l.dxil;
             if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
                 v.validate(&mut dxil).unwrap();
             }
-            let Ok(host) = super::host::Host::new(true) else {
-                eprintln!("no software adapter; the dispatch is skipped");
-                return;
-            };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
                 dxil,
@@ -2800,15 +2835,16 @@ mod tests {
                 approximate: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
-            let views: Vec<super::host::View> = if raw {
-                vec![
+            let raw = super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw };
+            let views: Vec<super::host::View> = match mode {
+                Port5::Off | Port5::NoTwins => vec![super::host::View::Cbv(&data), super::host::View::RawUav(8)],
+                Port5::Twins => vec![
                     super::host::View::Cbv(&other),
                     super::host::View::RawUav(8),
-                    super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                    raw,
                     super::host::View::RawUav(8),
-                ]
-            } else {
-                vec![super::host::View::Cbv(&data), super::host::View::RawUav(8)]
+                ],
+                Port5::Slot => vec![raw, super::host::View::RawUav(8)],
             };
             let out = host
                 .dispatch(
@@ -2822,10 +2858,37 @@ mod tests {
                     },
                 )
                 .unwrap();
-            // The UAV is written where the program reads it: its twin with the switch.
+            // The UAV is written where the program reads it: its twin with twins.
             let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
-            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
+            assert_eq!(got.as_deref(), Some(&want[..]), "{mode:?}: {out:x?}");
         }
+        true
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a table's constant buffer is
+    /// read as raw bytes through the raw twin of its slot, at a constant and
+    /// at a computed offset, and gives the dwords the constant buffer read
+    /// gives without the switch; the slot itself (a constant buffer view, of
+    /// other bytes here) is not read.
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_read_as_raw_bytes_through_their_twins() {
+        port5_tables(&[Port5::Off, Port5::Twins], true);
+    }
+
+    /// Renderer port 5 on a host without raw twins (NVIDIA's capped view
+    /// heap): with `VICTORY_PORT_CBV_SLOT=1` a table's constant buffer is read
+    /// as raw bytes through its slot itself, a raw view, and gives the dwords
+    /// the constant buffer read gives with the port off; without the slot
+    /// switch the translation is the port-off one. On the card (the RTX 4070
+    /// here), then on the software adapter.
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_read_as_raw_bytes_through_their_slots_without_twins() {
+        let modes = [Port5::Off, Port5::NoTwins, Port5::Slot];
+        let card = port5_tables(&modes, false);
+        let warp = port5_tables(&modes, true);
+        assert!(card || warp, "no adapter at all");
     }
 
     #[test]

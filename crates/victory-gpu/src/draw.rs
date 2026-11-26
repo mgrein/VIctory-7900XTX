@@ -3618,14 +3618,14 @@ impl State {
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                Some(shadow) => match host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                    Ok(()) => {
                                         crate::port_cbv::in_place(size);
                                         continue;
                                     }
-                                    crate::port_cbv::copied(false);
-                                }
-                                None => crate::port_cbv::copied(true),
+                                    Err(why) => crate::port_cbv::copied(Some(why)),
+                                },
+                                None => crate::port_cbv::copied(None),
                             }
                         }
                         let Some((buffer, gpu, to, views)) = list.scratch_held(u64::from(size)) else {

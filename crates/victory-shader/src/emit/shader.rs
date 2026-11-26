@@ -265,6 +265,35 @@ pub fn constants_raw() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: the switch of [`constants_in_slot`].
+    pub(crate) static CONSTANTS_IN_SLOT_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_PORT_CBV_SLOT=1` (off by default; read only with `VICTORY_PORT_CBV=1`): see
+/// [`constants_in_slot`]. Part of the translation: the shader cache keys on it when port 5 is on.
+pub fn constants_in_slot_switch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_IN_SLOT_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV_SLOT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Renderer port 5 on a host without raw twins ([`raw_views`] 0: a capped view heap,
+/// NVIDIA), with `VICTORY_PORT_CBV_SLOT=1`: a table's constant buffer (or one picked from
+/// the heap) is read as raw bytes through its slot itself, and the host makes every slot that
+/// shows a constant buffer a raw view of its bytes instead of a constant buffer view (the
+/// title's in place where they start on 16 bytes, else a copy, as before). Without it such a
+/// host reads them as constant buffers, copied at every submission (only root ones are read
+/// raw). The same slot read as a constant buffer by one program and as raw bytes by another
+/// cannot be: with the switch every translated program reads constant buffers raw.
+pub fn constants_in_slot() -> bool {
+    constants_raw() && raw_views() == 0 && constants_in_slot_switch()
+}
+
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
 pub fn raw_views() -> u32 {
     #[cfg(test)]

@@ -3198,6 +3198,17 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        // Renderer port 5 without twins (`VICTORY_PORT_CBV_SLOT=1`):
+        // translated programs read the slot itself as raw bytes.
+        if self.twin(index).is_none() && crate::port_cbv::in_slot() {
+            // SAFETY: a live buffer that holds the range.
+            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            // The memory is the caller's, of `buffer` (on 256 bytes).
+            create_srv(Some(buffer), Some(&raw_desc(first, desc.SizeInBytes / 4)), self.at(index));
+            self.put(index);
+            self.keep(index, holds.then(|| buffer.clone().into()));
+            return;
+        }
         // The memory is the caller's, of `buffer`.
         let made = views.is_some_and(|(kept, offset)| {
             let host = host().expect("checked above");
@@ -3252,34 +3263,44 @@ impl HostHeap {
     /// (title memory in place) with nothing copied: its raw twin a raw view
     /// of those bytes, which translated shaders read; the slot itself a
     /// constant buffer view of them where that can be (on 256 bytes), else a
-    /// null one. Whether the twin was made (`false`: the caller copies the
-    /// bytes as before).
-    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+    /// null one. Without twins, with `VICTORY_PORT_CBV_SLOT=1`
+    /// ([`crate::port_cbv::in_slot`]), the slot itself a raw view of them,
+    /// which translated shaders read then. `Err`: why not (the caller
+    /// copies the bytes as before).
+    pub(crate) fn constant_raw_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        size: u32,
+    ) -> Result<(), crate::port_cbv::Refused> {
+        use crate::port_cbv::Refused;
         if host().is_none() {
-            return false;
+            return Err(Refused::Other);
         }
-        let Some(twin) = self.twin(index) else { return false };
+        let twin = self.twin(index);
+        if twin.is_none() && !crate::port_cbv::in_slot() {
+            return Err(Refused::NoTwin);
+        }
         // SAFETY: a live buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
-        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
-            return false;
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width) else {
+            return Err(Refused::Other);
         };
+        if !crate::port_cbv::raw_ok(offset) {
+            return Err(Refused::Unaligned);
+        }
         let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
         if bytes == 0 {
-            return false;
+            return Err(Refused::Other);
         }
-        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: (bytes / 4) as u32,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
+        let raw = raw_desc(offset / 4, (bytes / 4) as u32);
+        let Some(twin) = twin else {
+            // The range lies in the live buffer, which the slot holds.
+            create_srv(Some(buffer), Some(&raw), self.at(index));
+            self.put(index);
+            self.keep(index, Some(buffer.clone().into()));
+            return Ok(());
         };
         let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
@@ -3293,7 +3314,7 @@ impl HostHeap {
         create_srv(Some(buffer), Some(&raw), twin);
         self.twin_made(index, true);
         self.keep_buffer(index, Some(buffer));
-        true
+        Ok(())
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -4431,13 +4452,16 @@ fn constant_bytes(size: u32) -> u32 {
 /// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
 /// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
 /// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
-/// translated shaders read. `false` (nothing made): not on 16 bytes.
+/// translated shaders read. `in_slot` (no twin, `VICTORY_PORT_CBV_SLOT=1`,
+/// [`crate::port_cbv::in_slot`]): the raw view at `at` itself, which
+/// translated shaders read then. `false` (nothing made): not on 16 bytes.
 fn constant_twinned(
     buffer: &ID3D12Resource,
     gpu: u64,
     size: u32,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    in_slot: bool,
 ) -> bool {
     if host().is_none() {
         return false;
@@ -4445,9 +4469,24 @@ fn constant_twinned(
     // SAFETY: a live buffer.
     let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
     let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+        if in_slot {
+            crate::port_cbv::slot_refused();
+        }
         return false;
     };
     let room = width - offset;
+    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+    let raw = raw_desc(offset / 4, (bytes / 4) as u32);
+    if in_slot && twin.is_none() {
+        // The range lies in the live buffer.
+        if bytes == 0 {
+            null_buffer_view(at);
+        } else {
+            create_srv(Some(buffer), Some(&raw), at);
+        }
+        crate::port_cbv::twinned();
+        return true;
+    }
     let cbv = if gpu.is_multiple_of(256) && room >= 256 {
         D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -4456,33 +4495,34 @@ fn constant_twinned(
     } else {
         D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
     };
-    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
     // The ranges lie in the live buffer.
     create_cbv(Some(buffer), &cbv, at);
-    {
-        if let Some(twin) = twin {
-            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_R32_TYPELESS,
-                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: offset / 4,
-                        NumElements: (bytes / 4) as u32,
-                        StructureByteStride: 0,
-                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                    },
-                },
-            };
-            if bytes == 0 {
-                null_buffer_view(twin);
-            } else {
-                create_srv(Some(buffer), Some(&raw), twin);
-            }
-            crate::port_cbv::twinned();
+    if let Some(twin) = twin {
+        if bytes == 0 {
+            null_buffer_view(twin);
+        } else {
+            create_srv(Some(buffer), Some(&raw), twin);
         }
+        crate::port_cbv::twinned();
     }
     true
+}
+
+/// A raw view of `elements` dwords from dword `first` on.
+fn raw_desc(first: u64, elements: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: elements,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    }
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4507,9 +4547,12 @@ fn make_twinned(
             let gpu = shadow.gpu(address);
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
-                // through the twin; a constant buffer view there would be read
-                // raw, with no end on AMD.
-                return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone().into()));
+                // through the twin (a constant buffer view there would be read
+                // raw, with no end on AMD), or through the slot itself on a
+                // host without twins with `VICTORY_PORT_CBV_SLOT=1`.
+                let in_slot = twin.is_none() && crate::port_cbv::in_slot();
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin, in_slot)
+                    .then(|| Some(shadow.buffer.clone().into()));
             }
             if gpu % 256 != 0 {
                 once!(
@@ -5180,6 +5223,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
+        // Renderer port 5 through slots: translated shaders read the slot as
+        // raw bytes, so a null raw view.
+        View::Constant(..) if crate::port_cbv::in_slot() => return null_buffer_view(at),
         View::Constant(..) => {
             // A zero location makes a null view.
             return create_cbv(None, &D3D12_CONSTANT_BUFFER_VIEW_DESC::default(), at);
@@ -6033,6 +6079,138 @@ void main(uint i : SV_DispatchThreadID) { dst.Store(i * 4, src.Load(i * 4)); }
             // SAFETY: the buffer's mapped bytes; the run was waited for.
             let read = unsafe { std::slice::from_raw_parts(out_data.cast_const(), 128) }.to_vec();
             assert_eq!(read, title(address, 128), "view {n} reads its own bytes");
+        }
+    }
+
+    /// Renderer port 5 through slots (`VICTORY_PORT_CBV_SLOT=1`, a host
+    /// without raw twins): a constant buffer of title memory in place on 16
+    /// bytes, not on 256, made as its slot's raw view (`constant_twinned` with
+    /// `in_slot`) reads on the card what the copied path reads (its bytes
+    /// copied to 256 bytes, a constant buffer view of the copy); one off 16
+    /// bytes is refused (copied as before).
+    #[test]
+    fn constant_buffers_off_256_bytes_read_in_place_through_their_slots_as_copied() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        // The same 64 dwords out: through a raw view, through a constant
+        // buffer view (the copied path's).
+        const RAW: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint i : SV_DispatchThreadID) { dst.Store(i * 4, src.Load(i * 4)); }
+";
+        const CBV: &str = "#define RS \"DescriptorTable(CBV(b0)), UAV(u0)\"
+cbuffer c : register(b0) { uint4 v[16]; };
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint i : SV_DispatchThreadID) { uint4 r = v[i >> 2]; uint k = i & 3; dst.Store(i * 4, k == 0 ? r.x : k == 1 ? r.y : k == 2 ? r.z : r.w); }
+";
+        let pipeline = |source: &str| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; then the
+            // blob's own bytes, which hold the root signature too.
+            unsafe {
+                let made = D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    windows::core::s!("port5"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                );
+                if made.is_err() {
+                    let e = errors.map(|e| {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(e.GetBufferPointer().cast::<u8>(), e.GetBufferSize())).into_owned()
+                    });
+                    panic!("not compiled: {e:?}");
+                }
+                let code = code.expect("code");
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).expect("a root signature");
+                let pso = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                        ..Default::default()
+                    })
+                    .expect("a pipeline");
+                (root, pso)
+            }
+        };
+        let (raw_root, raw_pso) = pipeline(RAW);
+        let (cbv_root, cbv_pso) = pipeline(CBV);
+        // SAFETY: a plain shader-visible heap of one view.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let (at, table) = unsafe { (heap.GetCPUDescriptorHandleForHeapStart(), heap.GetGPUDescriptorHandleForHeapStart()) };
+        // Title memory the card reads in place (renderer port 1), and the
+        // copied path's upload memory.
+        const TITLE: usize = 1 << 16;
+        let (title, title_data) = host.shared_buffer(TITLE as u64).expect("a buffer");
+        let (copy, copy_data) = host.shared_buffer(256).expect("a buffer");
+        let (out, out_data) = host.shared_buffer(256).expect("a buffer");
+        // SAFETY: live buffers.
+        let (title_gpu, copy_gpu, out_gpu) = unsafe { (title.GetGPUVirtualAddress(), copy.GetGPUVirtualAddress(), out.GetGPUVirtualAddress()) };
+        // SAFETY: the buffer's own mapped bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(title_data, TITLE) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add((i >> 8) as u8 ^ 11);
+        }
+        let mut rig = crate::inplace::Rig::new(&host.device).expect("a rig");
+        let mut run = |root: &ID3D12RootSignature, pso: &ID3D12PipelineState| -> Vec<u8> {
+            // SAFETY: the buffer's 256 mapped bytes, nothing running.
+            unsafe { std::ptr::write_bytes(out_data, 0, 256) };
+            // SAFETY: an open list of the rig's; live objects.
+            rig.run(|list| unsafe {
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.SetComputeRootSignature(root);
+                list.SetPipelineState(pso);
+                list.SetComputeRootDescriptorTable(0, table);
+                list.SetComputeRootUnorderedAccessView(1, out_gpu);
+                list.Dispatch(1, 1, 1);
+            })
+            .expect("ran");
+            // SAFETY: the buffer's mapped bytes; the run was waited for.
+            unsafe { std::slice::from_raw_parts(out_data.cast_const(), 256) }.to_vec()
+        };
+        for off in [0x10u64, 0x110, 0x1a0, 0x1f0, 0x4000] {
+            let want = bytes[off as usize..off as usize + 256].to_vec();
+            // In place, through the slot's raw view.
+            assert!(constant_twinned(&title, title_gpu + off, 256, at, None, true), "{off:#x} on 16 bytes");
+            let in_place = run(&raw_root, &raw_pso);
+            // Copied as before: the bytes to 256, a constant buffer view.
+            // SAFETY: the copy's 256 mapped bytes, nothing running.
+            unsafe { std::ptr::copy_nonoverlapping(want.as_ptr(), copy_data, 256) };
+            create_cbv(Some(&copy), &D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: copy_gpu, SizeInBytes: 256 }, at);
+            let copied = run(&cbv_root, &cbv_pso);
+            assert_eq!(copied, want, "{off:#x}: the copied path reads the title's bytes");
+            assert_eq!(in_place, copied, "{off:#x}: in place through the slot as copied");
+            eprintln!("{off:#x}: in place = copied ({} bytes)", in_place.len());
+        }
+        // Off 16 bytes: no raw view can begin there; refused, copied as before.
+        for off in [0x14u64, 0x18, 0x1c, 0x104] {
+            assert!(!constant_twinned(&title, title_gpu + off, 256, at, None, true), "{off:#x} refused");
         }
     }
 
