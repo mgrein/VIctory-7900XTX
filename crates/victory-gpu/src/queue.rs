@@ -888,6 +888,8 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::host::reflex::mark(crate::host::reflex::Marker::SimulationEnd, frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -953,6 +955,8 @@ extern "system" fn present(
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
+        // Last: pacing after the present (`VICTORY_PACE_AFTER`).
+        crate::frame::after_present();
         return S_OK;
     }
     #[cfg(windows)]
@@ -973,11 +977,17 @@ extern "system" fn present(
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
+    // How far the title runs ahead of the card, the swap chain's waitable
+    // object and Reflex's sleep (`crate::host::latency`).
+    #[cfg(windows)]
+    crate::host::latency::title_presented(frame);
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    // Last: pacing after the present (`VICTORY_PACE_AFTER`).
+    crate::frame::after_present();
     S_OK
 }
 

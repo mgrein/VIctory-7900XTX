@@ -3970,10 +3970,12 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+pub(crate) mod latency;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 pub(crate) mod rec;
+pub(crate) mod reflex;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -5536,10 +5538,18 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
+    // (The present uses [`Host::execute_own_fenced`]; tests and diagnostics this.)
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     fn execute_own(&self, list: &HostList) -> u64 {
+        self.execute_own_fenced(list).0
+    }
+
+    /// [`Host::execute_own`], and the host fence value the flight signals
+    /// (0 with the number).
+    fn execute_own_fenced(&self, list: &HostList) -> (u64, u64) {
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
-            return 0;
+            return (0, 0);
         };
         let number = sent.number;
         {
@@ -5569,8 +5579,9 @@ impl Host {
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
         RELAY_MOVED.notify_one();
+        let fence = *submitted;
         drop(submitted);
-        number
+        (number, fence)
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -8876,6 +8887,9 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    /// The flags it was made with (`DXGI_SWAP_CHAIN_FLAG`s, [`latency`]),
+    /// kept for its resizes and presents.
+    flags: u32,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9272,23 +9286,34 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            // A failed creation is tried again at most once a second.
+            if !latency::may_try() {
+                return None;
+            }
+            let made = self.presenter(width, height, format);
+            latency::tried(made.is_ok());
+            *presenter = match made {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                    tracing::warn!(error = %e, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            // A failed resize is tried again at most once a second.
+            if !latency::may_try() {
+                return None;
+            }
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(p.flags as i32))
             };
+            latency::tried(resized.is_ok());
             match resized {
                 Ok(()) => {
                     (p.width, p.height, p.format) = (width, height, format);
@@ -9370,8 +9395,10 @@ impl Host {
             copy.close();
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let (flown, fence) = self.execute_own_fenced(copy);
                     p.ahead[i].1 = flown;
+                    // For the title's wait for the card (`VICTORY_FRAMES_AHEAD`).
+                    latency::note_flight(frame, fence);
                     flown
                 }
                 None => {
@@ -9392,7 +9419,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let args = latency::present_args(p.flags);
+            reflex::mark(reflex::Marker::PresentStart, frame);
+            let mut hr = p.swap_chain.Present(args.0, args.1);
+            if let Some(again) = latency::retry_args(args, hr) {
+                hr = p.swap_chain.Present(again.0, again.1);
+            }
+            latency::presented(hr);
+            reflex::mark(reflex::Marker::PresentEnd, frame);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -9419,7 +9453,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let mut desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -9430,17 +9464,27 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: latency::swap_chain_flags(&factory),
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let mut made = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None);
+            // A swap chain that may tear that could not be made is made
+            // again without tearing.
+            if let Err(e) = &made
+                && let Some(flags) = latency::without_tearing(desc.Flags)
+            {
+                tracing::warn!(error = %e, "no swap chain that may tear: one without tearing is made");
+                desc.Flags = flags;
+                made = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None);
+            }
+            let swap_chain = made?.cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            latency::swap_chain_made(self, &swap_chain, desc.Flags, (width, height), format.0);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                flags: desc.Flags,
                 width,
                 height,
                 format,

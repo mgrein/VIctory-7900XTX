@@ -2,7 +2,8 @@
 //! (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and runs device callbacks on connect and disconnect; the title's look at
+//! the current reading reads the host too when the last read is old.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -59,7 +60,25 @@ const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
-const POLL: Duration = Duration::from_millis(8);
+
+/// How often the poll thread reads the host: `VICTORY_INPUT_POLL_MS` (read
+/// here once; 4 by default, at least 1; it was 8).
+fn poll_every() -> Duration {
+    let ms = std::env::var("VICTORY_INPUT_POLL_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+    Duration::from_millis(ms.max(1))
+}
+
+/// Whether the title's look at the current reading reads the host first when
+/// the last read is more than [`FRESH_US`] old (`VICTORY_INPUT_FRESH`, read
+/// here once; on unless `=0`).
+fn fresher() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_INPUT_FRESH").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// How old (µs) the last read of the host may be when the title asks for the
+/// current reading.
+const FRESH_US: u64 = 1_000;
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -346,6 +365,9 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    /// Host slots that have reported input away from rest on their current
+    /// connection.
+    seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -361,6 +383,8 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// When the host was last read ([`now`]).
+    last_read: AtomicU64,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -393,8 +417,10 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            last_read: AtomicU64::new(0),
             state: Mutex::new(State {
                 slots: Default::default(),
+                seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -415,12 +441,26 @@ impl Hub {
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source, one_pad());
         hub.poll();
-        std::thread::spawn(move || {
+        let every = poll_every();
+        let spawned = std::thread::Builder::new().name("victory-input".into()).spawn(move || {
+            // Input waits for no one: the poll thread comes before the
+            // title's busy threads.
+            #[cfg(windows)]
+            // SAFETY: plain calls on this thread.
+            unsafe {
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+                };
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            }
             loop {
-                std::thread::sleep(POLL);
+                std::thread::sleep(every);
                 hub.poll();
             }
         });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no input poll thread");
+        }
         hub
     }
 
@@ -430,13 +470,41 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let events = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            self.read(&mut **source)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
+    }
+
+    /// Reads the host and records what it found, with the source held (so
+    /// reads are recorded in the order they were made); the callbacks to
+    /// run.
+    fn read(&self, source: &mut dyn Source) -> Vec<Event> {
+        let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+        let keys = source.keys();
+        self.last_read.store(now(), Ordering::Relaxed);
+        self.state().poll(&self.devices, self.one_pad, pads, keys)
+    }
+
+    /// On the title's thread, before it takes the current reading: the host
+    /// is read again if the last read is more than [`FRESH_US`] old and no
+    /// read runs now ([`fresher`]). Callbacks are never run here (they call
+    /// back into us): they wait for the poll thread.
+    fn refresh(&self) {
+        if !fresher() || now().saturating_sub(self.last_read.load(Ordering::Relaxed)) <= FRESH_US {
+            return;
+        }
+        let Ok(mut source) = self.source.try_lock() else {
+            return;
+        };
+        let events = self.read(&mut **source);
+        drop(source);
+        if !events.is_empty() {
+            let mut state = self.state();
+            let later = std::mem::replace(&mut state.pending, events);
+            state.pending.extend(later);
+        }
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -484,6 +552,20 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // A wireless receiver answers for a switched-off pad with an all-zero
+        // state: a slot is empty until its current connection reports input
+        // (from Marvisak fd94726e, Fuzeofficial, #1430). It connected the
+        // empty slot and took the keyboard's stand-in pad away.
+        let pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
+            let Some(pad) = pads[slot] else {
+                self.seen_input[slot] = false;
+                return None;
+            };
+            if pad != PadState::default() {
+                self.seen_input[slot] = true;
+            }
+            self.seen_input[slot].then_some(pad)
+        });
         if one_pad {
             let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
@@ -629,6 +711,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
+    hub.refresh();
     let state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
@@ -1619,7 +1702,7 @@ mod tests {
 
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: A, ..Default::default() });
         hub.poll();
         assert_eq!(log.lock().unwrap().len(), 1);
     }
@@ -1666,7 +1749,7 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState { buttons: A, ..Default::default() });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1688,7 +1771,7 @@ mod tests {
     #[test]
     fn devices_are_found_by_id_and_rumble_reaches_the_host() {
         let (hub, host) = fake();
-        host.lock().unwrap().pads[2] = Some(PadState::default());
+        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, ..Default::default() });
         hub.poll();
         let device = &hub.devices[2] as *const Device;
         let info = slot::<extern "system" fn(*const Device) -> *const u8, _>(device, 0x18);
@@ -1710,5 +1793,88 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// From Marvisak fd94726e (Fuzeofficial, #1430), without the scripted
+    /// keys of that fork.
+    #[test]
+    fn switched_off_receiver_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // A receiver answering with an all-zero state while its pad is off
+        // stays disconnected and leaves the keyboard stand-in active.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'W')];
+        hub.poll();
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(stand_in), PadState { buttons: A, left_y: 1.0, ..Default::default() });
+        release(stand_in);
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+
+        // Turning the pad on and pressing a button connects slot 0, drops the
+        // stand-in, and keeps that first press as the current reading.
+        host.lock().unwrap().pads[0] = Some(PadState { buttons: B, ..Default::default() });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed).buttons, B);
+        release(pressed);
+
+        // Back at rest on the same connection, it stays connected.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 3);
+        let rest = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+
+        // A disconnect forgets it: all zero again is empty again.
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            log.lock().unwrap()[3..],
+            [(0, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
+        );
+    }
+
+    /// The title's look at the current reading reads the host when the last
+    /// read is old: a change since the poll is there without one, and its
+    /// callbacks wait for the next poll.
+    #[test]
+    fn current_reading_reads_a_host_change_without_a_poll() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        host.lock().unwrap().keys = vec![key(b'W')];
+        std::thread::sleep(Duration::from_millis(2));
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).left_y, 1.0);
+        release(r);
+        // A pad that came: its reading is there, its callback is not yet.
+        host.lock().unwrap().pads[3] = Some(PadState { buttons: Y, ..Default::default() });
+        std::thread::sleep(Duration::from_millis(2));
+        let r = current(hub, GAMEPAD_KIND, 3).unwrap();
+        assert_eq!(pad(r).buttons, Y);
+        release(r);
+        assert_eq!(log.lock().unwrap().len(), 1);
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(3, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
     }
 }

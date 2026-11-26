@@ -533,6 +533,9 @@ impl Work for Job {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
         }
+        if matches!(self, Job::Run(..) | Job::Joined(..)) {
+            render_submit(true, 0);
+        }
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
@@ -570,6 +573,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, shown) => {
+                render_submit(false, shown.frame);
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -584,6 +588,30 @@ impl Work for Job {
 }
 
 static LANE: Lane<Job> = Lane::new();
+
+/// NVIDIA Reflex's render-submit markers (`VICTORY_REFLEX`), on the lane: the
+/// first submission after a present begins the next frame's, the present of
+/// `frame` ends them.
+fn render_submit(first: bool, frame: u64) {
+    use crate::host::reflex::{Marker, mark, on};
+    /// The last frame presented, and whether its next frame's submissions began.
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    static BEGUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !on() {
+        return;
+    }
+    if first {
+        if !BEGUN.swap(true, Relaxed) {
+            mark(Marker::RenderSubmitStart, SHOWN.load(Relaxed) + 1);
+        }
+    } else {
+        if !BEGUN.swap(false, Relaxed) {
+            mark(Marker::RenderSubmitStart, frame);
+        }
+        mark(Marker::RenderSubmitEnd, frame);
+        SHOWN.store(frame, Relaxed);
+    }
+}
 
 /// Submissions and presents in the line that have not been given to the host
 /// yet.
@@ -819,6 +847,9 @@ pub(super) fn present(this: This, texture: Option<(std::sync::Arc<crate::resourc
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    // How far the title runs ahead of the card, the swap chain's waitable
+    // object and Reflex's sleep (`crate::host::latency`).
+    crate::host::latency::title_presented(shown.frame);
 }
 
 /// For the frame-rate line.
