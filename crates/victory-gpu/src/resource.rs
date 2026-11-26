@@ -2203,19 +2203,11 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Copies replaced by ones with more levels: held by nothing, so they go
+    // even when the sweep keeps everything else.
+    drain_replaced();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
-    }
-    // Copies replaced by ones with more levels, as any let go.
-    {
-        let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
-        let (gone, keep): (Vec<_>, Vec<_>) =
-            replaced.drain(..).partition(|(at, _)| crate::host::long_ago(*at, 1000, IDLE_FRAMES));
-        *replaced = keep;
-        drop(replaced);
-        for (_, made) in gone {
-            crate::host::retire(made);
-        }
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2370,6 +2362,29 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// Retires the host copies [`want_level`] replaced by ones with more levels
+/// once no thread that asked for one can still be about to record its use
+/// (a second and a few frames on). Nothing else holds them: this runs
+/// whatever `VICTORY_TEXTURE_SWEEP` and `VICTORY_SWEEP` say, which keep
+/// the copies textures hold, not these (they piled up for the run).
+#[cfg(windows)]
+pub(crate) fn drain_replaced() {
+    const IDLE_FRAMES: u64 = 4;
+    let gone = {
+        let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if replaced.is_empty() {
+            return;
+        }
+        let (gone, keep): (Vec<_>, Vec<_>) =
+            replaced.drain(..).partition(|(at, _)| crate::host::long_ago(*at, 1000, IDLE_FRAMES));
+        *replaced = keep;
+        gone
+    };
+    for (_, made) in gone {
+        crate::host::retire(made);
     }
 }
 

@@ -681,6 +681,9 @@ fn sweep() {
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
+        // What nothing holds goes all the same (`resource::let_go_idle`
+        // does this otherwise).
+        crate::resource::drain_replaced();
         return;
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
