@@ -5104,11 +5104,21 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
             rebase(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, base);
         }
+        // Cubes and their arrays likewise (after Belobug/VIctory-Belobug-AMD
+        // e9428969 and maren-halv/VIctory-DXR 443fd629).
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            rebase(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, base);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            rebase(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, base);
+        }
         _ => {}
     }
 }
 
-/// Keeps a 2-D texture view inside the `levels` its texture has: a view
+/// Keeps a 2-D or cube texture view inside the `levels` its texture has: a view
 /// past them is an invalid call that removes the device on NVIDIA's driver.
 fn within_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
     fn fit(most: &mut u32, count: &mut u32, levels: u32) {
@@ -5126,6 +5136,14 @@ fn within_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            fit(&mut t.MostDetailedMip, &mut t.MipLevels, levels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            fit(&mut t.MostDetailedMip, &mut t.MipLevels, levels);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
             fit(&mut t.MostDetailedMip, &mut t.MipLevels, levels);
         }
         _ => {}
@@ -5736,6 +5754,28 @@ mod tests {
         assert_eq!(raw_within(1024, 0, u64::MAX), Some((0, 256)));
         let far = (u64::from(u32::MAX) + 10) * 16;
         assert_eq!(raw_within(1 << 40, far, 64), Some((far / 4, 16)), "a start past 32 bits is kept");
+    }
+
+    /// Cube views of a copy made without its largest levels are rebased
+    /// and kept inside the copy's levels, as 2-D ones are.
+    #[test]
+    fn cube_views_of_a_capped_copy_stay_inside_its_levels() {
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 0, 13, 0, 0, 0, 0]);
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        desc.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: 3, MipLevels: 13, ResourceMinLODClamp: 4.0 };
+        from_base(&mut desc, 2);
+        within_levels(&mut desc, 11);
+        // SAFETY: the member its dimension says.
+        let t = unsafe { desc.Anonymous.TextureCube };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp), (1, 10, 2.0));
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        desc.Anonymous.TextureCubeArray =
+            D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: 14, MipLevels: u32::MAX, First2DArrayFace: 6, NumCubes: 2, ResourceMinLODClamp: 0.0 };
+        from_base(&mut desc, 2);
+        within_levels(&mut desc, 11);
+        // SAFETY: as above.
+        let t = unsafe { desc.Anonymous.TextureCubeArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels, t.First2DArrayFace, t.NumCubes), (10, u32::MAX, 6, 2));
     }
 
     /// A 2-D texture's view as an array of one is rebased as a plain one is,
