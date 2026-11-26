@@ -3201,10 +3201,18 @@ impl HostHeap {
         // Renderer port 5 without twins (`VICTORY_PORT_CBV_SLOT=1`):
         // translated programs read the slot itself as raw bytes.
         if self.twin(index).is_none() && crate::port_cbv::in_slot() {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
-            // The memory is the caller's, of `buffer` (on 256 bytes).
-            create_srv(Some(buffer), Some(&raw_desc(first, desc.SizeInBytes / 4)), self.at(index));
+            // The raw view stays inside the buffer and starts on 16 bytes
+            // (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`): the constant buffer's size
+            // rounded up to 256 reached past the end of a buffer made for it
+            // alone, an invalid call that lost the device (run xh10).
+            match slot_raw_desc(buffer, gpu, size) {
+                // The memory is the caller's, of `buffer`.
+                Some(raw) => create_srv(Some(buffer), Some(&raw), self.at(index)),
+                None => {
+                    crate::port_cbv::slot_refused();
+                    null_buffer_view(self.at(index));
+                }
+            }
             self.put(index);
             self.keep(index, holds.then(|| buffer.clone().into()));
             return;
@@ -4509,6 +4517,27 @@ fn constant_twinned(
 }
 
 /// A raw view of `elements` dwords from dword `first` on.
+/// The raw view of the constant buffer of `size` bytes at `gpu` of `buffer`
+/// that a slot shows under renderer port 5's slot reads
+/// ([`crate::port_cbv::in_slot`]): from a 16-byte boundary (else `None`), as
+/// long as the constant buffer view would be but never past the buffer's end.
+fn slot_raw_desc(buffer: &ID3D12Resource, gpu: u64, size: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let offset = gpu.checked_sub(base).filter(|&o| o < width)?;
+    raw_span(offset, width, size).map(|(first, elements)| raw_desc(first, elements))
+}
+
+/// [`slot_raw_desc`]'s first dword and dwords for a constant buffer of
+/// `size` bytes `offset` bytes into a buffer of `width` bytes.
+fn raw_span(offset: u64, width: u64, size: u32) -> Option<(u64, u32)> {
+    if !offset.is_multiple_of(16) || offset >= width {
+        return None;
+    }
+    let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+    (bytes > 0).then(|| (offset / 4, (bytes / 4) as u32))
+}
+
 fn raw_desc(first: u64, elements: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
@@ -5416,6 +5445,21 @@ mod tests {
         assert_eq!(view(0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
         assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
         assert_eq!(view(1, 2, 1.5), (0, 1, 0.0));
+    }
+
+    /// A slot's raw view of a constant buffer never reaches past its buffer,
+    /// and starts on 16 bytes or is not made.
+    #[test]
+    fn slot_raw_views_stay_inside_their_buffer() {
+        // 100 bytes at the start of a buffer of 100: the view's 256 would
+        // reach past it.
+        assert_eq!(raw_span(0, 100, 100), Some((0, 25)));
+        assert_eq!(raw_span(256, 4 << 20, 200), Some((64, 64)));
+        // The last 64 bytes of a chunk.
+        assert_eq!(raw_span((4 << 20) - 64, 4 << 20, 64), Some((((4 << 20) - 64) / 4, 16)));
+        assert_eq!(raw_span(8, 4096, 64), None, "off 16 bytes");
+        assert_eq!(raw_span(4096, 4096, 64), None, "past the end");
+        assert_eq!(raw_span(0, 2, 64), None, "no whole dword");
     }
 
     /// A 2-D texture's view as an array of one is rebased as a plain one is,
