@@ -91,6 +91,11 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// The bytes [`by_address`] counted against its share of the card's
+    /// memory for this copy ([`BY_ADDRESS_CARD_BYTES`]), given back when it
+    /// goes; 0 for any other copy and for one whose card side is in the PC's
+    /// memory.
+    by_address_card: u64,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -2828,6 +2833,9 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.by_address_card != 0 {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(self.by_address_card, Ordering::Relaxed);
+        }
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3466,6 +3474,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            by_address_card: 0,
             changes_only: Default::default(),
             mapped: false,
             place: None,
@@ -5867,14 +5876,27 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    // The share is counted only for what is on the card: an ask past it, and
+    // a buffer the card refused, give their bytes back, and so does the copy
+    // when it goes (`Drop`). It used to be only ever added to, so that after
+    // one ask past the share every later arena was put in the PC's memory
+    // for the rest of the run (Belobug e9428969).
+    let on_card = if room && take_share(&BY_ADDRESS_CARD_BYTES, len, most) {
+        let buffer = host.uav_buffer(len);
+        if buffer.is_none() {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+        }
+        buffer
     } else {
         None
     };
+    let counted = if on_card.is_some() { len } else { 0 };
     let buffer = match on_card {
         Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+        None => match host.shared_buffer(len) {
+            Some((buffer, _)) => buffer,
+            None => return None,
+        },
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
@@ -5884,6 +5906,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_card = counted;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
@@ -5897,6 +5920,25 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     carded(&shadow);
     Some(shadow)
+}
+
+/// Bytes of title memory by address that [`by_address`] has on the card
+/// now, against its share (`VICTORY_MEMORY_CARD_MB`).
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory by address on the card, in bytes (for the memory line).
+pub(crate) fn by_address_card_bytes() -> u64 {
+    BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Takes `len` bytes of a share of `most`, counted in `used`: whether they
+/// fit. Bytes that do not fit are not left counted.
+fn take_share(used: &AtomicU64, len: u64, most: u64) -> bool {
+    if used.fetch_add(len, Ordering::Relaxed) + len <= most {
+        return true;
+    }
+    used.fetch_sub(len, Ordering::Relaxed);
+    false
 }
 
 /// The MiB of title memory by address [`by_address`] puts on the card by
@@ -6247,6 +6289,25 @@ mod window_tests {
         // Without dedupe both would be picked to reach a 40 MiB cap.
         let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
         assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+    }
+
+    /// An ask past the share of the card's memory leaves the count as it
+    /// was, so that a later one that fits is still taken, and bytes given
+    /// back make room again.
+    #[test]
+    fn a_share_of_the_card_refused_is_not_left_counted() {
+        use super::take_share;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let used = AtomicU64::new(0);
+        assert!(take_share(&used, 60, 100));
+        assert!(!take_share(&used, 50, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 60);
+        assert!(take_share(&used, 40, 100));
+        assert!(!take_share(&used, 1, 100));
+        // A copy that goes gives its bytes back.
+        used.fetch_sub(60, Ordering::Relaxed);
+        assert!(take_share(&used, 60, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 100);
     }
 
     /// The card's share of title memory by address: 22 % of the budget,
