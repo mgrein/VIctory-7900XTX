@@ -52,7 +52,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<Pending>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -102,6 +102,51 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// The ranges a copy's shaders write ([`Shadow::writing`]), in the order
+/// they were declared, each once, and the same ranges in a set: dispatches
+/// declare the same ranges thousands of times, and whether one is declared
+/// already was a walk over all of them (after fxceless/victory-fork PR
+/// #1159, fffluffy-dev). Read as the list; changed only through its own
+/// methods, which keep the two alike.
+#[derive(Default)]
+struct Pending {
+    ranges: Vec<(usize, usize)>,
+    set: std::collections::HashSet<(usize, usize)>,
+}
+
+impl std::ops::Deref for Pending {
+    type Target = Vec<(usize, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.ranges
+    }
+}
+
+impl Pending {
+    /// Whether `range` is declared.
+    fn contains(&self, range: &(usize, usize)) -> bool {
+        self.set.contains(range)
+    }
+
+    /// Declares `range`, unless it is already.
+    fn push(&mut self, range: (usize, usize)) {
+        if self.set.insert(range) {
+            self.ranges.push(range);
+        }
+    }
+
+    /// Keeps the ranges `keep` says to.
+    fn retain(&mut self, mut keep: impl FnMut(&(usize, usize)) -> bool) {
+        let set = &mut self.set;
+        self.ranges.retain(|r| {
+            let kept = keep(r);
+            if !kept {
+                set.remove(r);
+            }
+            kept
+        });
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1047,6 +1092,81 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+#[cfg(test)]
+mod writing_tests {
+    use super::{Pending, outside};
+
+    /// The parts of `[from, to)` no range of `pending` holds, cutting each
+    /// out in turn as `Shadow::writing` did, and the lists that made.
+    fn one_at_a_time(from: usize, to: usize, pending: &[(usize, usize)]) -> (Vec<(usize, usize)>, usize) {
+        let (mut parts, mut lists) = (vec![(from, to)], 1);
+        for &(a, e) in pending {
+            let mut rest = Vec::with_capacity(parts.len() + 1);
+            lists += 1;
+            for (from, to) in parts {
+                if e <= from || a >= to {
+                    rest.push((from, to));
+                    continue;
+                }
+                if from < a {
+                    rest.push((from, a));
+                }
+                if e < to {
+                    rest.push((e, to));
+                }
+            }
+            parts = rest;
+        }
+        (parts.into_iter().filter(|&(a, e)| a < e).collect(), lists)
+    }
+
+    /// Overlapping, repeated, touching and empty declared ranges: one pass
+    /// gives the same non-empty parts, in order, with two lists a range
+    /// instead of one per range declared before it (fxceless/victory-fork
+    /// PR #1159, fffluffy-dev).
+    #[test]
+    fn a_new_range_s_parts_are_those_one_cut_at_a_time_gave() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        let (mut before, mut after) = (0, 0);
+        let mut pending = Pending::default();
+        for _ in 0..960 {
+            let a = next(1 << 16);
+            let range = (a, a + [0, 1, 16, 256, 4096, 40_000][next(6)]);
+            let (old, lists) = one_at_a_time(range.0, range.1, &pending);
+            let new = outside(range.0, range.1, pending.to_vec());
+            assert_eq!(new.iter().copied().filter(|&(a, e)| a < e).collect::<Vec<_>>(), old, "{range:?}");
+            assert!(new.windows(2).all(|w| w[0].1 <= w[1].0), "in order, apart");
+            (before, after) = (before + lists, after + 2);
+            let had = pending.ranges.contains(&range);
+            assert_eq!(pending.contains(&range), had);
+            pending.push(range);
+            assert_eq!(pending.len(), pending.set.len());
+        }
+        assert!(after * 100 < before, "lists for 960 declared ranges: {before} one at a time, {after} in one pass");
+    }
+
+    /// The set and the list of declared ranges stay alike through pushes
+    /// of ranges declared already and through what is let go.
+    #[test]
+    fn declared_ranges_are_listed_once_and_let_go_from_both() {
+        let mut pending = Pending::default();
+        for r in [(0, 16), (8, 32), (0, 16), (64, 80), (8, 32)] {
+            pending.push(r);
+        }
+        assert_eq!(*pending, vec![(0, 16), (8, 32), (64, 80)]);
+        pending.retain(|&(a, _)| a != 8);
+        assert_eq!(*pending, vec![(0, 16), (64, 80)]);
+        assert!(!pending.contains(&(8, 32)) && pending.contains(&(64, 80)));
+        pending.push((8, 32));
+        assert_eq!(*pending, vec![(0, 16), (64, 80), (8, 32)]);
+        assert_eq!(pending.set.len(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -2973,7 +3093,7 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let_go_unheld(&mut map, idle)
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2988,6 +3108,28 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// Takes the windows `keys` out of the table, of those still held by the
+/// table alone. Threads remember windows ([`FOUND`]) without the table's
+/// lock: the count of changes goes up first, then each is looked at again.
+/// A thread that took one up before the count went up holds it now, and
+/// it stays; one that takes it up after sees the count changed and does
+/// not hand it out. (Nothing changes, and the count stays, when there are
+/// none: this runs before every submission.)
+fn let_go_unheld(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, keys: Vec<(u64, u64)>) -> Vec<Arc<Shadow>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    tables_changed();
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let mut gone = Vec::with_capacity(keys.len());
+    for key in keys {
+        if map.get(&key).is_some_and(|s| Arc::strong_count(s) == 1) {
+            gone.extend(map.remove(&key));
+        }
+    }
+    gone
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -3064,6 +3206,26 @@ impl Shadow {
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// A window outside buffers is handed out for an ask of `[address,
+    /// end)`: it was used now ([`let_go_idle`]), what was asked of it widens,
+    /// and asks without a length are counted (the memory line).
+    fn asked_for(&self, address: u64, end: u64, unsized_ask: bool) {
+        // (Read first: the lines are shared by all recording threads.)
+        let now = crate::host::moment();
+        if self.used.load(Ordering::Relaxed) != now {
+            self.used.store(now, Ordering::Relaxed);
+        }
+        if self.asked[0].load(Ordering::Relaxed) > address {
+            self.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if self.asked[1].load(Ordering::Relaxed) < end {
+            self.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
+        if unsized_ask {
+            self.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether it is no copy but title memory in place (`crate::inplace`).
@@ -3206,24 +3368,12 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        // In one pass over the declared ranges, sorted ([`outside`]; after
+        // fxceless/victory-fork PR #1159, fffluffy-dev): cutting them out one
+        // at a time made a list per declared range for every new one
+        // (461,280 lists for 960 distinct ranges).
+        let (from, to) = self.inside(address, len);
+        let parts = outside(from, to, pending.iter().map(|&(a, e)| self.inside(a, e - a)).collect());
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
@@ -4966,15 +5116,34 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
+/// How often [`BUFFERS`] or the table of windows ([`LOOSE`]) was taken to
+/// be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// The table of windows changed, or is about to: what threads remember of
+/// it ([`FOUND`]) is of before. Bumped where a window is put in, and before
+/// one is taken out.
+fn tables_changed() {
+    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// An ask (address, bytes, whether it may take any window), the count of
+/// changes it was answered at, and the answer.
+type Found = (u64, u64, bool, u64, std::sync::Weak<Shadow>);
+
+/// Since the last memory line: asks for windows outside buffers answered by
+/// what the asking thread remembered, and by the tables.
+#[cfg(feature = "diagnostics")]
+static WINDOW_FINDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: [`WINDOW_FINDS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_finds() -> [u64; 2] {
+    [0, 1].map(|i| WINDOW_FINDS[i].swap(0, Ordering::Relaxed))
+}
 
 thread_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
@@ -4984,38 +5153,52 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
+/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not), for title
+/// buffers' copies and for windows outside buffers alike. Windows came in
+/// after fxceless/victory-fork PR #1237 (KyleS98; fxceless 32be36d5), which
+/// measured 117.2 -> 104.2 ms a frame (the buffers' part was here already):
+/// every bind of a draw asks for the copy of each range it reads, and an
+/// ask outside buffers went through both tables' locks each time.
 fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
 }
 
-fn found_at(address: u64, len: u64) -> usize {
-    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+fn found_at(address: u64, len: u64, any: bool) -> usize {
+    let h = (address ^ len.rotate_left(32) ^ u64::from(any) << 63).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 54) as usize % FOUND_MOST
 }
 
-/// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// What this thread remembers of an ask, if nothing changed since. A window
+/// handed out so is noted as asked for, as [`loose`] notes it.
+fn found(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, y, at, shadow) = f.get(found_at(address, len, any))?;
+        ((*a, *n, *y, *at) == (address, len, any, changed)).then(|| shadow.upgrade()).flatten()
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    if BUFFERS_CHANGED.load(Ordering::SeqCst) != changed {
+        return None;
+    }
+    if shadow.window {
+        #[cfg(feature = "diagnostics")]
+        WINDOW_FINDS[0].fetch_add(1, Ordering::Relaxed);
+        shadow.asked_for(address, address.saturating_add(len.max(1)), len <= 1);
+    }
+    Some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+fn remember(address: u64, len: u64, any: bool, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, false, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len, any)] = (address, len, any, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5065,6 +5248,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            // Before: a thread that remembers one of them hands it out no more.
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -5117,8 +5304,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
+    // With whole windows (the default with much RAM on an AMD card) there
+    // is one window to a cell and nothing to choose: exactly `find`.
     if !fine() {
         return find(address, len);
     }
@@ -5133,25 +5320,38 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
+    if quick && let Some(shadow) = found(address, len, any) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
+    // A window outside buffers, remembered from the count before either
+    // table was read: a change since, a window made or let go among them,
+    // leaves it unused.
+    let window = |changed: u64| {
+        let shadow = loose(address, end, len <= 1, any)?;
+        if quick {
+            #[cfg(feature = "diagnostics")]
+            WINDOW_FINDS[1].fetch_add(1, Ordering::Relaxed);
+            remember(address, len, any, changed, &shadow);
+        }
+        Some(shadow)
+    };
     {
         let map = buffers_read();
+        // (Nobody changes the map while this lock is held.)
+        let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, any, changed, shadow);
                 }
                 return Some(shadow.clone());
             }
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return window(changed);
             }
         }
     }
@@ -5163,8 +5363,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
+        // (The count after this lock's own change.)
+        let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return window(changed);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5240,23 +5442,71 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: what
+/// `VICTORY_WINDOW_KB` names, a power of two from 64 to 4096 (4 MiB for
+/// anything else).
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
 /// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
 /// window ends nearer to what is read. An ask without a length keeps the
 /// 4 MiB grid whatever is set: a root view reads from its address to its
 /// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// Unset, it is 256 KiB where windows are cut finer by default
+/// ([`fine_by_default`]: 40 GiB of RAM or less, or a card not AMD's), else
+/// 4 MiB as before. The same memory asked for with different ranges can
+/// then lie in more than one window; an ask takes a window alive that holds
+/// it before it makes one of its own ([`holder_below`]).
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+    *GRID.get_or_init(|| match std::env::var("VICTORY_WINDOW_KB") {
+        Ok(v) => grid(v.trim().parse::<u64>().ok()),
+        Err(_) => grid(fine_by_default().then_some(FINE_KB)),
     })
+}
+
+/// The grid of [`window`] where windows are cut finer by default, in KiB.
+const FINE_KB: u64 = 256;
+
+/// Whether windows are cut finer and tails are on unless their switches
+/// say otherwise ([`window`], [`tails`]): with 40 GiB of RAM or less, or on
+/// a card that is not AMD's. Windows on the 4 MiB grid held 3.3 GB for
+/// 1.6 GB ever asked for (run 60), and 513 of 782 were asked for without a
+/// length (run 65); on a 256 KiB grid with tails and windows that hold an
+/// ask taken, DexNom/VIctory PR #55 measured 1,499 MB of windows against
+/// 2,496. A 12 GB card and 32 GB of RAM need that room; a 24 GB AMD card
+/// with more RAM keeps what it had.
+fn fine_by_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let ram = total_physical_ram();
+        let amd = crate::host::host().map(|h| crate::indirect::amd(&h.device));
+        let on = fine_for(ram, amd);
+        tracing::info!(
+            ram_gib = ram.map(|r| r >> 30),
+            ?amd,
+            on,
+            "windows of title memory outside buffers cut on 256 KiB with tails by default \
+             (VICTORY_WINDOW_KB and VICTORY_WINDOW_TAILS say otherwise)"
+        );
+        on
+    })
+}
+
+/// [`fine_by_default`] for so much RAM (bytes) and a card that is AMD's or
+/// not (None: not known).
+fn fine_for(ram: Option<u64>, amd: Option<bool>) -> bool {
+    ram.is_some_and(|r| r <= 40 << 30) || amd == Some(false)
+}
+
+/// The host's physical RAM in bytes, from `GlobalMemoryStatusEx`.
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullTotalPhys)
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
@@ -5284,16 +5534,20 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// `VICTORY_WINDOW_TAILS=1` turns it on, any other value off; unset, it is
+/// on where windows are cut finer by default ([`fine_by_default`]). A
+/// longer tail is another host buffer than the shorter one: what was bound
+/// to the shorter stays right only because every list brings up to date
+/// the copy it bound (`draw.rs` keeps a root view's copy with its slot). It
+/// pays only together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB
+/// grid an ask with a length in the same cell makes the whole cell's
+/// window, and the tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => fine_by_default(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -5310,6 +5564,19 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
     let (cell, len) = window_of(address, end, WINDOW);
     let start = address & !(TAIL_STEP - 1);
     (start, cell + len - start)
+}
+
+/// Of `windows` (start, bytes), the one an ask of `[address, end)` that
+/// found no window of its own takes: the first that begins at or below the
+/// ask, and no lower than `lowest`, and holds all of it (DexNom/VIctory PR
+/// #55, wymd-wn118). An ask without a length and one with a length in the
+/// same cell name windows of different lengths, so without this the same
+/// title memory was copied once for each: 2,496 MB of windows lay over
+/// 1,636 MB of title memory there, 1,499 MB over 1,198 MB with it.
+fn holder_below(windows: impl Iterator<Item = (u64, u64)>, lowest: u64, address: u64, end: u64) -> Option<(u64, u64)> {
+    windows
+        .filter(|&(start, bytes)| start >= lowest && start <= address && start + bytes >= end)
+        .min()
 }
 
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
@@ -5392,14 +5659,22 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // At most so much on the card's own memory (`VICTORY_MEMORY_CARD_MB`,
+    // in MiB; unset, a share of the card's budget, [`memory_card_mb`]), and
+    // while it has room; past that the side shaders see is in the PC's
+    // memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
+        let budget = host.video_memory().map(|[budget, ..]| budget);
+        let mb = mb.unwrap_or_else(|| memory_card_mb(budget));
+        tracing::info!(
+            vram_budget_mb = budget.map(|b| b >> 20),
+            mb,
+            "title memory by address: at most so many MB of it on the card (VICTORY_MEMORY_CARD_MB)"
+        );
+        mb << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
@@ -5434,6 +5709,16 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The MiB of title memory by address [`by_address`] puts on the card by
+/// default for a local budget of so many bytes: 22 % of it, from 1 GiB to
+/// 4 GiB (4 GiB, as before, when the budget is not known). About 2.4 GB on a
+/// 12 GB card (budget near 11 GiB), so that the ray tracing structures and
+/// their arenas leave room for the title's textures; 4 GiB, unchanged, on a
+/// 24 GB card.
+pub(crate) fn memory_card_mb(budget: Option<u64>) -> u64 {
+    budget.map_or(4096, |b| ((b >> 20) * 22 / 100).clamp(1024, 4096))
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
@@ -5441,46 +5726,53 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
+    let note = |shadow: &Shadow| shadow.asked_for(address, end, unsized_ask);
+    // The window the ask takes, if it is there, and else the one it makes:
+    // the same under either lock.
+    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> ((u64, u64), Option<Arc<Shadow>>) {
+        let wanted = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask
+            // (one that begins in a cell below and reaches this far is
+            // passed over: the ask then makes its own).
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        if let Some(shadow) = map.get(&wanted) {
+            return (wanted, Some(shadow.clone()));
         }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        // None at exactly that: one alive that begins no lower than it and
+        // holds the whole ask serves it ([`holder_below`]). An ask without
+        // a length reads on to its window's end: the window must reach the
+        // end of the ask's cell, as the one it would make does. (Only where
+        // windows may be smaller than their cell: on the whole cells there
+        // is nothing else to take.)
+        if fine() {
+            let reach = if unsized_ask { cell + WINDOW } else { end };
+            let there = map.range((wanted.0, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            if let Some(key) = holder_below(there, wanted.0, address, reach) {
+                return (wanted, map.get(&key).cloned());
+            }
         }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
+        (wanted, None)
     };
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
-            note(shadow);
-            return Some(shadow.clone());
+        if let (_, Some(shadow)) = pick(&map) {
+            note(&shadow);
+            return Some(shadow);
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
+    let ((start, len), there) = pick(&map);
+    if let Some(shadow) = there {
+        note(&shadow);
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -5488,6 +5780,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5501,6 +5794,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5538,6 +5832,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 
@@ -5626,9 +5921,85 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits, fine_for, grid, holder, holder_below, longest_tail,
+        resolve_card_limits, tail_of, window_of,
     };
+
+    /// An ask that found no window of its own takes one that holds all of
+    /// it: the lengths the two kinds of ask make in one cell differ, so
+    /// without this the same title memory was copied once for each
+    /// (DexNom/VIctory PR #55).
+    #[test]
+    fn an_ask_takes_a_window_that_holds_it() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x9_0000, cell + 0xb_0000);
+        let lowest = cell;
+        assert_eq!(holder_below([].into_iter(), lowest, ask, end), None);
+        let mut there = vec![
+            (cell, 0x4_0000),             // ends below the ask
+            (cell + 0x8_0000, 0x2_0000),  // holds its first half only
+            (cell + 0x8_0000, 0x4_0000),  // holds it
+            (cell + 0x4_0000, 0x10_0000), // holds it, lower down
+            (cell + 0xa_0000, 0x40_0000), // begins above it
+        ];
+        // In order, as the table of windows walks them.
+        there.sort_unstable();
+        // The first that begins at or below the ask and holds it all.
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, end), Some((cell + 0x4_0000, 0x10_0000)));
+        // None below `lowest`, however well it holds the ask.
+        assert_eq!(holder_below(there.iter().copied(), cell + 0x8_0000, ask, end), Some((cell + 0x8_0000, 0x4_0000)));
+        // An ask without a length must find its cell's end in the window.
+        let cell_end = cell + WINDOW;
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, cell_end), None);
+        let tail = (cell + 0x8_0000, WINDOW - 0x8_0000);
+        there.push(tail);
+        there.sort_unstable();
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, cell_end), Some(tail));
+    }
+
+    /// An ask takes no window that begins below the lowest it may take, and
+    /// none that ends in the middle of it (DexNom/VIctory PR #55).
+    #[test]
+    fn a_window_must_begin_no_lower_than_the_ask_allows() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x2_0000, cell + 0x3_0000);
+        let there = [(cell, 0x10_0000), (cell + 0x1_0000, 0x10_0000)];
+        assert_eq!(holder_below(there.into_iter(), cell + 0x1_0000, ask, end), Some((cell + 0x1_0000, 0x10_0000)));
+        assert_eq!(holder_below(there.into_iter(), cell + 0x2_0000, ask, end), None);
+        let short = [(cell + 0x2_0000, 0x8000)];
+        assert_eq!(holder_below(short.into_iter(), cell, ask, end), None);
+    }
+
+    /// The card's share of title memory by address: 22 % of the budget,
+    /// from 1 to 4 GiB, 4 GiB when the budget is not known.
+    #[test]
+    fn title_memory_by_address_on_the_card_is_a_share_of_its_budget() {
+        use super::memory_card_mb;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(memory_card_mb(None), 4096);
+        // A 12 GB card (budget about 11 GiB).
+        assert_eq!(memory_card_mb(Some(11 * GIB)), 11 * 1024 * 22 / 100);
+        assert!((2400..2600).contains(&memory_card_mb(Some(11 * GIB))));
+        // Small cards keep 1 GiB, a 24 GB card keeps its 4 GiB.
+        assert_eq!(memory_card_mb(Some(2 * GIB)), 1024);
+        assert_eq!(memory_card_mb(Some(4 * GIB)), 1024);
+        assert_eq!(memory_card_mb(Some(23 * GIB)), 4096);
+        assert_eq!(memory_card_mb(Some(48 * GIB)), 4096);
+    }
+
+    /// Finer windows by default with 40 GiB of RAM or less, or on a card not
+    /// AMD's; a 24 GB AMD card with more RAM keeps the whole cells.
+    #[test]
+    fn windows_are_finer_by_default_on_less_ram_or_another_vendor() {
+        const GIB: u64 = 1 << 30;
+        assert!(fine_for(Some(32 * GIB), Some(true)));
+        assert!(fine_for(Some(40 * GIB), Some(true)));
+        assert!(!fine_for(Some(64 * GIB), Some(true)));
+        assert!(fine_for(Some(64 * GIB), Some(false)));
+        assert!(!fine_for(Some(64 * GIB), None));
+        assert!(!fine_for(None, None));
+        assert!(fine_for(None, Some(false)));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
@@ -5770,6 +6141,67 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod found_tests {
+    use super::{BUFFERS_CHANGED, LOOSE, Shadow, found, let_go_unheld, remember, tables_changed};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// A window a thread remembers is handed out from its memory while the
+    /// tables stay as they were, and is never handed out from there once it
+    /// is let go, though it is still alive.
+    #[test]
+    fn a_window_let_go_is_never_handed_out_from_what_a_thread_remembers() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let len = 64u64 << 10;
+        let Some((buffer, data)) = host.shared_buffer(len) else {
+            return;
+        };
+        // Title memory no other test asks about.
+        let start = 0xfe_0000_0000u64;
+        let (ask, bytes) = (start + 0x100, 0x40);
+        let mut shadow = Shadow::new(buffer, data, 0, start, len);
+        shadow.window = true;
+        let shadow = Arc::new(shadow);
+        LOOSE.write().unwrap().insert((start, len), shadow.clone());
+        tables_changed();
+        // Remembered as `lookup` remembers it (other tests may change the
+        // tables meanwhile: then it is remembered again).
+        let remembered = || {
+            (0..100).any(|_| {
+                let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+                remember(ask, bytes, true, changed, &shadow);
+                found(ask, bytes, true).is_some_and(|s| Arc::ptr_eq(&s, &shadow))
+            })
+        };
+        assert!(remembered());
+        // Asked for by that: noted as `loose` notes a window it hands out.
+        assert!(shadow.asked[0].load(Ordering::Relaxed) <= ask);
+        assert!(shadow.asked[1].load(Ordering::Relaxed) >= ask + bytes);
+        // Another kind of ask is not this one.
+        assert!(found(ask, bytes, false).is_none());
+        // Held here as well as by the table: not let go.
+        let kept = let_go_unheld(&mut LOOSE.write().unwrap(), vec![(start, len)]);
+        assert!(kept.is_empty());
+        assert!(LOOSE.read().unwrap().contains_key(&(start, len)));
+        assert!(remembered());
+        // Held by the table alone: let go, and from then on not handed out
+        // from what the thread remembers, alive as it still is.
+        let weak = Arc::downgrade(&shadow);
+        drop(shadow);
+        let gone = let_go_unheld(&mut LOOSE.write().unwrap(), vec![(start, len)]);
+        assert_eq!(gone.len(), 1);
+        assert!(!LOOSE.read().unwrap().contains_key(&(start, len)));
+        assert!(weak.upgrade().is_some());
+        assert!(found(ask, bytes, true).is_none());
+        drop(gone);
+        assert!(weak.upgrade().is_none());
+        assert!(found(ask, bytes, true).is_none());
     }
 }
 

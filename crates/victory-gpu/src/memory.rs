@@ -84,8 +84,39 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (3 GiB).
-const MOST: usize = 3 << 14;
+/// Pages held, at most: [`pages_most`].
+fn most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let budget = host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let mb = std::env::var("VICTORY_MEMORY_PAGES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let most = pages_most(budget, mb);
+        tracing::info!(
+            vram_budget_mb = budget.map(|b| b >> 20),
+            pages = most,
+            mb = (most as u64 * PAGE) >> 20,
+            "title memory by address: at most so many pages held (VICTORY_MEMORY_PAGES_MB)"
+        );
+        most
+    })
+}
+
+/// Pages held, at most, for a local budget of so many bytes and what
+/// `VICTORY_MEMORY_PAGES_MB` says (MiB of pages; it wins when set). Unset:
+/// 3 GiB of pages, as before, where the budget is 20 GiB or more or not
+/// known; below, as many as the card's share of title memory by address
+/// ([`crate::shadow::memory_card_mb`], about 2.4 GB on a 12 GB card) holds,
+/// 3 GiB at most. Pages past the card's share would go into the PC's memory
+/// (each 64 MiB arena twice) and be read over the bus by every step of
+/// every ray.
+fn pages_most(budget: Option<u64>, mb: Option<u64>) -> usize {
+    const BEFORE_MB: u64 = 3 << 10;
+    let mb = mb.unwrap_or_else(|| match budget {
+        Some(b) if b < 20 << 30 => crate::shadow::memory_card_mb(Some(b)).min(BEFORE_MB),
+        _ => BEFORE_MB,
+    });
+    ((mb << 20) / PAGE) as usize
+}
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -369,9 +400,9 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        if self.pages.len() >= most() {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(most = most(), "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -926,7 +957,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < most() && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1288,6 +1319,25 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    /// 3 GiB of pages on big cards and where the budget is not known, the
+    /// card's share on smaller ones, what the switch says when set.
+    #[test]
+    fn pages_held_are_the_cards_share_below_twenty_gib() {
+        const GIB: u64 = 1 << 30;
+        let pages = |mb: u64| ((mb << 20) / PAGE) as usize;
+        assert_eq!(pages_most(None, None), 3 << 14);
+        assert_eq!(pages_most(Some(24 * GIB), None), 3 << 14);
+        assert_eq!(pages_most(Some(20 * GIB), None), 3 << 14);
+        // A 12 GB card: its share, about 2.4 GB.
+        assert_eq!(pages_most(Some(11 * GIB), None), pages(11 * 1024 * 22 / 100));
+        // Never more than before, never under 1 GiB.
+        assert_eq!(pages_most(Some(19 * GIB), None), 3 << 14);
+        assert_eq!(pages_most(Some(2 * GIB), None), pages(1024));
+        // The switch wins.
+        assert_eq!(pages_most(Some(11 * GIB), Some(3072)), 3 << 14);
+        assert_eq!(pages_most(Some(24 * GIB), Some(512)), pages(512));
     }
 
     #[test]
