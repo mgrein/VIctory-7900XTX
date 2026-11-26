@@ -514,9 +514,69 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        // Let go of on the reaper thread ([`reaper`]), if there is one.
+        let objects: Vec<Retired> = done.into_iter().map(|(_, r)| r).collect();
+        if let Some(tx) = reaper()
+            && let Err(std::sync::mpsc::SendError(Reaped::Objects(objects))) = tx.send(Reaped::Objects(objects))
+        {
+            drop(objects);
+        }
     }
 }
+
+/// The thread that lets go of what the host is done with
+/// (`VICTORY_REAPER=0`: whatever thread is done with it, as before):
+/// resetting the host lists of landed flights and keeping them for reuse
+/// ([`land`]), and dropping retired objects whose submissions have run
+/// ([`bury`]). Letting go of a list's upload memory, descriptor state and,
+/// past the pool's room, the list itself, and of retired resources, is the
+/// driver's work (allocations destroyed, addresses freed): on an RTX 4070 a
+/// seventh of the submitting thread's time for the lists, and as much again
+/// for the resources. Only what is already due is sent ([`bury_lag`] and
+/// [`land`]'s lag are unchanged). From local DexNom-tree work.
+fn reaper() -> Option<&'static std::sync::mpsc::Sender<Reaped>> {
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Reaped>>> = OnceLock::new();
+    REAPER
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel::<Reaped>();
+            std::thread::Builder::new()
+                .name("victory-reaper".into())
+                .spawn(move || {
+                    for reaped in rx {
+                        match reaped {
+                            Reaped::Lists(landed) => {
+                                let _reaping = crate::timeline::span("reaper: landed lists reset and given back");
+                                for (lists, order) in landed {
+                                    crate::list::recycle(lists, &order);
+                                }
+                            }
+                            Reaped::Objects(objects) => {
+                                let _reaping = crate::timeline::span("reaper: retired objects dropped");
+                                drop(objects);
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// What goes to the reaper thread ([`reaper`]): landed flights' host lists
+/// ([`land`]), or retired objects whose submissions have run ([`bury`]).
+enum Reaped {
+    Lists(Vec<(Vec<crate::list::Detached>, Vec<usize>)>),
+    Objects(Vec<Retired>),
+}
+
+// SAFETY: the lists have run and nothing else names them; D3D12 objects
+// may be released and reset on any thread (as `Line`, which held them,
+// and [`Retired`]).
+unsafe impl Send for Reaped {}
 
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
@@ -3241,6 +3301,19 @@ fn land() {
         let mut line = line();
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
+    };
+    if landed.is_empty() {
+        return;
+    }
+    // On the reaper thread ([`reaper`]): the lists have run; nothing else
+    // holds them.
+    let landed = match reaper() {
+        Some(tx) => match tx.send(Reaped::Lists(landed)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(Reaped::Lists(landed))) => landed,
+            Err(_) => return,
+        },
+        None => landed,
     };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
