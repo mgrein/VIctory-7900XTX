@@ -2,6 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+#               (on NVIDIA through the card's own ray tracing, DXR 1.1 ray queries; -SoftwareRT: the emulated walk)
 # -Build        target\diag (the default, the build all measurements are of) or target\release (faster to play)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Nvidia       the NVIDIA profile even where no NVIDIA card is found (it is taken by itself on one; README.md, "NVIDIA")
@@ -13,6 +14,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$SoftwareRT,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$Nvidia,
@@ -51,6 +53,10 @@ if ($Nvidia) {
     # 80 -> 67 ms a frame at equal draws (runs xh2/xh4).
     $settings.VICTORY_PORT_CONSTANTS = '1'
     $settings.VICTORY_PORT_CBV = '1'
+    # Ray tracing on the card's own units (DXR 1.1 ray queries, from maren-halv/VIctory-DXR):
+    # RTX 4070, same save: 153 -> 108 ms a frame against the emulated walk. Changes every
+    # shader's cache key: run `victory shaders` once with VICTORY_NATIVE_RT=1 set.
+    if ($RayTracing -and -not $SoftwareRT) { $settings.VICTORY_NATIVE_RT = '1' }
     # A spinning 64-thread compute queue that keeps the card awake contends with NVIDIA's time slicing.
     if (-not $CardAwake) { $settings.Remove('VICTORY_CARD_AWAKE') }
     # Switches to try, one at a time (-More @{NAME='value'}); each is read only by builds that have it:
