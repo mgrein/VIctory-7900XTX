@@ -15,10 +15,14 @@
 //!   slots name memory that is gone, while nothing is lost yet ([`check`]).
 //!
 //! The book is kept with device-removed data on (`VICTORY_D3D12_DRED`) or the
-//! check; `VICTORY_BOOK=0` keeps none.
+//! check, on an AMD card; `VICTORY_BOOK=0` keeps none, `VICTORY_BOOK=1` keeps
+//! it on any card.
 //!
 //! What the descriptors' bits mean is AMD's (RDNA 2 and 3); on another card
-//! nothing is decoded as an address we know, and nothing is said.
+//! nothing is decoded as an address we know, and nothing is said, while the
+//! book still holds every object's entry and a copy of every view heap's
+//! descriptors (`descriptor::host`): memory for nothing, so it is not kept
+//! there unless asked for ([`adapter`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
@@ -67,6 +71,18 @@ static ROOTS: Mutex<VecDeque<(u64, u64, u64)>> = Mutex::new(VecDeque::new());
 #[cfg(test)]
 static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the host's adapter is another vendor's than AMD's ([`adapter`]).
+static NOT_AMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says whose card the host's device is on, before anything is made with it
+/// (`crate::host`): on a card other than AMD's the book is off unless
+/// `VICTORY_BOOK=1`.
+pub(crate) fn adapter(device: &ID3D12Device) {
+    NOT_AMD.store(!crate::indirect::amd(device), Ordering::Relaxed);
+}
+
+/// `VICTORY_BOOK`: `0`: no book; `1`: a book on any card; unset: a book on an
+/// AMD card with device-removed data or the slot check on.
 pub(crate) fn on() -> bool {
     #[cfg(test)]
     if FORCED.load(Ordering::Relaxed) {
@@ -74,10 +90,25 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
+        let switch = std::env::var_os("VICTORY_BOOK");
+        let on = wanted(switch.as_deref(), !NOT_AMD.load(Ordering::Relaxed))
             && !cfg!(test)
-            && (crate::host::dred_any() || checks())
+            && (crate::host::dred_any() || checks());
+        if !on && switch.is_none() && NOT_AMD.load(Ordering::Relaxed) && (crate::host::dred_any() || checks()) {
+            tracing::info!("no book of the card's memory: its descriptors are read as AMD's (VICTORY_BOOK=1: kept all the same)");
+        }
+        on
     })
+}
+
+/// [`on`] from `VICTORY_BOOK` and whether the card is AMD's, leaving out
+/// whether there is anything to keep it for.
+fn wanted(switch: Option<&std::ffi::OsStr>, amd: bool) -> bool {
+    match switch {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => amd,
+    }
 }
 
 /// `VICTORY_SLOT_CHECK=1`.
@@ -675,6 +706,20 @@ pub(crate) fn at_loss(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The book is AMD's alone unless `VICTORY_BOOK` says otherwise.
+    #[test]
+    fn the_book_is_kept_on_amd_cards_unless_asked() {
+        use std::ffi::OsStr;
+        assert!(wanted(None, true));
+        assert!(!wanted(None, false));
+        assert!(!wanted(Some(OsStr::new("0")), true));
+        assert!(wanted(Some(OsStr::new("1")), false));
+        assert!(wanted(Some(OsStr::new("1")), true));
+        // Any other value, as before: on where it was on.
+        assert!(wanted(Some(OsStr::new("yes")), true));
+        assert!(!wanted(Some(OsStr::new("yes")), false));
+    }
 
     /// The two descriptors of the card that were read (a texture of 64x64 and
     /// one of 2048x2048, RX 7900 XTX) and a raw buffer's.
