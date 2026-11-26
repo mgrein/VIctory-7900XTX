@@ -5942,13 +5942,30 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
-/// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// Copies of single buffer views' own bytes ([`exact`]), by (start, bytes);
+/// and when those not used lately were last looked for
+/// (`crate::host::moment`).
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), Arc<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made, and
+/// copies let go as not used lately.
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// How long a copy of a view's own bytes that nothing holds stays after it
+/// was last asked for, in milliseconds: the title's parameter blocks lie
+/// at ring positions, and a position comes round again within a few
+/// frames or not at all.
+const EXACT_KEEP_MS: u64 = 2000;
+
+/// Whether a copy of a view's own bytes last asked for at `used`
+/// (`crate::host::moment`) has not been for [`EXACT_KEEP_MS`] at `now`: and
+/// for two frames, or five times as long if frames do not advance.
+fn exact_idle(used: u64, now: u64) -> bool {
+    let ms = (now & 0xffff_ffff).saturating_sub(used & 0xffff_ffff) * 100;
+    let frames = (now >> 32).saturating_sub(used >> 32);
+    ms >= EXACT_KEEP_MS && (frames >= 2 || ms >= 5 * EXACT_KEEP_MS)
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5963,42 +5980,56 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 ///
 /// The copy is brought up to date and written back like any other (a list
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
-/// (start, bytes) for as long as a list or a slot holds it; of the others,
-/// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// (start, bytes) for as long as a list or a slot holds it, and for
+/// [`EXACT_KEEP_MS`] after it was last asked for; those not used lately are
+/// looked for at most once per frame or tenth of a second, once there are
+/// many. (They were kept for 512 askings: with ~3,000 a frame on a host
+/// without raw twins, less than a frame.)
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
+    /// Copies kept before the idle ones are looked for.
     const MANY: usize = 256;
-    const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let now = crate::host::moment();
+    let mut gone = Vec::new();
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    let (looked, map) = &mut *guard;
+    if let Some(shadow) = map.get(&(address, len)) {
+        // (Read first: the line is shared by all recording threads.)
+        if shadow.used.load(Ordering::Relaxed) != now {
+            shadow.used.store(now, Ordering::Relaxed);
+        }
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    if map.len() >= MANY && *looked != now {
+        *looked = now;
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+        // slot shows it), and not asked for lately. Dropped outside the
+        // lock.
+        let idle: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, shadow)| {
+                Arc::strong_count(shadow) == 1
+                    && crate::host::references(&shadow.buffer) == 1
+                    && exact_idle(shadow.used.load(Ordering::Relaxed), now)
+            })
+            .map(|(&key, _)| key)
+            .collect();
+        gone.extend(idle.iter().filter_map(|key| map.remove(key)));
+        EXACT_STATS[2].fetch_add(gone.len() as u64, Ordering::Relaxed);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    map.insert((address, len), shadow.clone());
+    drop(guard);
+    drop(gone);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -6011,16 +6042,16 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, idle] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
     tracing::info!(
-        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again):          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {:.1} let go per frame, {kept} kept",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        idle as f64 / frames
     );
 }
 
