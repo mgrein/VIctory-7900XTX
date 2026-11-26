@@ -922,13 +922,17 @@ fn log_memory() {
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists
     // the title made and never used.
+    let finds = crate::shadow::window_finds();
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
+         reset since they were made: {}; asks for windows since the last line answered by \
+         the asking thread {}, by the tables {}",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+        finds[0],
+        finds[1],
     );
 }
 

@@ -3077,7 +3077,7 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let_go_unheld(&mut map, idle)
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3092,6 +3092,28 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// Takes the windows `keys` out of the table, of those still held by the
+/// table alone. Threads remember windows ([`FOUND`]) without the table's
+/// lock: the count of changes goes up first, then each is looked at again.
+/// A thread that took one up before the count went up holds it now, and
+/// it stays; one that takes it up after sees the count changed and does
+/// not hand it out. (Nothing changes, and the count stays, when there are
+/// none: this runs before every submission.)
+fn let_go_unheld(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, keys: Vec<(u64, u64)>) -> Vec<Arc<Shadow>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    tables_changed();
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let mut gone = Vec::with_capacity(keys.len());
+    for key in keys {
+        if map.get(&key).is_some_and(|s| Arc::strong_count(s) == 1) {
+            gone.extend(map.remove(&key));
+        }
+    }
+    gone
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -3168,6 +3190,26 @@ impl Shadow {
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// A window outside buffers is handed out for an ask of `[address,
+    /// end)`: it was used now ([`let_go_idle`]), what was asked of it widens,
+    /// and asks without a length are counted (the memory line).
+    fn asked_for(&self, address: u64, end: u64, unsized_ask: bool) {
+        // (Read first: the lines are shared by all recording threads.)
+        let now = crate::host::moment();
+        if self.used.load(Ordering::Relaxed) != now {
+            self.used.store(now, Ordering::Relaxed);
+        }
+        if self.asked[0].load(Ordering::Relaxed) > address {
+            self.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if self.asked[1].load(Ordering::Relaxed) < end {
+            self.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
+        if unsized_ask {
+            self.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether it is no copy but title memory in place (`crate::inplace`).
@@ -5058,15 +5100,34 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
+/// How often [`BUFFERS`] or the table of windows ([`LOOSE`]) was taken to
+/// be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// The table of windows changed, or is about to: what threads remember of
+/// it ([`FOUND`]) is of before. Bumped where a window is put in, and before
+/// one is taken out.
+fn tables_changed() {
+    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// An ask (address, bytes, whether it may take any window), the count of
+/// changes it was answered at, and the answer.
+type Found = (u64, u64, bool, u64, std::sync::Weak<Shadow>);
+
+/// Since the last memory line: asks for windows outside buffers answered by
+/// what the asking thread remembered, and by the tables.
+#[cfg(feature = "diagnostics")]
+static WINDOW_FINDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: [`WINDOW_FINDS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_finds() -> [u64; 2] {
+    [0, 1].map(|i| WINDOW_FINDS[i].swap(0, Ordering::Relaxed))
+}
 
 thread_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
@@ -5076,38 +5137,52 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
+/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not), for title
+/// buffers' copies and for windows outside buffers alike. Windows came in
+/// after fxceless/victory-fork PR #1237 (KyleS98; fxceless 32be36d5), which
+/// measured 117.2 -> 104.2 ms a frame (the buffers' part was here already):
+/// every bind of a draw asks for the copy of each range it reads, and an
+/// ask outside buffers went through both tables' locks each time.
 fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
 }
 
-fn found_at(address: u64, len: u64) -> usize {
-    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+fn found_at(address: u64, len: u64, any: bool) -> usize {
+    let h = (address ^ len.rotate_left(32) ^ u64::from(any) << 63).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 54) as usize % FOUND_MOST
 }
 
-/// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// What this thread remembers of an ask, if nothing changed since. A window
+/// handed out so is noted as asked for, as [`loose`] notes it.
+fn found(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, y, at, shadow) = f.get(found_at(address, len, any))?;
+        ((*a, *n, *y, *at) == (address, len, any, changed)).then(|| shadow.upgrade()).flatten()
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    if BUFFERS_CHANGED.load(Ordering::SeqCst) != changed {
+        return None;
+    }
+    if shadow.window {
+        #[cfg(feature = "diagnostics")]
+        WINDOW_FINDS[0].fetch_add(1, Ordering::Relaxed);
+        shadow.asked_for(address, address.saturating_add(len.max(1)), len <= 1);
+    }
+    Some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+fn remember(address: u64, len: u64, any: bool, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, false, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len, any)] = (address, len, any, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5157,6 +5232,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            // Before: a thread that remembers one of them hands it out no more.
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
@@ -5225,25 +5304,38 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
+    if quick && let Some(shadow) = found(address, len, any) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
+    // A window outside buffers, remembered from the count before either
+    // table was read: a change since, a window made or let go among them,
+    // leaves it unused.
+    let window = |changed: u64| {
+        let shadow = loose(address, end, len <= 1, any)?;
+        if quick {
+            #[cfg(feature = "diagnostics")]
+            WINDOW_FINDS[1].fetch_add(1, Ordering::Relaxed);
+            remember(address, len, any, changed, &shadow);
+        }
+        Some(shadow)
+    };
     {
         let map = buffers_read();
+        // (Nobody changes the map while this lock is held.)
+        let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, any, changed, shadow);
                 }
                 return Some(shadow.clone());
             }
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return window(changed);
             }
         }
     }
@@ -5255,8 +5347,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
+        // (The count after this lock's own change.)
+        let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return window(changed);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5598,22 +5692,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| shadow.asked_for(address, end, unsized_ask);
     // The window the ask takes, if it is there, and else the one it makes:
     // the same under either lock.
     let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> ((u64, u64), Option<Arc<Shadow>>) {
@@ -5667,6 +5746,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5680,6 +5760,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5717,6 +5798,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 
@@ -5997,6 +6079,67 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod found_tests {
+    use super::{BUFFERS_CHANGED, LOOSE, Shadow, found, let_go_unheld, remember, tables_changed};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// A window a thread remembers is handed out from its memory while the
+    /// tables stay as they were, and is never handed out from there once it
+    /// is let go, though it is still alive.
+    #[test]
+    fn a_window_let_go_is_never_handed_out_from_what_a_thread_remembers() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let len = 64u64 << 10;
+        let Some((buffer, data)) = host.shared_buffer(len) else {
+            return;
+        };
+        // Title memory no other test asks about.
+        let start = 0xfe_0000_0000u64;
+        let (ask, bytes) = (start + 0x100, 0x40);
+        let mut shadow = Shadow::new(buffer, data, 0, start, len);
+        shadow.window = true;
+        let shadow = Arc::new(shadow);
+        LOOSE.write().unwrap().insert((start, len), shadow.clone());
+        tables_changed();
+        // Remembered as `lookup` remembers it (other tests may change the
+        // tables meanwhile: then it is remembered again).
+        let remembered = || {
+            (0..100).any(|_| {
+                let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+                remember(ask, bytes, true, changed, &shadow);
+                found(ask, bytes, true).is_some_and(|s| Arc::ptr_eq(&s, &shadow))
+            })
+        };
+        assert!(remembered());
+        // Asked for by that: noted as `loose` notes a window it hands out.
+        assert!(shadow.asked[0].load(Ordering::Relaxed) <= ask);
+        assert!(shadow.asked[1].load(Ordering::Relaxed) >= ask + bytes);
+        // Another kind of ask is not this one.
+        assert!(found(ask, bytes, false).is_none());
+        // Held here as well as by the table: not let go.
+        let kept = let_go_unheld(&mut LOOSE.write().unwrap(), vec![(start, len)]);
+        assert!(kept.is_empty());
+        assert!(LOOSE.read().unwrap().contains_key(&(start, len)));
+        assert!(remembered());
+        // Held by the table alone: let go, and from then on not handed out
+        // from what the thread remembers, alive as it still is.
+        let weak = Arc::downgrade(&shadow);
+        drop(shadow);
+        let gone = let_go_unheld(&mut LOOSE.write().unwrap(), vec![(start, len)]);
+        assert_eq!(gone.len(), 1);
+        assert!(!LOOSE.read().unwrap().contains_key(&(start, len)));
+        assert!(weak.upgrade().is_some());
+        assert!(found(ask, bytes, true).is_none());
+        drop(gone);
+        assert!(weak.upgrade().is_none());
+        assert!(found(ask, bytes, true).is_none());
     }
 }
 
