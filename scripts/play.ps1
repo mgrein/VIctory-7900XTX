@@ -60,6 +60,8 @@ if ($Nvidia) {
     # A spinning 64-thread compute queue that keeps the card awake contends with NVIDIA's time slicing.
     if (-not $CardAwake) { $settings.Remove('VICTORY_CARD_AWAKE') }
     # Switches to try, one at a time (-More @{NAME='value'}); each is read only by builds that have it:
+    #   VICTORY_PORT_CBV_SLOT=1   renderer port 5 without raw twins: tables' constant buffers read in place through their slots
+    #                             (changes every shader's cache key: run `victory shaders` once with it set)
     #   VICTORY_INDIRECT_WIDE=1   indirect dispatches up to 2^20 groups in x on any card (cut to 65,535 on NVIDIA otherwise)
     #   VICTORY_JOIN_BARRIERS=1   barrier calls held and joined into fewer
     #   VICTORY_UP_QUEUE=1        copies in the card's memory brought up on a copy queue

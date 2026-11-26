@@ -148,6 +148,12 @@ fn build() -> [u8; 32] {
         // their key.
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+            // And, on a host without raw twins, whether they are read
+            // through their slots (`VICTORY_PORT_CBV_SLOT=1`; only when
+            // on, as above).
+            if victory_shader::emit::constants_in_slot_switch() {
+                bytes.extend_from_slice(b"VICTORY_PORT_CBV_SLOT=1");
+            }
         }
         // Native ray tracing (`VICTORY_NATIVE_RT=1`): traversal loops lifted
         // to `RayQuery`, and the switches that pick which and how. Only when

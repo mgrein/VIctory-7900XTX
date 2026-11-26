@@ -7596,7 +7596,10 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(other));
             // (Renderer port 5: the twin of a constant buffer's slot is a
             // raw view of its bytes, read as one.)
-            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            // (Without twins, with `VICTORY_PORT_CBV_SLOT=1`: the slot
+            // itself, which the host makes a raw view then.)
+            let as_raw = super::shader::constants_raw()
+                && (super::shader::raw_views() != 0 || super::shader::constants_in_slot());
             let h = if as_raw {
                 self.handle(site, src, false, (11, 0))?
             } else {
@@ -8205,7 +8208,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
+        // No twins (a capped host heap): through the slot itself only with
+        // `VICTORY_PORT_CBV_SLOT=1` ([`super::shader::constants_in_slot`]).
+        if super::shader::raw_views() == 0 && !super::shader::constants_in_slot() {
             return Ok(None);
         }
         let x = self.x;
@@ -8220,7 +8225,8 @@ impl<'a> Lower<'a> {
         if !through_heap {
             return Ok(None);
         }
-        // (Raw, so `raw_twin` gives the twin's index.)
+        // (Raw, so `raw_twin` gives the twin's index; the slot's own without
+        // twins.)
         Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
