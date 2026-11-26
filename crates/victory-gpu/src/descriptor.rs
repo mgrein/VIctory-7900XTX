@@ -1468,6 +1468,15 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Whether a view of the table, or a slot waiting for a host copy, names
+/// `resource` (`crate::resource::let_go_placed`).
+#[cfg(windows)]
+pub(crate) fn names(resource: usize) -> bool {
+    // (One lock at a time.)
+    let waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&resource);
+    waiting || views_read().by_resource.contains_key(&resource)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]

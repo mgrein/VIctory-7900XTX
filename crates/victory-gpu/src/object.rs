@@ -57,6 +57,11 @@ impl Object {
             refs: AtomicU32::new(0),
         }
     }
+
+    /// The references held now.
+    pub(crate) fn refs(&self) -> u32 {
+        self.refs.load(Ordering::Acquire)
+    }
 }
 
 pub(crate) type This = *const Object;

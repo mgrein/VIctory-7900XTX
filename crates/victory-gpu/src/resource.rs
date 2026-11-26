@@ -1237,6 +1237,9 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// When [`PLACED_TEXTURES`] last handed it out (`crate::host::moment`),
+    /// written under that table's lock: what [`let_go_placed`] waits on.
+    looked: std::sync::atomic::AtomicU64,
     /// The lowest level a view asked for since it had no host copy
     /// ([`want_level`]; `u32::MAX`: none said).
     wanted: std::sync::atomic::AtomicU32,
@@ -1984,7 +1987,9 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     key[1] = 0;
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
+    let found = *map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))? as This;
+    looked_now(found);
+    Some(found)
 }
 
 /// For the card accounting line: whether title texture `this` has a host
@@ -2218,11 +2223,10 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Copies replaced by ones with more levels: held by nothing, so they go
     // even when the sweep keeps everything else.
     drain_replaced();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !texture_sweep() {
         return;
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
@@ -2379,6 +2383,14 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Whether the sweep lets go of anything textures hold
+/// (`VICTORY_TEXTURE_SWEEP=0`: nothing).
+#[cfg(windows)]
+fn texture_sweep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
 }
 
 /// Retires the host copies [`want_level`] replaced by ones with more levels
@@ -2660,7 +2672,7 @@ impl Drop for HostTexture {
 }
 
 /// How many textures placed in title memory have a resource of ours
-/// (never released), for the memory line.
+/// ([`let_go_placed`] releases those unasked for), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
@@ -3008,6 +3020,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            looked: std::sync::atomic::AtomicU64::new(0),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
@@ -3252,9 +3265,11 @@ pub(crate) extern "system" fn create_at_address(
 /// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
-/// The resource is kept for the run (views and lists name its address);
-/// its host texture is let go when nothing names it any more
-/// ([`let_go_idle`]) and made again on the next use.
+/// The resource is kept while it is used (views and lists name its
+/// address): its host texture is let go when nothing names it any more
+/// ([`let_go_idle`]) and made again on the next use, and the resource
+/// itself once nothing has asked for it for a minute ([`let_go_placed`])
+/// and made again too.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -3337,8 +3352,9 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     key[1] = 0;
     key[13] = 0;
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
-    Some(*found as This)
+    let found = *map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))? as This;
+    looked_now(found);
+    Some(found)
 }
 
 /// From which level on the title texture's host copy was filled, and from
@@ -3389,6 +3405,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         }
     }
     if let Some(&r) = map.get(&(address, *desc)) {
+        looked_now(r as This);
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -3410,12 +3427,146 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    looked_now(out);
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
+}
+
+/// Notes that [`PLACED_TEXTURES`] hands out `this` now (under its lock).
+#[cfg(windows)]
+fn looked_now(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::host::moment();
+    let looked = &resource(this).host.looked;
+    // (Most look-ups are of a texture asked for a moment ago.)
+    if looked.load(Relaxed) != now {
+        looked.store(now, Relaxed);
+    }
+}
+
+/// Whether [`let_go_placed`] lets go of the resources of placed textures
+/// nothing asked for in a minute (`VICTORY_PLACED_EVICT=0`: kept for the
+/// run, as before).
+#[cfg(windows)]
+fn placed_evict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_EVICT").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: the resources of placed textures [`let_go_placed`] let
+/// go of.
+#[cfg(windows)]
+pub(crate) static PLACED_LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a placed texture's resource stays unasked for before
+/// [`let_go_placed`] lets it go: milliseconds and frames.
+#[cfg(windows)]
+const PLACED_IDLE: (u64, u64) = (60_000, 600);
+
+/// Lets go of the resources [`texture_at`] made for placed textures that
+/// nothing asked for in a while: each (address and description) one
+/// stayed for the run, with its entry in the table of textures and the
+/// state other modules keep for it, while the title streams textures to
+/// ever other addresses (18,639 after nine minutes of run 24). A resource
+/// goes when
+/// - it has no host copy (never made, or let go by [`let_go_idle`]), so no
+///   list and no slot holds anything of it, and the host never refused one;
+/// - [`PLACED_TEXTURES`] has not handed it out, and nothing asked for its
+///   host copy, for [`PLACED_IDLE`]: a thread that has it from the table
+///   uses it within the title's call;
+/// - only the table holds it (one reference), the host never copied into
+///   it, and no view in the descriptor table names it.
+///
+/// Taken out of the table under its lock, after a last look there: the
+/// next view of that memory makes a resource anew, as the first did.
+/// Released then, which forgets it everywhere as a title release does.
+/// A part of the table at each call (`LOOK`), at most `MOST` going.
+/// Called by the sweep, once a second; `VICTORY_PLACED_EVICT=0` keeps them
+/// (and `VICTORY_TEXTURE_SWEEP=0`, which keeps everything).
+#[cfg(windows)]
+pub(crate) fn let_go_placed() {
+    use std::ops::Bound::{Excluded, Unbounded};
+    // Where the last call stopped; one call at a time.
+    static FROM: std::sync::Mutex<Option<PlacedKey>> = std::sync::Mutex::new(None);
+    if !placed_evict() || !texture_sweep() {
+        return;
+    }
+    let Ok(mut from) = FROM.try_lock() else {
+        return;
+    };
+    let start = from.take().map_or(Unbounded, Excluded);
+    *from = let_go_placed_in((start, Unbounded), PLACED_IDLE);
+}
+
+/// A key of [`PLACED_TEXTURES`]: address and description.
+#[cfg(windows)]
+type PlacedKey = (u64, [u32; 14]);
+
+/// [`let_go_placed`] over the keys `within`, after `idle` (milliseconds
+/// and frames); one call at a time. Where to go on from if it stopped
+/// short of the end.
+#[cfg(windows)]
+fn let_go_placed_in(
+    within: (std::ops::Bound<PlacedKey>, std::ops::Bound<PlacedKey>),
+    (idle_ms, idle_frames): (u64, u64),
+) -> Option<PlacedKey> {
+    use std::sync::atomic::Ordering::Relaxed;
+    const LOOK: usize = 8192;
+    const MOST: usize = 256;
+    let idle = |at: usize| {
+        // SAFETY: a resource in the table, whose lock the caller holds;
+        // only this takes one out, and frees it after.
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        crate::host::long_ago(r.host.looked.load(Relaxed), idle_ms, idle_frames)
+            && (used == 0 || crate::host::long_ago(used, idle_ms, idle_frames))
+            && !r.host.refused.load(Relaxed)
+            && r.object.refs() == 1
+            // (Not waited for: one being made is not idle.)
+            && r.host.made.try_lock().is_ok_and(|made| made.is_none())
+    };
+    let mut picked: Vec<(PlacedKey, usize)> = Vec::new();
+    let mut next = None;
+    {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut looked = 0;
+        for (&key, &at) in map.range(within) {
+            looked += 1;
+            if idle(at) {
+                picked.push((key, at));
+            }
+            if looked == LOOK || picked.len() == MOST {
+                next = Some(key);
+                break;
+            }
+        }
+    }
+    // Without the table's lock: these take others.
+    picked.retain(|&(_, at)| !crate::texture::host_wrote(at) && !crate::descriptor::names(at));
+    if picked.is_empty() {
+        return next;
+    }
+    let mut gone = Vec::with_capacity(picked.len());
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, at) in picked {
+            // Not handed out since the look above (that would be noted).
+            if map.get(&key) == Some(&at) && idle(at) {
+                map.remove(&key);
+                gone.push(at);
+            }
+        }
+    }
+    PLACED_LET_GO.fetch_add(gone.len() as u64, Relaxed);
+    for at in gone {
+        // The table's reference, the last one.
+        resource_release(at as This);
+    }
+    next
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -4924,6 +5075,49 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The resource of a placed texture nothing asks for any more is let go
+    /// unless it has a host copy, and the next view of its memory makes one
+    /// anew; one asked for since the look stays.
+    #[cfg(windows)]
+    #[test]
+    fn an_unasked_for_placed_texture_is_let_go() {
+        use std::ops::Bound::{Excluded, Included};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        // 64x64 BC7, one level.
+        let desc = [3u32, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let bytes = 3 * 0x10000;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        let within = (Included((at, [0; 14])), Excluded((at + bytes as u64, [0; 14])));
+        let count = || {
+            PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).range(within).count()
+        };
+        let [plain, copied, again] = [0, 1, 2].map(|n| at + n * 0x10000);
+        texture_at(plain, &desc).unwrap();
+        let held = texture_at(copied, &desc).unwrap();
+        let copy = host_copy(held).unwrap();
+        assert_eq!(count(), 2);
+        // Idle at once: only the one without a host copy goes.
+        assert_eq!(let_go_placed_in(within, (0, 0)), None);
+        assert_eq!(count(), 1);
+        assert_eq!(placed_known(copied, &desc), Some(held));
+        assert_eq!(placed_known(plain, &desc), None);
+        // Made anew on the next view, with the filler words left out still.
+        let mut noisy = desc;
+        noisy[1] = 0xdead;
+        let anew = texture_at(plain, &noisy).unwrap();
+        assert_eq!(texture_at(plain, &desc), Some(anew));
+        assert!(textures().contains(&(anew as usize)));
+        // Asked for a moment ago: stays with a minute's wait.
+        texture_at(again, &desc).unwrap();
+        assert_eq!(let_go_placed_in(within, PLACED_IDLE), None);
+        assert_eq!(count(), 3);
+        drop(copy);
     }
 
     /// A streamed BC texture larger than the cap loses the fewest largest

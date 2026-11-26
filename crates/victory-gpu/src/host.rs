@@ -710,6 +710,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::resource::let_go_placed();
     let lists = crate::list::let_go_idle(pressed);
     press(pressed, lists);
 }

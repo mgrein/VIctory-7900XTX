@@ -973,6 +973,10 @@ fn log_memory() {
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
+    tracing::info!(
+        "memory, placed textures: {} resources let go after a minute nothing asked for them (made again on their next view; VICTORY_PLACED_EVICT=0 keeps them)",
+        crate::resource::PLACED_LET_GO.load(Relaxed)
+    );
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.
