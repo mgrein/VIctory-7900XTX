@@ -5643,14 +5643,22 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // At most so much on the card's own memory (`VICTORY_MEMORY_CARD_MB`,
+    // in MiB; unset, a share of the card's budget, [`memory_card_mb`]), and
+    // while it has room; past that the side shaders see is in the PC's
+    // memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
+        let budget = host.video_memory().map(|[budget, ..]| budget);
+        let mb = mb.unwrap_or_else(|| memory_card_mb(budget));
+        tracing::info!(
+            vram_budget_mb = budget.map(|b| b >> 20),
+            mb,
+            "title memory by address: at most so many MB of it on the card (VICTORY_MEMORY_CARD_MB)"
+        );
+        mb << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
@@ -5683,6 +5691,16 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     Some(shadow)
+}
+
+/// The MiB of title memory by address [`by_address`] puts on the card by
+/// default for a local budget of so many bytes: 22 % of it, from 1 GiB to
+/// 4 GiB (4 GiB, as before, when the budget is not known). About 2.4 GB on a
+/// 12 GB card (budget near 11 GiB), so that the ray tracing structures and
+/// their arenas leave room for the title's textures; 4 GiB, unchanged, on a
+/// 24 GB card.
+pub(crate) fn memory_card_mb(budget: Option<u64>) -> u64 {
+    budget.map_or(4096, |b| ((b >> 20) * 22 / 100).clamp(1024, 4096))
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -5934,6 +5952,23 @@ mod window_tests {
         assert_eq!(holder_below(there.into_iter(), cell + 0x2_0000, ask, end), None);
         let short = [(cell + 0x2_0000, 0x8000)];
         assert_eq!(holder_below(short.into_iter(), cell, ask, end), None);
+    }
+
+    /// The card's share of title memory by address: 22 % of the budget,
+    /// from 1 to 4 GiB, 4 GiB when the budget is not known.
+    #[test]
+    fn title_memory_by_address_on_the_card_is_a_share_of_its_budget() {
+        use super::memory_card_mb;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(memory_card_mb(None), 4096);
+        // A 12 GB card (budget about 11 GiB).
+        assert_eq!(memory_card_mb(Some(11 * GIB)), 11 * 1024 * 22 / 100);
+        assert!((2400..2600).contains(&memory_card_mb(Some(11 * GIB))));
+        // Small cards keep 1 GiB, a 24 GB card keeps its 4 GiB.
+        assert_eq!(memory_card_mb(Some(2 * GIB)), 1024);
+        assert_eq!(memory_card_mb(Some(4 * GIB)), 1024);
+        assert_eq!(memory_card_mb(Some(23 * GIB)), 4096);
+        assert_eq!(memory_card_mb(Some(48 * GIB)), 4096);
     }
 
     /// Finer windows by default with 40 GiB of RAM or less, or on a card not
