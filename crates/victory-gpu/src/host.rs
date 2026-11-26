@@ -4489,6 +4489,8 @@ impl Host {
             })()
         };
         LISTS[1].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PreludesMade, 1);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {

@@ -134,6 +134,22 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Host lists asked of the pool and found it empty, so made where they
+    /// were asked (for a submission: on the submitting thread), and those
+    /// made ahead by the thread that keeps the pool filled
+    /// (`crate::list::warm`).
+    ListsMissed,
+    ListsAhead,
+    /// Host lists that ran and did not go back to the pool: retired for
+    /// the size of a recording (`VICTORY_LIST_FAT`), dropped for a full
+    /// pool, and let go by the sweep after waiting unused.
+    ListsFat,
+    ListsDropped,
+    ListsAged,
+    /// Preludes (a host list's second allocator and list) made, and taken
+    /// from those other lists left instead.
+    PreludesMade,
+    PreludesPooled,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1001,8 +1017,8 @@ fn log_memory() {
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
-         lists were made; twins of depth textures: {:.0} MB; host copies of \
+         made by the host, {} preludes made for them, {} retired for their size, private bytes \
+         grew {:.0} MB while lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
@@ -1013,6 +1029,7 @@ fn log_memory() {
         views[5],
         lists[0],
         lists[1],
+        crate::list::lists_fat(),
         lists[2] as i64 as f64 / (1 << 20) as f64,
         mb(census[7]),
         mb(census[8]),
@@ -1456,7 +1473,9 @@ pub(crate) fn log(frames: f64) {
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
          putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
-         {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
+         {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms ({:.1} for an empty pool, {:.1} \
+         ahead of need; {:.1} retired fat, {:.1} dropped for a full pool, {:.1} let go idle; \
+         preludes {:.1} made, {:.1} reused); {:.0} parts of held submissions \
          ran alone that the next part could have run with",
         ms(c[C::UntilRecordUs as usize]),
         ms(c[C::UntilSubmitUs as usize]),
@@ -1472,6 +1491,13 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitCheckNs as usize] / 1e6,
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
+        c[C::ListsMissed as usize],
+        c[C::ListsAhead as usize],
+        c[C::ListsFat as usize],
+        c[C::ListsDropped as usize],
+        c[C::ListsAged as usize],
+        c[C::PreludesMade as usize],
+        c[C::PreludesPooled as usize],
         c[C::PartsTogether as usize],
     );
     // What is copied whole, largest first: memory nobody tells us about.

@@ -304,7 +304,11 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsMissed, 1);
+            crate::host::host().and_then(|h| h.new_list().ok())
+        }
     }
 }
 
@@ -327,6 +331,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
         if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
             // (It has run: its buffers serve the lists made next.)
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsDropped, 1);
             host.give_back_buffers();
             continue;
         }
@@ -335,6 +341,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let fat = list_fat();
         if fat > 0 && host.list.recorded_most() > fat {
             LISTS_FAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsFat, 1);
             host.give_back_buffers();
             crate::host::retire(host);
             continue;
@@ -351,6 +359,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             idle.1 += bytes;
         } else {
             drop(idle);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsDropped, 1);
             host.give_back_buffers();
         }
     }
@@ -360,6 +370,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// the start.
 #[cfg(windows)]
 static LISTS_FAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`LISTS_FAT`], for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn lists_fat() -> u64 {
+    LISTS_FAT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How long a list may wait in the pool unused before [`let_go_idle`] lets
 /// it go, and how many are kept whatever their age (fewer under memory
@@ -406,6 +422,8 @@ pub(crate) fn let_go_idle(pressed: bool) -> usize {
         gone
     };
     let n = gone.len();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ListsAged, n as u64);
     // Unless memory is short, their buffers serve the lists made next.
     if !pressed {
         for Idle(host, _, _) in &mut gone {
