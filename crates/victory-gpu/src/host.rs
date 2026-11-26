@@ -4250,8 +4250,13 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     // Where each copy is in it, and the ranges seen: dispatches declare the
     // same ranges thousands of times a frame.
-    let mut places: ByCopy<usize> = ByCopy::default();
-    let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+    static PLACES: MapHint = MapHint::new();
+    static SEEN: MapHint = MapHint::new();
+    let mut places: ByCopy<usize> = PLACES.map();
+    let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::with_capacity_and_hasher(
+        SEEN.room(),
+        Default::default(),
+    );
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
@@ -4267,6 +4272,8 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
             }
         }
     }
+    PLACES.held(places.len());
+    SEEN.held(seen.len());
     back
 }
 
@@ -6047,7 +6054,7 @@ impl Host {
         // a timing run to time each on its own (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let mut marks: Vec<(usize, crate::copystat::Timed)> = Vec::with_capacity(2 * runs.len() + 3);
-        let mut batch = Batch::default();
+        let mut batch = Batch::sized();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -6057,7 +6064,8 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            static SPANS: MapHint = MapHint::new();
+            let mut spans: ByCopy<(usize, usize)> = SPANS.map();
             // (What of the spans lies between their copies' refreshed ranges,
             // for the frame line.)
             #[cfg(feature = "diagnostics")]
@@ -6093,6 +6101,7 @@ impl Host {
                 }
                 crate::watch::span_slack(((span - covered) >> 10) as u64);
             }
+            SPANS.held(spans.len());
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
@@ -8038,6 +8047,40 @@ fn next_epoch() -> u64 {
 /// A table by a copy's address.
 pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
 
+/// How big a table a submission makes anew was lately, so that the next one
+/// is made that big at once and does not grow (each growth moves every
+/// entry: thousands of copies a world submission, 2-3% of the submitting
+/// thread). The hint is the most entries lately seen, slowly forgotten.
+/// `VICTORY_MAP_HINTS=0`: the tables start empty and grow, as before.
+struct MapHint(std::sync::atomic::AtomicUsize);
+
+impl MapHint {
+    const fn new() -> MapHint {
+        MapHint(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_HINTS").is_none_or(|v| v != "0"))
+    }
+
+    /// Entries to make room for (0 with the switch off).
+    fn room(&self) -> usize {
+        if Self::on() { self.0.load(Ordering::Relaxed) } else { 0 }
+    }
+
+    /// A table with room for what was lately held.
+    fn map<K, T, H: Default>(&self) -> std::collections::HashMap<K, T, H> {
+        std::collections::HashMap::with_capacity_and_hasher(self.room(), H::default())
+    }
+
+    /// A table of this kind held `n` entries.
+    fn held(&self, n: usize) {
+        let was = self.0.load(Ordering::Relaxed);
+        self.0.store(n.max(was - was / 32), Ordering::Relaxed);
+    }
+}
+
 /// A hash for addresses of ours: the bits that tell them apart, spread. The
 /// tables it serves are asked 40,000 times a frame, and hold no one's keys
 /// but our own.
@@ -8307,6 +8350,26 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// The most entries `index` held ([`MapHint`]).
+    most: usize,
+}
+
+/// [`MapHint`] of [`Batch`]'s `index`.
+static BATCH_INDEX: MapHint = MapHint::new();
+
+impl Batch {
+    /// A batch whose `index` has room for what one lately held.
+    fn sized() -> Batch {
+        let mut batch = Batch::default();
+        batch.index = BATCH_INDEX.map();
+        batch
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        BATCH_INDEX.held(self.most.max(self.index.len()));
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8346,7 +8409,8 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    static AT: MapHint = MapHint::new();
+    let mut at: ByCopy<usize> = AT.map();
     // (Copy, from, to), in the order they come, and the part that gave it to
     // shaders last.
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
@@ -8383,6 +8447,7 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
             Touch::Title | Touch::Nothing => {}
         }
     }
+    AT.held(at.len());
     spans.retain(|s| s.1 < s.2);
     spans
 }
@@ -8612,7 +8677,8 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        static COPIES: MapHint = MapHint::new();
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = COPIES.map();
         let mut due = Vec::new();
         let mut touches = Vec::new();
         for (n, list) in runs.iter().enumerate() {
@@ -8640,11 +8706,13 @@ impl Batch {
                 }
             }
         }
+        COPIES.held(copies.len());
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
         self.front = true;
+        self.ahead.reserve(spans.len());
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -8812,6 +8880,7 @@ impl Batch {
 
     fn flush(&mut self) {
         self.refresh_textures();
+        self.most = self.most.max(self.index.len());
         self.index.clear();
         if self.refreshes.is_empty() {
             return;
