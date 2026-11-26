@@ -1565,6 +1565,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The list let go of what its recording uses but still holds the
+    /// recording ([`HostList::let_go_recording`]): its commands name
+    /// scratch memory, uploads and descriptor slots that serve other lists
+    /// now. Until its next reset it is run as an empty list ([`Host::submit`]
+    /// leaves it out), as the reset list that waited in the pool before was.
+    stale: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1589,6 +1595,104 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the preludes of host lists that go wait for the lists that need
+/// one next (on by default; `VICTORY_PRELUDE_POOL=0`: each list makes its
+/// own when it first needs one, on the submitting thread, and it goes with
+/// the list, as before). A prelude was made under `Host::submit` for most
+/// lists made (78,226 for 105,508 in run x14, 5 % of the submitting thread
+/// in profile x28).
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most preludes kept for lists that need one ([`prelude_pool`]): each
+/// is an allocator and a closed list that records barriers and copies of
+/// twins, a small recording.
+const SPARE_PRELUDES_MOST: usize = 128;
+
+/// Preludes kept for the lists that need one next ([`prelude_pool`]).
+struct SparePreludes(Vec<Prelude>);
+
+// SAFETY: D3D12 objects are free-threaded; a kept prelude is closed and has
+// run, and nobody touches it until it is taken out again.
+unsafe impl Send for SparePreludes {}
+
+static SPARE_PRELUDES: Mutex<SparePreludes> = Mutex::new(SparePreludes(Vec::new()));
+
+/// A kept prelude ([`prelude_pool`]), if there is one.
+fn spare_prelude() -> Option<Prelude> {
+    if !prelude_pool() {
+        return None;
+    }
+    let (taken, left) = {
+        let mut spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = spare.0.pop();
+        (taken, spare.0.len())
+    };
+    crate::list::warm::prelude_taken(left, taken.is_none());
+    #[cfg(feature = "diagnostics")]
+    if taken.is_some() {
+        crate::copystat::add(crate::copystat::C::PreludesPooled, 1);
+    }
+    taken
+}
+
+/// [`SPARE_PRELUDES_MOST`], for the thread that makes preludes ahead of
+/// need (`crate::list::warm`).
+pub(crate) fn spare_preludes_most() -> usize {
+    if prelude_pool() { SPARE_PRELUDES_MOST } else { 0 }
+}
+
+/// Makes a prelude and keeps it for the next list that needs one
+/// (`crate::list::warm`): `false` if none could be made.
+pub(crate) fn warm_prelude() -> bool {
+    let Some(prelude) = host().and_then(|h| h.make_prelude()) else {
+        return false;
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PreludesAhead, 1);
+    give_prelude(prelude);
+    true
+}
+
+/// Keeps `prelude` (closed, and run if it ever ran) for the next list that
+/// needs one, past [`SPARE_PRELUDES_MOST`] retired instead.
+fn give_prelude(prelude: Prelude) {
+    let mut spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+    if spare.0.len() < SPARE_PRELUDES_MOST {
+        spare.0.push(prelude);
+    } else {
+        drop(spare);
+        retire(prelude);
+    }
+}
+
+/// How many preludes are kept ([`prelude_pool`]).
+pub(crate) fn spare_preludes() -> usize {
+    SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
+/// How many host lists submissions left out because they held a recording
+/// whose memory went ([`HostList::stale`]).
+static STALE_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A submission left out a stale host list ([`HostList::stale`]): counted,
+/// and said once.
+fn stale_skipped() {
+    if STALE_SKIPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::info!(
+            "a title list was run again without a reset: its host list, from the pool, holds a let-go recording and runs as an empty list (VICTORY_LIST_POOL_CLOSED)"
+        );
+    }
+}
+
+/// [`STALE_SKIPPED`], for the frame account.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stale_skips() -> u64 {
+    STALE_SKIPPED.load(Ordering::Relaxed)
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4498,6 +4602,8 @@ impl Host {
             })()
         };
         LISTS[1].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PreludesMade, 1);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
@@ -4563,6 +4669,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                stale: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6146,6 +6253,15 @@ impl Host {
         stage.next("submit: the lists' steps");
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
+            if list.stale() {
+                // A title list run again without a reset, its host list a
+                // pooled one whose recording names memory other lists use
+                // now ([`HostList::stale`]): nothing to run, as for the
+                // reset list it held before.
+                firsts.push(lists.len());
+                stale_skipped();
+                continue;
+            }
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -6248,8 +6364,12 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+                    // (A part of left-out lists only, [`HostList::stale`],
+                    // has nothing to send.)
+                    if to > from {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                    }
+                    from = from.max(to);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6307,7 +6427,10 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                // (Nothing to send if every list was left out, `HostList::stale`.)
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6861,10 +6984,85 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.forget_recording();
+        // SAFETY: the list is not executing.
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        self.stale.store(false, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// What [`HostList::reset`] does but for the host list's own reset: what
+    /// the list kept for its commands goes and it stays closed, as a pooled
+    /// list waits (`crate::list::recycle`), so that taking it for a
+    /// submitted title list wants no close and the title's reset after
+    /// that is the one reset of the list. Only after the list's last
+    /// submission finished, on a closed list.
+    pub(crate) fn let_go_recording(&self) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let _resetting = crate::timeline::span("letting go of a host list's recording");
+        self.forget_recording();
+        // Its commands still name what was just let go: it must not run
+        // until it is reset ([`HostList::stale`]).
+        self.stale.store(true, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// For a closed list that ran, whose command allocator kept the memory
+    /// of a big recording (`crate::list::recycle`, `VICTORY_LIST_FAT`): a
+    /// new allocator takes its place and the old one is retired
+    /// ([`retire`]), so the list shrinks and stays, with its prelude and
+    /// buffers, where the whole list was retired and another made for the
+    /// pool. The list is reset onto the new allocator and closed again,
+    /// recording nothing. `false` (nothing changed) if no allocator could
+    /// be made.
+    pub(crate) fn new_allocator(&mut self) -> bool {
+        let Some(host) = host() else {
+            return false;
+        };
+        // SAFETY: plain object creation.
+        let Ok(allocator) =
+            (unsafe { host.device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT) })
+        else {
+            return false;
+        };
+        let old = std::mem::replace(&mut self.allocator, allocator);
+        // SAFETY: the list is closed and not executing (it ran); the new
+        // allocator is no other list's.
+        let moved = unsafe { self.list.Reset(&self.allocator, None).and_then(|()| self.list.Close()) };
+        if let Err(e) = moved {
+            fail(format_args!("a host command list did not move to a new allocator ({e})"));
+        }
+        retire(old);
+        self.list.forget_most();
+        // Reset onto the new allocator and closed: it records nothing.
+        self.stale.store(false, Ordering::Release);
+        true
+    }
+
+    /// Whether the list holds a recording whose memory it let go of
+    /// ([`HostList::let_go_recording`]) and has not been reset since: a
+    /// pooled list left in a title's list that the title runs again
+    /// without resetting it. Such a list runs as an empty one.
+    pub(crate) fn stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
+    }
+
+    /// The bookkeeping of [`HostList::reset`] and [`HostList::let_go_recording`].
+    fn forget_recording(&self) {
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6884,18 +7082,7 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
-        }
         self.list.reset_count();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -7239,7 +7426,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| spare_prelude().or_else(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -7577,6 +7764,7 @@ impl HostList {
     /// starts in (common: the list moves them back before it closes), and
     /// the budget's words are zeroed.
     pub(crate) fn give_back_buffers(&mut self) {
+        self.give_back_prelude();
         if !list_buffers_pooled() {
             return;
         }
@@ -7605,6 +7793,18 @@ impl HostList {
             }
             Some(())
         });
+    }
+
+    /// The list has run and goes: its prelude, if it had one, waits for
+    /// the next list that needs one ([`spare_prelude`]). It ran before the
+    /// list in the same submission, so it has run too.
+    fn give_back_prelude(&mut self) {
+        if !prelude_pool() {
+            return;
+        }
+        if let Some(Some(prelude)) = self.prelude.take() {
+            give_prelude(prelude);
+        }
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -10638,6 +10838,10 @@ fn list_buffers<R>(f: impl FnOnce(&mut ListBuffers) -> Option<R>) -> Option<R> {
 
 /// Under memory pressure: the buffers kept for lists go (retired).
 pub(crate) fn list_buffers_let_go() {
+    let preludes = std::mem::take(&mut SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0);
+    if !preludes.is_empty() {
+        retire(SparePreludes(preludes));
+    }
     let kept = {
         let mut b = LIST_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut kept: Vec<ID3D12Resource> = b.budgets.drain(..).map(|(buffer, _)| buffer).collect();
@@ -10688,6 +10892,103 @@ mod list_buffer_tests {
         assert_eq!(b.take_args(100 << 10).map(|(_, cap)| cap), Some(256 << 10));
         assert_eq!(b.take_args(2 << 20).map(|(_, cap)| cap), None);
         assert_eq!(b.take_args(1).map(|(_, cap)| cap), Some(64 << 10));
+    }
+
+    /// A list that ran lets go of its recording and stays closed; the one
+    /// reset after that opens it, and it records and runs again.
+    #[test]
+    fn a_list_that_ran_waits_closed_and_resets_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().expect("a host list");
+        list.close();
+        assert!(!list.stale());
+        host.execute(&[&list]);
+        list.let_go_recording();
+        assert!(list.stale(), "its recording's memory went");
+        // Closed: a second close would fail, a reset succeeds.
+        list.reset();
+        assert!(!list.stale(), "reset: nothing recorded");
+        list.close();
+        host.execute(&[&list]);
+        list.let_go_recording();
+        list.reset();
+        list.close();
+    }
+
+    /// A list that let go of its recording and is run again without a
+    /// reset (a title list submitted twice) is left out of the submission:
+    /// the lists with it run, and so does it once it is reset.
+    #[test]
+    fn a_stale_list_runs_as_an_empty_one() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let stale = host.new_list().expect("a host list");
+        let other = host.new_list().expect("a host list");
+        stale.close();
+        other.close();
+        host.execute(&[&stale, &other]);
+        stale.let_go_recording();
+        assert!(stale.stale());
+        let before = STALE_SKIPPED.load(Ordering::Relaxed);
+        host.execute(&[&stale, &other, &stale]);
+        assert!(STALE_SKIPPED.load(Ordering::Relaxed) >= before + 2, "left out each time it is named");
+        host.execute(&[&stale]);
+        stale.reset();
+        stale.close();
+        host.execute(&[&stale, &other]);
+    }
+
+    /// A list that ran moves to a new allocator: it forgets its biggest
+    /// recording, stays closed, and records and runs again.
+    #[test]
+    fn a_fat_list_moves_to_a_new_allocator() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let mut list = host.new_list().expect("a host list");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        assert!(list.list.recorded_most() > 0);
+        let old = list.allocator.as_raw();
+        assert!(list.new_allocator());
+        assert_ne!(list.allocator.as_raw(), old, "a new allocator");
+        assert_eq!(list.list.recorded_most(), 0, "nothing recorded on it yet");
+        assert!(!list.stale(), "reset onto the new allocator: nothing recorded");
+        list.let_go_recording();
+        assert!(list.stale());
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+    }
+
+    /// The prelude of a list that goes is kept and the next list that
+    /// needs one takes it.
+    #[test]
+    fn a_list_that_goes_leaves_its_prelude_to_the_next() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if !prelude_pool() {
+            return;
+        }
+        let mut list = host.new_list().expect("a host list");
+        let prelude = host.make_prelude().expect("a prelude");
+        let raw = prelude.1.as_raw();
+        let _ = list.prelude.set(Some(prelude));
+        list.close();
+        list.give_back_buffers();
+        assert!(list.prelude.get().is_none(), "given, not kept");
+        let kept = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.iter().any(|p| p.1.as_raw() == raw);
+        assert!(kept, "the prelude waits for the next list");
+        assert!(spare_preludes() > 0);
+        // (Other tests may take it meanwhile: any kept prelude will do.)
+        assert!(spare_prelude().is_some() || spare_preludes() == 0);
     }
 }
 

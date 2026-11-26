@@ -20,6 +20,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 pub(crate) mod thin;
+#[cfg(windows)]
+pub(crate) mod warm;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
@@ -282,6 +284,19 @@ fn list_fat() -> u32 {
     *FAT.get_or_init(|| std::env::var("VICTORY_LIST_FAT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16384))
 }
 
+/// Whether a fat host list ([`list_fat`]) that ran gets a new command
+/// allocator and goes back to the pool (on by default;
+/// `VICTORY_LIST_FAT_SWAP=0`: the whole list is retired, as before). Its
+/// allocator is what holds the big recording's memory; retiring the list
+/// with its prelude and buffers had the pool run short, and the lists made
+/// for it were made on the submitting thread (`Host::new_list` under
+/// `detach`, 8 % of it in profile x28, and their preludes 5 %).
+#[cfg(windows)]
+fn fat_swap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_FAT_SWAP").is_none_or(|v| v != "0"))
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -290,22 +305,51 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// Whether pooled host lists wait closed (on by default;
+/// `VICTORY_LIST_POOL_CLOSED=0`: reset and open, as before). A list that
+/// ran was reset when it went back to the pool, closed when a submission
+/// took it for the title's list (on the submitting thread: 4 % of it in
+/// profile x28), and reset again by the title: now what it kept goes when
+/// it goes back (`HostList::let_go_recording`), it stays closed, and the
+/// title's reset is its one reset. A list cut at a wait, which records
+/// into it at once, resets it then. Until that reset the list still holds
+/// its old recording, whose memory serves other lists: a title list run
+/// again without a reset runs it as an empty list
+/// (`crate::host::HostList::stale`), as it ran the reset one before.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
+fn pool_closed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL_CLOSED").is_none_or(|v| v != "0"))
+}
+
+/// A host list that has run, as a title's list is after its reset, or a
+/// new one: `open` for recording, else closed, as a submitted title list
+/// is left for its next reset.
+#[cfg(windows)]
+fn fresh_list(open: bool) -> Option<crate::host::HostList> {
+    let (idle, left) = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
-        taken
+        (taken, idle.0.len())
     };
-    match idle {
-        Some(Idle(list, _, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+    warm::taken(left, idle.is_none());
+    let (list, closed) = match idle {
+        Some(Idle(list, _, _)) => (list, pool_closed()),
+        None => {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsMissed, 1);
+            (crate::host::host().and_then(|h| h.new_list().ok())?, false)
+        }
+    };
+    match (open, closed) {
+        (true, true) => list.reset(),
+        (false, false) => list.close(),
+        _ => {}
     }
+    Some(list)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -327,21 +371,33 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
         if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
             // (It has run: its buffers serve the lists made next.)
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsDropped, 1);
             host.give_back_buffers();
             continue;
         }
         // A list that once recorded a big frame: its allocators keep that
-        // memory for good ([`list_fat`]).
+        // memory for good ([`list_fat`]). It gets a new allocator here, on
+        // the thread that lets go of landed lists ([`fat_swap`]), or goes.
         let fat = list_fat();
         if fat > 0 && host.list.recorded_most() > fat {
             LISTS_FAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            host.give_back_buffers();
-            crate::host::retire(host);
-            continue;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsFat, 1);
+            if !(fat_swap() && host.new_allocator()) {
+                host.give_back_buffers();
+                crate::host::retire(host);
+                continue;
+            }
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // goes, its allocators stay (and with [`pool_closed`] the list
+        // stays closed until the title resets it).
+        if pool_closed() {
+            host.let_go_recording();
+        } else {
+            host.reset();
+        }
         host.trim_args();
         let bytes = host.scratch_kept();
         let now = crate::host::now_ms();
@@ -351,6 +407,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             idle.1 += bytes;
         } else {
             drop(idle);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ListsDropped, 1);
             host.give_back_buffers();
         }
     }
@@ -361,6 +419,18 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 #[cfg(windows)]
 static LISTS_FAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Host lists waiting in the pool, for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pooled() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
+/// [`LISTS_FAT`], for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn lists_fat() -> u64 {
+    LISTS_FAT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How long a list may wait in the pool unused before [`let_go_idle`] lets
 /// it go, and how many are kept whatever their age (fewer under memory
 /// pressure, when every one past them goes).
@@ -370,13 +440,14 @@ const IDLE_LIST_FLOOR_PRESSED: usize = 16;
 
 /// How many of the pool's lists, taken when (`stamps`, oldest first: lists
 /// are put at the end and taken from there) and `now`, [`let_go_idle`] lets
-/// go from the front: those unused for [`IDLE_LIST_MS`] past the floor, or
-/// with `pressed` every one past the smaller floor.
-fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool) -> usize {
+/// go from the front: those unused for [`IDLE_LIST_MS`] past the floor (at
+/// least [`IDLE_LIST_FLOOR`], more while the pool is kept filled to more,
+/// `warm`), or with `pressed` every one past the smaller floor.
+fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool, floor: usize) -> usize {
     if pressed {
         return stamps.len().saturating_sub(IDLE_LIST_FLOOR_PRESSED);
     }
-    let room = stamps.len().saturating_sub(IDLE_LIST_FLOOR);
+    let room = stamps.len().saturating_sub(floor.max(IDLE_LIST_FLOOR));
     stamps.iter().take(room).take_while(|&&at| now.saturating_sub(at) >= IDLE_LIST_MS).count()
 }
 
@@ -397,7 +468,7 @@ pub(crate) fn let_go_idle(pressed: bool) -> usize {
     let mut gone: Vec<Idle> = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let stamps: Vec<u64> = idle.0.iter().map(|Idle(_, _, at)| *at).collect();
-        let n = idle_aged_out(&stamps, now, pressed);
+        let n = idle_aged_out(&stamps, now, pressed, warm::target());
         if n == 0 {
             return 0;
         }
@@ -406,6 +477,8 @@ pub(crate) fn let_go_idle(pressed: bool) -> usize {
         gone
     };
     let n = gone.len();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ListsAged, n as u64);
     // Unless memory is short, their buffers serve the lists made next.
     if !pressed {
         for Idle(host, _, _) in &mut gone {
@@ -449,7 +522,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(true) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -526,15 +599,20 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        // Run again without a reset since a submission took its host list:
+        // the pooled one it holds instead has nothing to run (`stale`), and
+        // stays for the title's reset.
+        if list.host.as_ref().is_some_and(crate::host::HostList::stale) {
+            continue;
+        }
+        // Closed: the title's next call on its list is a reset, which
+        // wants it so.
+        let Some(fresh) = fresh_list(false) else {
+            continue;
+        };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -598,13 +676,19 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let list = this.cast_mut().cast::<List>();
+        // Run again without a reset since a submission took its host list:
+        // the pooled one it holds instead has nothing to run (`stale`), and
+        // stays for the title's reset.
+        // SAFETY: one of our lists, closed and submitted.
+        if unsafe { (*list).host.as_ref() }.is_some_and(crate::host::HostList::stale) {
+            continue;
+        }
+        // Closed: the title's next call on its list is a reset, which
+        // wants it so.
+        let Some(fresh) = fresh_list(false) else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
-        let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
@@ -2346,7 +2430,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(true) else {
             return;
         };
         current.close();
@@ -2527,20 +2611,20 @@ mod tests {
         use super::{IDLE_LIST_FLOOR, IDLE_LIST_FLOOR_PRESSED, IDLE_LIST_MS, idle_aged_out};
         let now = 100_000;
         // Few lists: none goes, however old.
-        assert_eq!(idle_aged_out(&vec![0; IDLE_LIST_FLOOR], now, false), 0);
+        assert_eq!(idle_aged_out(&vec![0; IDLE_LIST_FLOOR], now, false, 0), 0);
         // 40 old and 10 fresh: the old past the floor go, from the front.
         let mut stamps = vec![now - IDLE_LIST_MS - 1; 40];
         stamps.extend(std::iter::repeat_n(now - 10, 10));
-        assert_eq!(idle_aged_out(&stamps, now, false), 50 - IDLE_LIST_FLOOR);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 50 - IDLE_LIST_FLOOR);
         // 10 old and 40 fresh: only the 10 old.
         let mut stamps = vec![now - IDLE_LIST_MS; 10];
         stamps.extend(std::iter::repeat_n(now - 10, 40));
-        assert_eq!(idle_aged_out(&stamps, now, false), 10);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 10);
         // All fresh: none, unless the PC is short of memory.
         let stamps = vec![now; 50];
-        assert_eq!(idle_aged_out(&stamps, now, false), 0);
-        assert_eq!(idle_aged_out(&stamps, now, true), 50 - IDLE_LIST_FLOOR_PRESSED);
-        assert_eq!(idle_aged_out(&stamps[..8], now, true), 0);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 0);
+        assert_eq!(idle_aged_out(&stamps, now, true, 0), 50 - IDLE_LIST_FLOOR_PRESSED);
+        assert_eq!(idle_aged_out(&stamps[..8], now, true, 0), 0);
     }
 
     use super::*;
