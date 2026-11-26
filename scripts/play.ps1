@@ -46,6 +46,11 @@ if ($Nvidia) {
     $settings.VICTORY_D3D12_DRED = 'faults'
     # No book of the card's memory: it reads descriptors as AMD's and costs memory.
     $settings.VICTORY_BOOK = '0'
+    # The title's 32-bit graphics heap and constant buffers used in place, no host copies
+    # (renderer ports 1 and 5, as DoubleGhosty/cool_fox's launcher): on an RTX 4070, same save,
+    # 80 -> 67 ms a frame at equal draws (runs xh2/xh4).
+    $settings.VICTORY_PORT_CONSTANTS = '1'
+    $settings.VICTORY_PORT_CBV = '1'
     # A spinning 64-thread compute queue that keeps the card awake contends with NVIDIA's time slicing.
     if (-not $CardAwake) { $settings.Remove('VICTORY_CARD_AWAKE') }
     # Switches to try, one at a time (-More @{NAME='value'}); each is read only by builds that have it:
