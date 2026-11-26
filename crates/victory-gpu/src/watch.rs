@@ -340,20 +340,29 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let gap = AHEAD_GAP;
+    let ends = known_ends();
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && !ends_between(ends.as_deref(), last, pieces[k].0)
         {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        runs.push((i, k));
         i = k;
+    }
+    // (Let go before asking: a refused run notes where it ends.)
+    drop(ends);
+    for (i, k) in runs {
+        ask_run(&pieces[i..k], &mut asked, &mut written);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -650,6 +659,16 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if let Some(mut pages) = kernel_written(first, last) {
+        #[cfg(feature = "diagnostics")]
+        {
+            // The pages walked that lie in none of the ranges.
+            let (mut covered, mut to) = (0, first);
+            for &(a, b) in pieces {
+                covered += b.saturating_sub(a.max(to));
+                to = to.max(b);
+            }
+            tally(13, ((last - first - covered) * (PAGE >> 10)) as u64);
+        }
         if let Some(caught) = consider_cold(first, last, &pages) {
             pages.extend(caught);
         }
@@ -657,9 +676,99 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
         asked.push((first, last));
         return;
     }
+    // Refused: most often the run reaches from one reservation into the
+    // next. Where the pieces' reservations change is noted, and the run is
+    // asked reservation by reservation; the next submissions' runs stop
+    // there ([`ends_between`]) instead of being refused again.
+    if let Some(cuts) = learn_ends(pieces) {
+        let mut from = 0;
+        for cut in cuts.into_iter().chain([pieces.len()]) {
+            ask_run(&pieces[from..cut], asked, written);
+            from = cut;
+        }
+        return;
+    }
     let (a, b) = pieces.split_at(pieces.len() / 2);
     ask_run(a, asked, written);
     ask_run(b, asked, written);
+}
+
+/// Where a run of a submission's asking stops, learned from askings the
+/// kernel refused: by the page that begins an allocation, the end of the
+/// piece before it (the beginning lies between the two). Only ever a reason
+/// to ask in two calls instead of one: a note gone wrong (memory freed and
+/// reserved again otherwise) costs a call, a missing one a refusal, and
+/// neither loses a write. `VICTORY_ASK_ENDS=0` halves refused runs only, as
+/// before. (Run x16-rt: 360 of a frame's 680 askings were refused.)
+static ENDS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+/// The most notes kept; past it they are forgotten and learned again.
+const ENDS_MOST: usize = 4096;
+
+fn ends_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ENDS").is_none_or(|v| v != "0"))
+}
+
+/// [`ENDS`] for one submission's merging, if any are noted.
+fn known_ends() -> Option<std::sync::RwLockReadGuard<'static, BTreeMap<usize, usize>>> {
+    if !ends_on() {
+        return None;
+    }
+    let ends = ENDS.read().unwrap_or_else(|e| e.into_inner());
+    (!ends.is_empty()).then_some(ends)
+}
+
+/// Whether a run ending at page `last` and the piece from page `next` on lie
+/// on two sides of an allocation's beginning noted in `ends`.
+fn ends_between(ends: Option<&BTreeMap<usize, usize>>, last: usize, next: usize) -> bool {
+    // (A piece that overlaps the run lies in its allocation.)
+    let Some(ends) = ends.filter(|_| next >= last) else {
+        return false;
+    };
+    // The nearest noted beginning at or past the run's end, if the piece
+    // before it ended by the next piece's start: the two sit across it.
+    ends.range(last..).next().is_some_and(|(_, &before)| before <= next)
+}
+
+/// For a refused run of `pieces`: the indices of the pieces that begin in
+/// another allocation than the pieces before them, noted in [`ENDS`];
+/// `None` if they all lie in one (the refusal is something else).
+fn learn_ends(pieces: &[(usize, usize)]) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if !ends_on() {
+        return None;
+    }
+    let base = |page: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info.AllocationBase as usize)
+    };
+    let mut cuts = Vec::new();
+    let mut before = base(pieces[0].0)?;
+    let mut end = pieces[0].1;
+    for (i, &(a, b)) in pieces.iter().enumerate().skip(1) {
+        let here = base(a)?;
+        // (Overlapping pieces stay together, as the merging keeps them.)
+        if here != before && a >= end {
+            cuts.push(i);
+        }
+        before = here;
+        end = end.max(b);
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut ends = ENDS.write().unwrap_or_else(|e| e.into_inner());
+    if ends.len() + cuts.len() > ENDS_MOST {
+        ends.clear();
+    }
+    for &cut in &cuts {
+        let before = pieces[..cut].iter().map(|p| p.1).max().unwrap_or(0);
+        ends.insert(pieces[cut].0, before);
+    }
+    Some(cuts)
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -1434,9 +1543,10 @@ fn published(start: usize, end: usize) -> bool {
 /// opened by ourselves; nanoseconds waiting for the guards' lock and
 /// nanoseconds of changing protections (all threads); questions to Windows
 /// about holes; kernel askings refused; nanoseconds in kernel askings; the
-/// 4 KiB pages they found written.
+/// 4 KiB pages they found written; KiB of the submissions' joined askings
+/// that lay between their ranges.
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static ASKS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
@@ -1445,7 +1555,7 @@ fn tally(what: usize, n: u64) {
 
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 13] {
+pub(crate) fn asks() -> [u64; 14] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -2965,6 +3075,59 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// A run of a submission's asking that reaches from one allocation into
+    /// the next is refused; it is asked allocation by allocation, nothing
+    /// written is missed, and later runs stop where the second begins.
+    #[test]
+    fn a_run_across_two_allocations_is_asked_by_allocation() {
+        // Two write-watched allocations side by side: where a reservation
+        // was let go, unless another thread takes the place first.
+        let p = (0..16)
+            .find_map(|_| {
+                // SAFETY: a reservation of ours, let go at once.
+                let p = unsafe { VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+                assert_ne!(p, 0);
+                // SAFETY: as above.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+                let flags = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+                // SAFETY: fresh allocations at addresses nobody holds, freed below.
+                let a = unsafe { VirtualAlloc(p as *const _, 4 * PAGE, flags, PAGE_READWRITE) } as usize;
+                let b = unsafe { VirtualAlloc((p + 4 * PAGE) as *const _, 4 * PAGE, flags, PAGE_READWRITE) } as usize;
+                if a == p && b == p + 4 * PAGE {
+                    return Some(p);
+                }
+                for at in [a, b].into_iter().filter(|&at| at != 0) {
+                    // SAFETY: ours.
+                    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+                }
+                None
+            })
+            .expect("two allocations side by side");
+        let base = p / PAGE;
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + PAGE + 8) as *mut u8).write(1);
+            ((p + 5 * PAGE) as *mut u8).write(1);
+        }
+        let pieces = [(base, base + 1), (base + 1, base + 2), (base + 4, base + 5), (base + 5, base + 6)];
+        let _held = Asking::hold(base, base + 8);
+        assert!(kernel_written(base, base + 6).is_none(), "the kernel asks across allocations");
+        let (mut asked, mut written) = (Vec::new(), Vec::new());
+        ask_run(&pieces, &mut asked, &mut written);
+        assert_eq!(asked, [(base, base + 2), (base + 4, base + 6)]);
+        let pages: Vec<usize> = written.iter().map(|w| w.0).collect();
+        assert_eq!(pages, [base + 1, base + 5]);
+        let ends = ENDS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(ends_between(Some(&ends), base + 2, base + 4));
+        assert!(!ends_between(Some(&ends), base, base + 1), "inside the first");
+        assert!(!ends_between(Some(&ends), base + 5, base + 5), "inside the second");
+        drop(ends);
+        for at in [p, p + 4 * PAGE] {
+            // SAFETY: ours.
+            unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
 
     /// Eight quiet askings in a row make a range cold; a busy one starts
     /// the count again.
