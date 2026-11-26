@@ -2345,6 +2345,15 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // A look for the longest idle that let nothing go is not made again at
+    // once ([`sweep_rests`]).
+    static EMPTY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let limited = most != u64::MAX;
+    let now = crate::host::coarse_ms().max(1);
+    if limited && sweep_rests(now, EMPTY[0].load(Relaxed), EMPTY[1].load(Relaxed), idle_ms, sweep_rest_ms()) {
+        SWEPT_RESTED.fetch_add(1, Relaxed);
+        return;
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2474,6 +2483,12 @@ pub(crate) fn let_go_idle() {
             }
         }
     }
+    if limited && went == 0 {
+        EMPTY[1].store(idle_ms, Relaxed);
+        EMPTY[0].store(now, Relaxed);
+    } else {
+        EMPTY[0].store(0, Relaxed);
+    }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2486,6 +2501,35 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Looks of [`let_go_idle`] not made because the one before let nothing go
+/// ([`sweep_rests`]).
+#[cfg(windows)]
+pub(crate) static SWEPT_RESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long [`let_go_idle`] rests after a look on a card short of room
+/// that let nothing go: `VICTORY_SWEEP_REST_MS` (2,000; 0: no rest, a look
+/// every second as before; at most 10,000).
+#[cfg(windows)]
+fn sweep_rest_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_SWEEP_REST_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(2000, |ms| ms.min(10_000))
+    })
+}
+
+/// Whether [`let_go_idle`] leaves out a look for the longest idle copies:
+/// the last one, at `empty_at` (0: none) with copies idle for `empty_idle`
+/// milliseconds, let nothing go, less than `rest` milliseconds before
+/// `now`, and the card is no shorter of room than it was then (`idle_ms`
+/// is not less). On a card that stays over its line with nothing idle
+/// (render targets and textures in use), every look went through and
+/// sorted the table of over 100,000 textures, under its lock, for nothing.
+/// (After Belobug/VIctory-Belobug-AMD PR #223, zaixiakongyiji.)
+#[cfg(any(windows, test))]
+fn sweep_rests(now: u64, empty_at: u64, empty_idle: u64, idle_ms: u64, rest: u64) -> bool {
+    empty_at != 0 && idle_ms >= empty_idle && now.saturating_sub(empty_at) < rest
 }
 
 /// For [`let_go_idle`]: lets go of the host copy of title texture `at` if it
@@ -5218,5 +5262,22 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(dxr_room_from(Some(" 768 ")), 768 << 20);
         assert_eq!(dxr_room_from(Some("999999")), 4096 << 20);
         assert_eq!(dxr_room_from(Some("no")), 1024 << 20);
+    }
+
+    #[test]
+    fn an_empty_sweep_rests_unless_the_card_gets_shorter_of_room() {
+        // No empty look before: none left out.
+        assert!(!sweep_rests(5_000, 0, 5_000, 5_000, 2_000));
+        // An empty one a second ago, the same pressure: left out; two
+        // seconds ago: made again.
+        assert!(sweep_rests(5_000, 4_000, 5_000, 5_000, 2_000));
+        assert!(!sweep_rests(6_000, 4_000, 5_000, 5_000, 2_000));
+        // The card got shorter of room (copies go after 1.5 s, not 5 s):
+        // looked at once.
+        assert!(!sweep_rests(5_000, 4_000, 5_000, 1_500, 2_000));
+        // It got less short: still rests.
+        assert!(sweep_rests(5_000, 4_000, 1_500, 5_000, 2_000));
+        // No rest asked for.
+        assert!(!sweep_rests(5_000, 4_999, 5_000, 5_000, 0));
     }
 }
