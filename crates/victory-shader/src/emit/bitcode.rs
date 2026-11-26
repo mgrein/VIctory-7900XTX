@@ -326,6 +326,33 @@ impl Module {
         }
     }
 
+    /// The flags of every `dx.op.barrier` call, in order (tests).
+    #[cfg(test)]
+    pub fn barrier_modes(&self) -> Vec<u32> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.barrier" => {
+                    Some(self.int_value(args[1]).expect("constant barrier flags") as u32)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the module declares function `name` (tests).
+    #[cfg(test)]
+    pub fn has_function(&self, name: &str) -> bool {
+        self.func_ids.contains_key(name)
+    }
+
+    /// Whether the module holds the 32-bit integer constant `v` (tests).
+    #[cfg(test)]
+    pub fn has_i32_const(&self, v: u32) -> bool {
+        let want = Const::Int(i64::from(v as i32));
+        self.consts.iter().any(|(_, c)| *c == want)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

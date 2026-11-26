@@ -2379,9 +2379,15 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
     // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
-    // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
-        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+    // immediate sampler's word; either operand inline or a literal (fxceless
+    // PR #799).
+    if let ("s_bfm_b32", 0, [w, at]) = (inst.name(), k, &src[..]) {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let (w, at) = (constant(w)? & 31, constant(at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;
@@ -2411,6 +2417,15 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
             }))
         }
         _ => None,
+    }
+}
+
+/// The constant [`copy_source`] finds for dword `k` of what `inst` writes (tests).
+#[cfg(test)]
+pub(crate) fn constant_copy(inst: &Inst, k: usize) -> Option<u32> {
+    match copy_source(inst, k)? {
+        Moved::Const(x) => Some(x),
+        Moved::Value(_) => None,
     }
 }
 

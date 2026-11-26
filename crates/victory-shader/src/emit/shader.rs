@@ -240,6 +240,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of `lds_dwords` the title's program allocates (what follows is the
+    /// translation's own: `wave_base`'s counter, exchange dwords). LDS accesses past it read 0
+    /// and drop writes, as the console's.
+    pub title_lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -293,6 +297,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            title_lds_dwords: 0,
             lds: None,
             main,
             entry,
