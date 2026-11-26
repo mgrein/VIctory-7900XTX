@@ -1170,6 +1170,11 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// The levels over the cap ([`cap_first`]) it was made without, as the
+    /// cap was then (0: none): [`want_level`] goes by this, not by the cap
+    /// as it is now, so a cap that loosens for a moment does not replace
+    /// every capped copy with a level-0 view at once.
+    pub(crate) capped: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1296,6 +1301,108 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// Host copies of streamed textures made without levels over the cap
+/// ([`cap_first`]) that their views show, since the start; and the count
+/// the log line goes by.
+#[cfg(windows)]
+pub(crate) static CAPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How much of the card's memory budget the process uses, in percent, as
+/// last asked (at most every 50 ms: asked for every such host copy made).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> = std::sync::Mutex::new((None, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0.is_none_or(|at| at.elapsed() > std::time::Duration::from_millis(50)) {
+        last.0 = Some(std::time::Instant::now());
+        if let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) {
+            last.1 = used.saturating_mul(100) / budget.max(1);
+        }
+    }
+    last.1
+}
+
+/// Whether the card's memory budget (DXGI's local budget, at the first
+/// asking with a host device) is 12 GiB or less: the cap is then on by
+/// default. On a 12 GB card textures streaming in after the budget is
+/// reached stayed blank and some 5 GB went to the PC's memory.
+#[cfg(windows)]
+fn small_card() -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&small) = SMALL.get() {
+        return small;
+    }
+    let Some(budget) = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget) else {
+        return false;
+    };
+    *SMALL.get_or_init(|| budget <= 12 << 30)
+}
+
+/// The longest side a streamed texture's host copy may have, in pixels (0:
+/// no cap). `VICTORY_TEXTURE_MAX=<pixels>` sets it (`0`: off); unset, on a
+/// card of 12 GiB or less ([`small_card`]) it follows how full the card is
+/// ([`cap_for_percent`]), elsewhere there is none (AMD's 24 GB card keeps
+/// every level, as before). (From DexNom/VIctory#60, port of Belobug
+/// ebd990d8, where at 2048 a 16 GB card went 1 to 2 GB over its budget.)
+#[cfg(windows)]
+fn texture_max() -> u64 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| std::env::var("VICTORY_TEXTURE_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()));
+    match set {
+        Some(max) => max,
+        None if !cfg!(test) && small_card() => cap_for_percent(video_memory_percent()),
+        None => 0,
+    }
+}
+
+/// [`texture_max`]'s default for a card `percent` full: 1024 under 70 % of
+/// its budget, 512 under 85 %, 256 above.
+#[cfg(windows)]
+fn cap_for_percent(percent: u64) -> u64 {
+    match percent {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    }
+}
+
+/// The first level of a streamed texture its host copy keeps for no side
+/// to pass [`texture_max`] (0: all), asked when the copy is made (and so
+/// again after the sweep let one go) and when a view asks for a larger
+/// level ([`want_level`]). [`base_level`] then makes it one the host can
+/// begin at.
+#[cfg(windows)]
+fn cap_first(d: &ResourceDesc) -> u32 {
+    mips_over(d, texture_max())
+}
+
+/// How many of the largest levels a texture described by `d` loses for no
+/// side of it to pass `max` (0: none): only 2-D textures of
+/// block-compressed formats (BC1 to BC7) with a level chain, no render
+/// target, depth or unordered access, one sample; at least one level
+/// stays, and the sides of the new largest level stay multiples of 4.
+#[cfg(windows)]
+fn mips_over(d: &ResourceDesc, max: u64) -> u32 {
+    const TEXTURE2D: u32 = 3;
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
+    if max == 0 || d.dimension != TEXTURE2D || d.flags & TARGET_DEPTH_UNORDERED != 0 || !block || d.mip_levels < 2 || d.sample_count > 1 {
+        return 0;
+    }
+    let (width, height) = (d.width, u64::from(d.height));
+    let mut skip = 0u32;
+    while (width.max(height) >> skip) > max
+        && skip + 1 < u32::from(d.mip_levels)
+        && (width >> (skip + 1)) > 0
+        && (height >> (skip + 1)) > 0
+        && (width >> (skip + 1)).is_multiple_of(4)
+        && (height >> (skip + 1)).is_multiple_of(4)
+    {
+        skip += 1;
+    }
+    skip
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1353,7 +1460,14 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // Never past the levels over the cap ([`cap_first`]) as it was when the
+    // copy was made: the cap follows how full the card is, asked every
+    // 50 ms, and every capped texture has views from level 0, so going by
+    // the cap as it is now replaced every one of them each time the card
+    // dipped under a threshold, and the new copies (with the old ones still
+    // alive in `REPLACED`) filled it again. The cap loosens for a texture
+    // when its copy is made again (after the sweep let it go).
+    if host.base == 0 || host.base <= base_level(&r.desc, first.max(host.capped)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1576,13 +1690,35 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
+        // A large block-compressed one also goes without the levels over
+        // the cap ([`cap_first`]): its first level is the larger of the two.
         let mut base = 0;
+        let mut cap_used = 0;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
+            let capped = cap_first(&r.desc);
+            cap_used = capped;
+            if first != u32::MAX || capped > 0 {
+                let held = if first == u32::MAX { 0 } else { base_level(&r.desc, first) };
+                base = base_level(&r.desc, if first == u32::MAX { capped } else { first.max(capped) });
+                if base > held {
+                    CAPPED[0].fetch_add(1, Relaxed);
+                    let n = CAPPED[1].fetch_add(1, Relaxed) + 1;
+                    if n == 1 || n.is_power_of_two() {
+                        tracing::info!(
+                            resource = ?this,
+                            width = r.desc.width,
+                            height = r.desc.height,
+                            levels = r.desc.mip_levels,
+                            base,
+                            viewed_from = held,
+                            so_far = n,
+                            "a streamed texture's host copy goes without its largest levels (VICTORY_TEXTURE_MAX)"
+                        );
+                    }
+                }
             }
         }
         let texture = match texture {
@@ -1611,6 +1747,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.capped = cap_used;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2294,6 +2431,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            capped: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2319,6 +2457,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            capped: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -4567,5 +4706,46 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A streamed BC texture larger than the cap loses the fewest largest
+    /// levels for both sides to fit; others are left whole. (Port of
+    /// DexNom/VIctory#60's test.)
+    #[cfg(windows)]
+    #[test]
+    fn a_large_streamed_texture_goes_without_its_largest_mips() {
+        const BC1: u32 = 71;
+        const BC7: u32 = 98;
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 13), 1024), 2);
+        assert_eq!(mips_over(&texture(4096, 1024, BC7, 13), 1024), 2, "the longer side");
+        assert_eq!(mips_over(&texture(2048, 2048, BC7, 12), 512), 2);
+        assert_eq!(mips_over(&texture(1024, 1024, BC1, 11), 1024), 0, "fits already");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 13), 0), 0, "no cap");
+        assert_eq!(mips_over(&texture(4096, 4096, 28, 13), 1024), 0, "not block-compressed");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 1), 1024), 0, "no mip chain");
+        assert_eq!(mips_over(&texture(4096, 4096, BC1, 2), 256), 1, "one mip stays");
+        // Sides stay multiples of 4: 2052 / 2 = 1026 is not.
+        assert_eq!(mips_over(&texture(2052, 2048, BC1, 12), 1024), 0);
+        let target = ResourceDesc { flags: 1, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&target, 1024), 0, "a render target");
+        let unordered = ResourceDesc { flags: 4, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&unordered, 1024), 0, "unordered access");
+        let volume = ResourceDesc { dimension: 4, ..texture(4096, 4096, BC1, 13) };
+        assert_eq!(mips_over(&volume, 1024), 0, "a volume");
+        assert_eq!([cap_for_percent(10), cap_for_percent(69), cap_for_percent(70)], [1024, 1024, 512]);
+        assert_eq!([cap_for_percent(84), cap_for_percent(85), cap_for_percent(120)], [512, 256, 256]);
+        // A placed 4096x4096 BC7 texture of 13 levels in the console's
+        // layout: the host copy can begin at level 2 (1024x1024), and a view
+        // from level 3 keeps it from there.
+        let words = [3u32, 0, 0, 0, 4096, 0, 4096, 0xd_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes in the description's layout.
+        let d = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        assert_eq!(mips_over(&d, 1024), 2);
+        assert_eq!(base_level(&d, mips_over(&d, 1024)), 2);
+        assert_eq!(base_level(&d, 3u32.max(mips_over(&d, 1024))), 3);
+        // Unset in tests: no cap by default.
+        if std::env::var_os("VICTORY_TEXTURE_MAX").is_none() {
+            assert_eq!(cap_first(&texture(4096, 4096, BC1, 13)), 0);
+        }
     }
 }

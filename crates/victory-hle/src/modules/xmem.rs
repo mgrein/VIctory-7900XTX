@@ -401,6 +401,8 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Made with `SEC_COMMIT`: every page is committed already.
+    whole: bool,
 }
 
 impl Section {
@@ -440,7 +442,7 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            if !self.whole && !commit(base + page * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -465,7 +467,7 @@ impl Section {
                 word.load(Ordering::Acquire) & bit != 0
             })
         };
-        if lean() && done() {
+        if self.whole || lean() && done() {
             return true;
         }
         if !counted(Call::Commit, || commit(base, len)) {
@@ -657,21 +659,34 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far: commit it whole there.
+    // With page pool windows in place (`victory_gpu::pool_in_place`, port of
+    // DexNom's local `VICTORY_POOL_INPLACE`) the section must be committed
+    // to be opened as a host heap (it charges the commit at once, and takes
+    // memory only for pages touched); if the host cannot commit it now, it
+    // is made reserved as before and its windows are copied.
+    let make = |flags| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | flags,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
     };
+    let mut committed = on_wine() || victory_gpu::pool_in_place();
+    let mut handle = make(if committed { SEC_COMMIT } else { SEC_RESERVE });
+    if handle.is_null() && committed && !on_wine() {
+        tracing::warn!(n, error = %std::io::Error::last_os_error(), "page pool section not committed: made reserved, its windows are copied");
+        committed = false;
+        handle = make(SEC_RESERVE);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -686,12 +701,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     let section = Arc::new(Section {
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        whole: committed,
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -760,7 +776,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if !slice.section.whole && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }

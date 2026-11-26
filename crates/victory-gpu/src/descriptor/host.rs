@@ -4927,6 +4927,12 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+        // A copy without levels over the cap (`crate::resource::cap_first`):
+        // the title's whole view shows all the copy has, a view of levels
+        // the copy has not alone shows its largest.
+        assert_eq!(view(0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(view(1, 2, 1.5), (0, 1, 0.0));
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.
