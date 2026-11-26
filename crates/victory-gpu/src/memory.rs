@@ -139,6 +139,10 @@ const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// After what title memory by address needs could not be made (all of it,
+/// or another arena), so many frames before it is tried again: each try
+/// commits memory (16 MiB, 64 MiB) and draws come hundreds of times a frame.
+const RETRY: u64 = 300;
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -209,6 +213,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// The frame another arena last could not be made in ([`RETRY`]).
+    no_arena: Option<u64>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -242,6 +248,24 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The frame [`Memory::new`] last failed in (`u64::MAX`: never), under
+/// [`MEMORY`]'s lock ([`RETRY`]).
+static NEW_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether a try that failed in frame `failed` (`u64::MAX`: none did) is
+/// too recent to try again in frame `frame`.
+fn too_soon(failed: u64, frame: u64) -> bool {
+    failed != u64::MAX && frame >= failed && frame - failed < RETRY
+}
+
+/// Memory [`crate::upload::reserve`] gave that is not used after all.
+fn give_back(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    // SAFETY: a whole reservation of ours; nothing holds it (what was made
+    // over it was dropped).
+    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -256,9 +280,17 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        let made = (|| {
+            let directory = crate::shadow::by_address(entries as u64, bytes)?;
+            let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+            Some((directory, faults, data))
+        })();
+        // (Else the 16 MiB stayed committed, once per draw.)
+        let Some((directory, faults, data)) = made else {
+            give_back(entries);
+            return None;
+        };
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
         unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
@@ -284,6 +316,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            no_arena: None,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -419,12 +452,30 @@ impl Memory {
         true
     }
 
-    /// Another arena's pages.
+    /// Whether another copy can be given a number.
+    fn numbers_left(&self) -> bool {
+        self.copies.len() < COPIES as usize
+    }
+
+    /// Another arena's pages. Not tried for [`RETRY`] frames after a try
+    /// failed: what a try commits is given back, but it costs 64 MiB of
+    /// commit and two buffers of as much, and it comes with every dispatch
+    /// of the builder.
     fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+        if self.no_arena.is_some_and(|failed| too_soon(failed, self.frame)) || !self.numbers_left() {
             return false;
-        };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        }
+        let made = crate::upload::reserve(ARENA as usize).and_then(|at| {
+            let n = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s));
+            if n.is_none() {
+                give_back(at);
+            }
+            Some((n?, at))
+        });
+        let Some((n, at)) = made else {
+            self.no_arena = Some(self.frame);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(RETRY, "title memory by address: another arena could not be made; tried again so many frames later"));
             return false;
         };
         self.arenas.push((n, at));
@@ -935,11 +986,19 @@ pub(crate) fn ready(
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = crate::frame::current();
     if guard.is_none() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Not with every draw: each try commits the directory's 16 MiB.
+        if too_soon(NEW_FAILED.load(Relaxed), frame) {
+            return None;
+        }
         *guard = Memory::new();
+        if guard.is_none() {
+            NEW_FAILED.store(frame, Relaxed);
+        }
     }
     let m = guard.as_mut()?;
-    let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
@@ -1338,6 +1397,18 @@ mod tests {
         // The switch wins.
         assert_eq!(pages_most(Some(11 * GIB), Some(3072)), 3 << 14);
         assert_eq!(pages_most(Some(24 * GIB), Some(512)), pages(512));
+    }
+
+    /// A failed try is not tried again for [`RETRY`] frames.
+    #[test]
+    fn a_failed_try_waits() {
+        assert!(!too_soon(u64::MAX, 0));
+        assert!(!too_soon(u64::MAX, 5));
+        assert!(too_soon(7, 7));
+        assert!(too_soon(7, 7 + RETRY - 1));
+        assert!(!too_soon(7, 7 + RETRY));
+        // A frame counter that went back: tried.
+        assert!(!too_soon(7, 3));
     }
 
     #[test]
