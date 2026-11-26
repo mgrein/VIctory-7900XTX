@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{TEST_MEMORY, TEST_MEMORY_END};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -639,6 +639,99 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
         (structure >> 40) as u32 | bvh::BOX_SORT,
     );
     run(false, descriptor, 0, true);
+}
+
+/// Title memory where the first node, a 32-bit box node, starts 64 bytes
+/// before the end of a 64 KiB page: its second half is in the next page.
+const ACROSS: u64 = 0x12_3456_F7C0;
+
+#[test]
+fn a_box_node_across_the_end_of_a_page_matches_the_reference_on_the_card() {
+    // Its last two boxes are read through a look of their own in the
+    // directory (the other nodes' second halves through their first's).
+    assert_eq!((ACROSS + u64::from(NODES)) & 0xFFFF, 0x1_0000 - 64);
+    let _memory = Memory::at(ACROSS);
+    run(true, WHOLE, ACROSS + u64::from(NODES), true);
+}
+
+/// When the page after a box node's first half has no copy, the two boxes
+/// in its second half are hit by no ray: the second half is looked for in
+/// its own page, not taken from the first half's copy.
+#[test]
+fn a_box_node_whose_second_half_has_no_copy_enters_only_its_first_two_children() {
+    // Title memory ends where the first node's page does.
+    let shader = {
+        let _memory = Memory::at(ACROSS);
+        TEST_MEMORY_END.set(Some(ACROSS + u64::from(NODES) + 64));
+        let built = build(true, WHOLE);
+        TEST_MEMORY_END.set(None);
+        built.expect("the program lowers").0
+    };
+    let (scene, batches) = scene();
+    // The first cases: rays of the reference's tests at the first node.
+    let batch: Vec<Case> = batches[0]
+        .iter()
+        .copied()
+        .take_while(|c| matches!(c, Some((0, 5, _))))
+        .collect();
+    assert!(batch.len() >= 8);
+    assert_eq!(scene.starts[0], 0);
+    let mut words = scene.node(0);
+    // The last two boxes switched off: what the instruction answers when
+    // their page is not there.
+    words[16..28].fill(f32::NAN.to_bits());
+    let want: Vec<[u32; 4]> = batch
+        .iter()
+        .map(|c| {
+            let (_, kind, ray) = c.expect("a case");
+            bvh::intersect(&words, kind, &ray, true)
+        })
+        .collect();
+    // Some ray must enter one of those boxes, or this proves nothing.
+    assert!(
+        batch
+            .iter()
+            .zip(&want)
+            .any(|(c, w)| expected(&scene, c, true) != *w),
+        "no ray enters the last two boxes"
+    );
+    let data = buffer(&scene, &batch, ACROSS + u64::from(NODES));
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (t, w) in want.iter().enumerate() {
+            assert_eq!(&out[0][4 * t..4 * t + 4], w, "{label}, thread {t}: {:x?}", batch[t]);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 #[test]
