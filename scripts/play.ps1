@@ -53,6 +53,12 @@ if ($Nvidia) {
     # 80 -> 67 ms a frame at equal draws (runs xh2/xh4).
     $settings.VICTORY_PORT_CONSTANTS = '1'
     $settings.VICTORY_PORT_CBV = '1'
+    # Renderer ports 2, 6 and 7 (descriptor records told by their stores, the guards' shared lock,
+    # the heaps' records asked at the title's submit): same save, 15.9 -> 15.3 ms per thousand
+    # draws, the submitting thread's preparing 38 -> 33 ms (runs xh8/xh9).
+    $settings.VICTORY_PORT_DESCRIPTORS = '1'
+    $settings.VICTORY_PORT_GUARD = '1'
+    $settings.VICTORY_PORT_JOURNAL = '1'
     # Ray tracing on the card's own units (DXR 1.1 ray queries, from maren-halv/VIctory-DXR):
     # RTX 4070, same save: 153 -> 108 ms a frame against the emulated walk. Changes every
     # shader's cache key: run `victory shaders` once with VICTORY_NATIVE_RT=1 set.
