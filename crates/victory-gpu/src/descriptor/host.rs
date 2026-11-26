@@ -4329,6 +4329,37 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     Some((from / 4, dwords, (start - from) as u32))
 }
 
+/// The format the host makes a typed buffer view in: the float format of
+/// the same width for a 32-bit integer one. Translated shaders declare
+/// every typed buffer load and store as 32-bit float and move the bits
+/// (`victory_shader` `emit/lower.rs`); through a view of an integer format
+/// the host is free to convert between float and integer values on the
+/// way (a store of an integer's bits as a float is then written as the
+/// integer the float rounds to, zero for most), where the console moves
+/// the bits. The float format moves them unchanged and is what the shader
+/// declares. (The 16-bit integer formats are told to the shader instead,
+/// `victory_shader::emit::VIEW_INTEGER`.) `VICTORY_TYPED_INT_BITS=0`: the
+/// title's format, as before. From fxceless/victory-fork f6a09d3b (pull
+/// request #684).
+fn bits_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_INT_BITS").is_none_or(|v| v != "0")) {
+        return format;
+    }
+    float_of_width(format)
+}
+
+/// [`bits_format`], whatever the setting.
+fn float_of_width(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -4366,6 +4397,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    desc.Format = bits_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -4496,6 +4528,7 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    desc.Format = bits_format(desc.Format);
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
@@ -5776,6 +5809,40 @@ mod tests {
         // SAFETY: as above.
         let t = unsafe { desc.Anonymous.TextureCubeArray };
         assert_eq!((t.MostDetailedMip, t.MipLevels, t.First2DArrayFace, t.NumCubes), (10, u32::MAX, 6, 2));
+    }
+
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width, with elements of the same size; every
+    /// other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32_SINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_UINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(float_of_width(title), host);
+            let bytes = |f: DXGI_FORMAT| crate::resource::element(f.0 as u32).map(|(bytes, _)| bytes);
+            assert_eq!(bytes(title), bytes(host), "{title:?}");
+            assert!(bytes(host).is_some());
+        }
+        for same in [
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R16_UINT,
+            DXGI_FORMAT_R16G16B16A16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R10G10B10A2_UINT,
+        ] {
+            assert_eq!(float_of_width(same), same);
+        }
     }
 
     /// A 2-D texture's view as an array of one is rebased as a plain one is,
