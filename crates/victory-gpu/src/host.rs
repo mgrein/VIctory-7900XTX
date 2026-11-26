@@ -1621,12 +1621,35 @@ fn spare_prelude() -> Option<Prelude> {
     if !prelude_pool() {
         return None;
     }
-    let taken = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.pop();
+    let (taken, left) = {
+        let mut spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = spare.0.pop();
+        (taken, spare.0.len())
+    };
+    crate::list::warm::prelude_taken(left, taken.is_none());
     #[cfg(feature = "diagnostics")]
     if taken.is_some() {
         crate::copystat::add(crate::copystat::C::PreludesPooled, 1);
     }
     taken
+}
+
+/// [`SPARE_PRELUDES_MOST`], for the thread that makes preludes ahead of
+/// need (`crate::list::warm`).
+pub(crate) fn spare_preludes_most() -> usize {
+    if prelude_pool() { SPARE_PRELUDES_MOST } else { 0 }
+}
+
+/// Makes a prelude and keeps it for the next list that needs one
+/// (`crate::list::warm`): `false` if none could be made.
+pub(crate) fn warm_prelude() -> bool {
+    let Some(prelude) = host().and_then(|h| h.make_prelude()) else {
+        return false;
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PreludesAhead, 1);
+    give_prelude(prelude);
+    true
 }
 
 /// Keeps `prelude` (closed, and run if it ever ran) for the next list that
@@ -1642,7 +1665,6 @@ fn give_prelude(prelude: Prelude) {
 }
 
 /// How many preludes are kept ([`prelude_pool`]).
-#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn spare_preludes() -> usize {
     SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.len()
 }

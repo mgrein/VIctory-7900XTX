@@ -152,6 +152,8 @@ pub(crate) enum C {
     /// from those other lists left instead.
     PreludesMade,
     PreludesPooled,
+    /// Of `PreludesMade`, those made ahead of need (`crate::list::warm`).
+    PreludesAhead,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1480,7 +1482,7 @@ pub(crate) fn log(frames: f64) {
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms ({:.1} for an empty pool, {:.1} \
          ahead of need; {:.1} fat (VICTORY_LIST_FAT), {:.1} dropped for a full pool, {:.1} let go idle; \
-         preludes {:.1} made, {:.1} reused); {:.0} parts of held submissions \
+         preludes {:.1} made ({:.1} ahead), {:.1} taken from those kept); {:.0} parts of held submissions \
          ran alone that the next part could have run with",
         ms(c[C::UntilRecordUs as usize]),
         ms(c[C::UntilSubmitUs as usize]),
@@ -1502,6 +1504,7 @@ pub(crate) fn log(frames: f64) {
         c[C::ListsDropped as usize],
         c[C::ListsAged as usize],
         c[C::PreludesMade as usize],
+        c[C::PreludesAhead as usize],
         c[C::PreludesPooled as usize],
         c[C::PartsTogether as usize],
     );

@@ -20,6 +20,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 pub(crate) mod thin;
+#[cfg(windows)]
+pub(crate) mod warm;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
@@ -322,14 +324,15 @@ fn pool_closed() -> bool {
 /// is left for its next reset.
 #[cfg(windows)]
 fn fresh_list(open: bool) -> Option<crate::host::HostList> {
-    let idle = {
+    let (idle, left) = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
-        taken
+        (taken, idle.0.len())
     };
+    warm::taken(left, idle.is_none());
     let (list, closed) = match idle {
         Some(Idle(list, _, _)) => (list, pool_closed()),
         None => {
@@ -434,13 +437,14 @@ const IDLE_LIST_FLOOR_PRESSED: usize = 16;
 
 /// How many of the pool's lists, taken when (`stamps`, oldest first: lists
 /// are put at the end and taken from there) and `now`, [`let_go_idle`] lets
-/// go from the front: those unused for [`IDLE_LIST_MS`] past the floor, or
-/// with `pressed` every one past the smaller floor.
-fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool) -> usize {
+/// go from the front: those unused for [`IDLE_LIST_MS`] past the floor (at
+/// least [`IDLE_LIST_FLOOR`], more while the pool is kept filled to more,
+/// `warm`), or with `pressed` every one past the smaller floor.
+fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool, floor: usize) -> usize {
     if pressed {
         return stamps.len().saturating_sub(IDLE_LIST_FLOOR_PRESSED);
     }
-    let room = stamps.len().saturating_sub(IDLE_LIST_FLOOR);
+    let room = stamps.len().saturating_sub(floor.max(IDLE_LIST_FLOOR));
     stamps.iter().take(room).take_while(|&&at| now.saturating_sub(at) >= IDLE_LIST_MS).count()
 }
 
@@ -461,7 +465,7 @@ pub(crate) fn let_go_idle(pressed: bool) -> usize {
     let mut gone: Vec<Idle> = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let stamps: Vec<u64> = idle.0.iter().map(|Idle(_, _, at)| *at).collect();
-        let n = idle_aged_out(&stamps, now, pressed);
+        let n = idle_aged_out(&stamps, now, pressed, warm::target());
         if n == 0 {
             return 0;
         }
@@ -2591,20 +2595,20 @@ mod tests {
         use super::{IDLE_LIST_FLOOR, IDLE_LIST_FLOOR_PRESSED, IDLE_LIST_MS, idle_aged_out};
         let now = 100_000;
         // Few lists: none goes, however old.
-        assert_eq!(idle_aged_out(&vec![0; IDLE_LIST_FLOOR], now, false), 0);
+        assert_eq!(idle_aged_out(&vec![0; IDLE_LIST_FLOOR], now, false, 0), 0);
         // 40 old and 10 fresh: the old past the floor go, from the front.
         let mut stamps = vec![now - IDLE_LIST_MS - 1; 40];
         stamps.extend(std::iter::repeat_n(now - 10, 10));
-        assert_eq!(idle_aged_out(&stamps, now, false), 50 - IDLE_LIST_FLOOR);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 50 - IDLE_LIST_FLOOR);
         // 10 old and 40 fresh: only the 10 old.
         let mut stamps = vec![now - IDLE_LIST_MS; 10];
         stamps.extend(std::iter::repeat_n(now - 10, 40));
-        assert_eq!(idle_aged_out(&stamps, now, false), 10);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 10);
         // All fresh: none, unless the PC is short of memory.
         let stamps = vec![now; 50];
-        assert_eq!(idle_aged_out(&stamps, now, false), 0);
-        assert_eq!(idle_aged_out(&stamps, now, true), 50 - IDLE_LIST_FLOOR_PRESSED);
-        assert_eq!(idle_aged_out(&stamps[..8], now, true), 0);
+        assert_eq!(idle_aged_out(&stamps, now, false, 0), 0);
+        assert_eq!(idle_aged_out(&stamps, now, true, 0), 50 - IDLE_LIST_FLOOR_PRESSED);
+        assert_eq!(idle_aged_out(&stamps[..8], now, true, 0), 0);
     }
 
     use super::*;
