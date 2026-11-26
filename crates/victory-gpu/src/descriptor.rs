@@ -1541,11 +1541,16 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// Without a description the slot becomes a null constant buffer view, as
+/// on the console and the PC: left as it was, the slot went on showing the
+/// constant buffer written there before (wrong constants; a device lost on
+/// an RX 6500 XT). From uiliannn/VItoriaBr PR #117 (a port of
+/// avatarmanz/VIctory 78ed12e).
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1957,6 +1962,19 @@ mod tests {
     /// Constant buffer views are named whole in their records: any address
     /// a program can have, any size below 16 KiB, multiples of 256 bytes
     /// up to 4 MiB; what does not fit says so.
+    /// A constant buffer view made without a description is a null one, not
+    /// the view the slot held before.
+    #[test]
+    fn a_constant_view_without_a_description_is_a_null_one() {
+        let null = std::ptr::null_mut();
+        let slot = [0u64; 4];
+        let handle = slot.as_ptr() as u64;
+        create_cbv(null, &[0x2602_0000, 0, 512, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x2602_0000, 512)));
+        create_cbv(null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
     #[test]
     fn constant_views_fit_their_records() {
         let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
