@@ -543,14 +543,39 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+///
+/// Read by every texture use of every list thread ([`upload_from`]) and
+/// written only when the host first copies into a texture or the title
+/// releases one: readers share the lock, and take none at all while the
+/// set is empty ([`HOST_WRITTEN_COUNT`]). (One mutex here was taken for
+/// every texture of every table on all list threads; after DexNom PR #24
+/// and Belobug PR #152, Adika713.)
+static HOST_WRITTEN: std::sync::RwLock<Option<std::collections::HashSet<usize>>> = std::sync::RwLock::new(None);
+
+/// How many textures [`HOST_WRITTEN`] holds, changed under its write lock.
+/// A reader that finds 0 skips the lock: a texture is entered before the
+/// list that records the host's write goes on to use it, so a reader that
+/// must see it reads the count after the insert.
+static HOST_WRITTEN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Enters `resource` in [`HOST_WRITTEN`]; whether it was not there.
+fn enter_host_written(resource: usize) -> bool {
+    let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+    let new = set.get_or_insert_with(Default::default).insert(resource);
+    if new {
+        HOST_WRITTEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    new
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
-    };
+    // (Written again and again by the same copies: no write lock for one
+    // already in the set.)
+    if host_wrote(resource as usize) {
+        return;
+    }
+    let new = enter_host_written(resource as usize);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -612,11 +637,27 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
+    if HOST_WRITTEN_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return false;
+    }
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
+}
+
+/// Takes `resource` out of [`HOST_WRITTEN`].
+fn leave_host_written(resource: usize) {
+    // (Most released resources were never copied into: no write lock.)
+    if host_wrote(resource) {
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = set.as_mut()
+            && set.remove(&resource)
+        {
+            HOST_WRITTEN_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// The title released a resource.
@@ -625,10 +666,7 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
-    }
+    leave_host_written(resource);
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
@@ -728,11 +766,7 @@ pub(crate) struct Digest(pub(crate) u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    let host_written = host_wrote(resource as usize);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {
@@ -1945,6 +1979,39 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod host_written_tests {
+    use super::{enter_host_written, host_wrote, leave_host_written};
+
+    /// Threads that enter, ask about and take out their own textures at
+    /// once each see their own: entered is found at once, taken out is
+    /// gone at once, whatever the others do to the set meanwhile, and a
+    /// texture nobody entered is never found.
+    #[test]
+    fn readers_and_writers_of_the_host_written_set_agree() {
+        const NEVER: usize = 0x7fff_0000_0008;
+        let threads: Vec<_> = (0..8usize)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..4000usize {
+                        let texture = 0x7ff0_0000_0000 + (t << 20) + (i % 64) * 16;
+                        assert!(!host_wrote(texture), "not entered yet");
+                        assert!(enter_host_written(texture), "new");
+                        assert!(!enter_host_written(texture), "there already");
+                        assert!(host_wrote(texture), "entered");
+                        assert!(!host_wrote(NEVER));
+                        leave_host_written(texture);
+                        assert!(!host_wrote(texture), "taken out");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("no thread failed");
+        }
+    }
 }
 
 #[cfg(test)]
