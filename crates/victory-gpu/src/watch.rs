@@ -602,9 +602,99 @@ impl Asking {
         Asking(first, last)
     }
 
-    /// Everything: an asking for a whole submission.
+    /// Everything: an asking for a whole submission, as it was before
+    /// [`AskingMany`] ([`hold_everything`]).
     fn hold_all() -> Asking {
         Asking::hold(0, usize::MAX)
+    }
+}
+
+/// Whether a submission's asking holds everything in [`ASKING`] while it
+/// asks, as before (`VICTORY_ASK_HOLD_ALL=1`; off by default, read here).
+///
+/// By default it holds only the page ranges it asks the kernel about
+/// ([`AskingMany`]): an asking of other pages on another thread (the heaps'
+/// thread asks about the descriptor heaps, the refreshes of the lists'
+/// threads about what the submission did not name) no longer waits for the
+/// submission's whole asking, some milliseconds a frame. What is kept: no
+/// two threads ask the kernel about the same page before the first one's
+/// answer is in the journal, since every range a kernel call covers is held
+/// from before the call until its pages are noted.
+fn hold_everything() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_HOLD_ALL").is_some_and(|v| v == "1"))
+}
+
+/// Sorts page ranges and joins those that overlap or touch.
+fn coalesce(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() < 2 {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for i in 1..ranges.len() {
+        let (a, b) = ranges[i];
+        if a <= ranges[kept].1 {
+            ranges[kept].1 = ranges[kept].1.max(b);
+        } else {
+            kept += 1;
+            ranges[kept] = (a, b);
+        }
+    }
+    ranges.truncate(kept + 1);
+}
+
+/// Several page ranges held in [`ASKING`] at once until dropped, taken
+/// together (all or none: who waits holds nothing meanwhile, so two of them
+/// never wait for each other). Ranges it does not hold are free for other
+/// askings. (After VIctory-DXR 965e0927, Maren Halvorsen.)
+struct AskingMany(Vec<(usize, usize)>);
+
+impl AskingMany {
+    fn hold(mut ranges: Vec<(usize, usize)>) -> AskingMany {
+        ranges.retain(|r| r.0 < r.1);
+        coalesce(&mut ranges);
+        if ranges.is_empty() {
+            return AskingMany(ranges);
+        }
+        let overlaps = |held: &[(usize, usize)]| {
+            held.iter().any(|&(a, b)| {
+                // The first of ours that ends past `a`: the only one that
+                // can begin before `b` if any does (ours are in order and
+                // apart).
+                let i = ranges.partition_point(|r| r.1 <= a);
+                i < ranges.len() && ranges[i].0 < b
+            })
+        };
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if overlaps(&held) {
+            held = waited(0, || {
+                let mut held = held;
+                while overlaps(&held) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&ranges);
+        drop(held);
+        AskingMany(ranges)
+    }
+}
+
+impl Drop for AskingMany {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &range in &self.0 {
+            if let Some(i) = held.iter().position(|&r| r == range) {
+                held.swap_remove(i);
+            }
+        }
+        drop(held);
+        ASKING.1.notify_all();
     }
 }
 
@@ -794,7 +884,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    let _all = (!held).then(Asking::hold_all);
+    let _all = (!held && hold_everything()).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let gap = ahead_gap();
     let ends = known_ends();
@@ -817,6 +907,18 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     }
     // (Let go before asking: a refused run notes where it ends.)
     drop(ends);
+    // Held until the answers are noted below: every page a run's kernel
+    // calls cover (whole, by reservation or by halves) lies between its
+    // first piece's start and its furthest end. A run of one piece is not
+    // asked ([`ask_run`]).
+    let _runs = (!held && !hold_everything()).then(|| {
+        AskingMany::hold(
+            runs.iter()
+                .filter(|r| r.len() >= 2)
+                .map(|r| (pieces[r.start].0, pieces[r.clone()].iter().map(|p| p.1).max().unwrap_or(0)))
+                .collect(),
+        )
+    });
     for (a, w) in spread_each(runs.len(), |r| {
         let (mut a, mut w) = (Vec::new(), Vec::new());
         ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
@@ -1061,6 +1163,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
+    if !hold_everything() {
+        // Each part holds the ranges it asks about, and no more
+        // ([`AskingMany`]). An asking of another thread that comes between
+        // the two parts is what the second part's own number is for.
+        ask_ahead_held(ranges, false);
+        spent.next("asking: the rest");
+        ask_rest(ranges, false);
+        spent.end();
+        return;
+    }
     // Both parts under one hold of everything: a second hold waited for the
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
@@ -1074,10 +1186,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
-    let _all = (!held).then(Asking::hold_all);
-    let mut ahead = {
+    let everything = hold_everything();
+    let _all = (!held && everything).then(Asking::hold_all);
+    // (Not holding everything, the first part's ranges stay standing
+    // meanwhile: the refreshes of other threads go on answering from the
+    // journal instead of asking the kernel about them again.)
+    let mut ahead = if held || everything {
         let mut j = journal_mut();
         j.ahead.take()
+    } else {
+        journal().ahead.ranges.clone()
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
@@ -1101,6 +1219,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
     }
     let mut ahead = held_ahead.take();
+    // Held until the answers are noted below.
+    let _alone = (!held && !everything).then(|| AskingMany::hold(alone_ranges.clone()));
     let answers = spread_each(alone_ranges.len(), |r| {
         let (first, last) = alone_ranges[r];
         #[cfg(feature = "diagnostics")]
@@ -4534,6 +4654,57 @@ mod tests {
     /// thread can guard it in between. Told, it is the title's to write: a
     /// block left read-only and forgotten would be an access violation in
     /// title code.
+    #[test]
+    fn ranges_held_together_are_joined() {
+        let mut ranges = vec![(20, 25), (10, 15), (14, 18), (18, 20), (30, 35)];
+        coalesce(&mut ranges);
+        assert_eq!(ranges, [(10, 25), (30, 35)]);
+        let mut none: Vec<(usize, usize)> = Vec::new();
+        coalesce(&mut none);
+        assert!(none.is_empty());
+    }
+
+    /// (After VIctory-DXR 965e0927's `asking_many_does_not_block_disjoint_ranges`.)
+    #[test]
+    fn many_ranges_held_leave_the_others_free() {
+        // Page numbers no memory has: only the holds are tried.
+        const AT: usize = usize::MAX / PAGE - 4096;
+        let hold = || AskingMany::hold(vec![(AT + 100, AT + 120), (AT + 200, AT + 220), (AT + 110, AT + 130), (AT + 7, AT + 7)]);
+        let held = hold();
+        assert_eq!(held.0, [(AT + 100, AT + 130), (AT + 200, AT + 220)]);
+        // Between the two, and beside them: at once.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _between = Asking::hold(AT + 130, AT + 200);
+            let _beside = AskingMany::hold(vec![(AT + 300, AT + 310), (AT + 50, AT + 100)]);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("ranges not held are free");
+        t.join().unwrap();
+        drop(held);
+        // One that overlaps waits until it is let go, whichever way it asks,
+        // and holds nothing while it waits.
+        for many in [false, true] {
+            let held = hold();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t = std::thread::spawn(move || {
+                if many {
+                    let _h = AskingMany::hold(vec![(AT + 400, AT + 410), (AT + 219, AT + 230)]);
+                    tx.send(()).unwrap();
+                } else {
+                    let _h = Asking::hold(AT + 129, AT + 131);
+                    tx.send(()).unwrap();
+                }
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "an overlapping range was held twice");
+            drop(Asking::hold(AT + 400, AT + 410));
+            drop(held);
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("let go, the waiting one holds");
+            t.join().unwrap();
+        }
+        assert!(!ASKING.0.lock().unwrap().iter().any(|r| r.0 >= AT));
+    }
+
     #[test]
     fn a_block_guarded_before_we_were_told_of_its_view_can_be_written() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
