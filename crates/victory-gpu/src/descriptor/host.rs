@@ -2017,7 +2017,17 @@ impl HostHeap {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                // The longest run of free slots, how many are free in all
+                // and how many there are: none left, or none long enough.
+                let (mut largest_free, mut run) = (0usize, 0usize);
+                for &t in taken.iter().take(end) {
+                    run = if t { 0 } else { run + 1 };
+                    largest_free = largest_free.max(run);
+                }
+                let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(n, largest_free, free, capacity = self.dynamic, "no free dynamic descriptor slots: a table is not made");
+            });
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -2686,11 +2696,17 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// [`HostHeap::texture_slot_tabled`] of a slot a draw read: whether
+    /// this is the first such read of the slot in the frame.
+    pub(crate) fn texture_slot_tabled_first(&self, index: u32) -> bool {
+        self.tabled_in(index, true, crate::frame::current())
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
-    fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+    fn tabled_in(&self, index: u32, read: bool, frame: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
-            return;
+            return false;
         };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         let old = stamp.load(Relaxed);
@@ -2698,10 +2714,11 @@ impl HostHeap {
             if old & !TABLED_READ != now {
                 stamp.store(now, Relaxed);
             }
-            return;
+            return false;
         }
         // Once per slot and frame: tables are read by every draw.
-        if old != now | TABLED_READ {
+        let first = old != now | TABLED_READ;
+        if first {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() && self.queued.may(index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -2710,6 +2727,7 @@ impl HostHeap {
                 }
             }
         }
+        first
     }
 
     /// Whether title slot `index` was a table's within the last

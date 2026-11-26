@@ -1622,13 +1622,14 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let extents = self.table_extents(p, compute);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &extents);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3394,6 +3395,76 @@ impl State {
         }
     }
 
+    /// Whether a stage's table is made afresh for the draw: it holds a
+    /// constant buffer, or reaches past the host heap's slots.
+    fn group_fresh(&self, group: &TableGroup, compute: bool) -> bool {
+        group.has_cbv
+            || match self.roots_ref(compute).get(usize::from(group.slot)) {
+                Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
+                    heap.host()
+                        .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
+                }),
+                _ => false,
+            }
+    }
+
+    /// The slots a stage picks from its table by an index in its
+    /// constants, in order, and how many slots the stage reads of the
+    /// table from its first on.
+    fn group_count(&self, group: &TableGroup, compute: bool) -> (Vec<u32>, u32) {
+        let mut selected: Vec<u32> = group
+            .indexed
+            .iter()
+            .map(|index| {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            })
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+        (selected, n)
+    }
+
+    /// Per root table that more than one stage of `p` reads and has made
+    /// afresh ([`State::tables`]): the slots the stage that reads furthest
+    /// into it reads. Every stage then asks for that many, so the second
+    /// finds the table the first made (same table, count and contents) and
+    /// takes no dynamic slots and makes no views of its own. A vertex
+    /// shader that reads 6 slots of a table and a pixel shader that reads
+    /// 128 of the same one took 134 slots and made the first 6 views
+    /// twice; they take 128. (After fxceless 5d659e0c,
+    /// `VICTORY_TABLE_STAGES`, and Xyzstk's `table_extents` in cool_fox
+    /// 8eb4f320, PR #30, where draws were no longer dropped for want of
+    /// slots.) On by default; `VICTORY_TABLE_STAGES=0`: every stage its
+    /// own count, as before.
+    fn table_extents(&self, p: &HostPipeline, compute: bool) -> Few<(u8, u32), 16> {
+        let mut all = Few::default();
+        if p.stages.len() < 2 || !crate::toggled!("VICTORY_TABLE_STAGES") {
+            return all;
+        }
+        for slot in shared_slots(p.stages.iter().map(|stage| stage.translated().tables.groups.iter().map(|g| g.slot))).iter() {
+            let mut most = 0;
+            for stage in &p.stages {
+                for g in stage.translated().tables.groups.iter().filter(|g| g.slot == *slot) {
+                    if self.group_fresh(g, compute) {
+                        most = most.max(self.group_count(g, compute).1);
+                    }
+                }
+            }
+            if most != 0 {
+                all.push((*slot, most));
+            }
+        }
+        all
+    }
+
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
@@ -3410,20 +3481,13 @@ impl State {
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        extents: &[(u8, u32)],
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
-            let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
-            if needs_snapshot {
+            if self.group_fresh(group, compute) {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
@@ -3452,23 +3516,15 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let (selected, own) = self.group_count(group, compute);
+            // As many slots as the stage of this draw that reads furthest
+            // into the table ([`State::table_extents`]), if they are there.
+            let n = shared_count(own, extents.iter().find(|e| e.0 == slot).map(|e| e.1), |most| {
+                table
+                    .checked_add(u64::from(most - 1) * 32)
+                    .and_then(|handle| heap.index(handle))
+                    .is_some()
+            });
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3503,12 +3559,24 @@ impl State {
                     made.push((slot, first * 32));
                     continue;
                 }
+                // Made by another stage, for this one too: the title's
+                // slots of the textures this one reads are a table's that
+                // a draw read, as if this stage had made the table.
+                let title_first = (known.shared && known.maker != std::ptr::from_ref(plan) as usize)
+                    .then(|| heap.index(table).filter(|first| first + n <= host.count()))
+                    .flatten();
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = title_first
+                            && crate::descriptor::host::is_texture_view(&view)
+                            && host.texture_slot_tabled_first(title + u.table_offset_dwords / 8)
+                        {
+                            host.mirror_after(list, title + u.table_offset_dwords / 8, handle);
+                        }
                     }
                 }
                 for k in selected {
@@ -3545,7 +3613,8 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            let maker = std::ptr::from_ref(plan) as usize;
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), maker, shared: n > own });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4422,9 +4491,74 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
+/// The root tables more than one of a draw's stages reads: `stages`, per
+/// stage, the root parameters of its tables.
+fn shared_slots<S: Iterator<Item = u8>>(stages: impl Iterator<Item = S>) -> Few<u8, 16> {
+    let mut seen = Few::<u8, 16>::default();
+    let mut shared = Few::<u8, 16>::default();
+    for stage in stages {
+        let before = seen.len();
+        for slot in stage {
+            if seen[..before].contains(&slot) {
+                if !shared.contains(&slot) {
+                    shared.push(slot);
+                }
+            } else if !seen[before..].contains(&slot) {
+                seen.push(slot);
+            }
+        }
+    }
+    shared
+}
+
+/// How many slots a stage that reads `own` of a table asks for, when the
+/// stage of the draw that reads furthest into it reads `most`: `most`, if
+/// that many dynamic slots can be had at once and the title's heap has
+/// them from the table's first on (`there`); its own count otherwise.
+fn shared_count(own: u32, most: Option<u32>, there: impl Fn(u32) -> bool) -> u32 {
+    match most {
+        Some(most) if most > own && most <= crate::descriptor::host::DYNAMIC && there(most) => most,
+        _ => own,
+    }
+}
+
+#[cfg(test)]
+mod table_stage_tests {
+    use super::*;
+
+    #[test]
+    fn stages_that_read_one_table_ask_for_the_longest_count() {
+        // A vertex shader reads 6 slots, a pixel shader 128: one
+        // allocation of 128, which the second stage finds by its key.
+        assert_eq!(shared_count(6, Some(128), |_| true), 128);
+        assert_eq!(shared_count(128, Some(128), |_| true), 128);
+        // No other stage reads the table, or reads less of it.
+        assert_eq!(shared_count(6, None, |_| true), 6);
+        assert_eq!(shared_count(6, Some(4), |_| true), 6);
+        // The title's heap ends before the longer count, or the count is
+        // more than the dynamic slots: each stage its own, as before.
+        assert_eq!(shared_count(6, Some(128), |n| n <= 100), 6);
+        assert_eq!(shared_count(6, Some(crate::descriptor::host::DYNAMIC + 1), |_| true), 6);
+    }
+
+    #[test]
+    fn only_tables_two_stages_read_are_shared() {
+        let stages: [&[u8]; 3] = [&[0, 2, 2], &[2, 5], &[5, 7, 0]];
+        let shared = shared_slots(stages.iter().map(|s| s.iter().copied()));
+        assert_eq!(&*shared, &[2, 5, 0]);
+        let alone: [&[u8]; 1] = [&[1, 1, 3]];
+        assert!(shared_slots(alone.iter().map(|s| s.iter().copied())).is_empty());
+    }
+}
+
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
+    /// The stage's list of what it reads that the table was made for, and
+    /// whether it was made longer than that stage reads, for another
+    /// stage of the draw ([`State::table_extents`]).
+    maker: usize,
+    shared: bool,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
