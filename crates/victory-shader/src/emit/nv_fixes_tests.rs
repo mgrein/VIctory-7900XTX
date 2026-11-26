@@ -225,3 +225,132 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         eprintln!("ran on the hardware device: wave64={wave64}, {threads} threads");
     }
 }
+
+/// The wave64 half-wave base (`lane_index & !31`) appears only in a wave64 program's
+/// `ds_bpermute_b32` (upstream 0665a0e8, QB): without reading v0 nothing else asks the lane
+/// index. On a 32-lane host the wave64 program now runs in waves of 32 (it used to need
+/// 64-lane waves, or an exchange that refused the permute).
+#[test]
+fn ds_bpermute_wave64_preserves_32_lane_half() {
+    let words = [
+        0x7E02_02FF,
+        0x0000_0104, // v_mov_b32 v1, 0x104
+        0x7E04_0285, // v_mov_b32 v2, 5
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+        0x7E00_0503, // v_readfirstlane_b32 s0, v3
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for wave64 in [false, true] {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [if wave64 { 64 } else { 32 }, 1, 1],
+            }),
+            code: code.clone(),
+        };
+        let (_, l) = lowered(&native, 64).unwrap_or_else(|e| panic!("wave64={wave64}: {e:?}"));
+        assert!(l.wave_ops);
+        assert_eq!(l.uses_lane_index, wave64, "wave64={wave64}");
+        assert_eq!(l.has_half_wave_mask, wave64, "wave64={wave64}");
+        let (_, l) = lowered(&native, 32).unwrap_or_else(|e| panic!("wave64={wave64} on 32 lanes: {e:?}"));
+        assert_eq!(l.wave_size, Some(32), "wave64={wave64} on 32 lanes");
+    }
+}
+
+/// Lowers `body` (each lane's result left in v3) as one group of one console wave, runs it on
+/// the hardware device and compares v3 of every lane with `want`.
+fn run_permute(wave64: bool, body: &[u32], want: &[u32]) {
+    let wave = if wave64 { 64 } else { 32 };
+    assert_eq!(want.len(), wave as usize);
+    let mut words = body.to_vec();
+    words.push(0x3420_0082); // v_lshlrev_b32 v16, 2, v0
+    words.extend(store(3, 0));
+    let native = native(&words, wave64, wave, 0);
+    lowered(&native, 64).unwrap_or_else(|e| panic!("wave64={wave64} on 64 lanes: {e:?}"));
+    let (shader, l) = lowered(&native, 32).unwrap_or_else(|e| panic!("wave64={wave64}: {e:?}"));
+    assert_eq!(l.wave_size, Some(32));
+    if let Some(out) = run(&shader, [0; 4], wave) {
+        assert_eq!(out, want, "wave64={wave64}");
+        eprintln!("ran on the hardware device: wave64={wave64}");
+    }
+}
+
+/// High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so only bits 6:2 select
+/// the source lane. Lanes 16..31 skip the permute via `s_cbranch_execz`, so reads from them give
+/// 0 while they keep v3.
+#[test]
+fn permutes_mask_high_address_bits_and_divergent_branches() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+        0x4A06_00FF,
+        0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+    ];
+    let want: Vec<u32> = (0..32)
+        .map(|l| if l < 8 { 0x3000 + l + 8 } else if l < 16 { 0 } else { 0xBEEF_0000 + l })
+        .collect();
+    run_permute(false, &body, &want);
+}
+
+/// RDNA 2 ISA 10.4.4: wave64 permutes lanes 0..31 and 32..63 independently. v1 = ((lane & 31)
+/// << 2) + 0x103 with offset:12 wraps within each half (29..31 -> 0..2, 61..63 -> 32..34; lane
+/// 32 pulls from lane 35, not lane 3).
+#[test]
+fn wave64_permutes_stay_within_each_32_lane_half() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+        0x3602_009F, // v_and_b32 v1, 31, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    ];
+    let want: Vec<u32> = (0..64).map(|l| 0x4000 + ((l & !31) | ((l + 3) & 31))).collect();
+    run_permute(true, &body, &want);
+}
+
+/// Active lanes 0..39 of a wave64: lanes 32..39 pull from upper-half lanes 40..47 (inactive:
+/// 0) though lower-half lanes 8..15 are active; inactive lanes 40..63 keep 0xcafe0000 + lane.
+#[test]
+fn wave64_permutes_check_exec_within_each_half() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+        0x4A06_00FF,
+        0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3602_029F, // v_and_b32 v1, 31, v1
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ];
+    let want: Vec<u32> = (0..64)
+        .map(|l| if l < 32 { 0x5000 + ((l + 8) & 31) } else if l < 40 { 0 } else { 0xCAFE_0000 + l })
+        .collect();
+    run_permute(true, &body, &want);
+}

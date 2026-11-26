@@ -65,6 +65,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the module declares `dx.op.waveGetLaneIndex`.
+    #[cfg(test)]
+    pub uses_lane_index: bool,
+    /// Whether the module holds the 32-lane half mask (`!31`).
+    #[cfg(test)]
+    pub has_half_wave_mask: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1442,8 +1448,9 @@ impl<'a> Lower<'a> {
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
-            // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
+            // console wave (lanes 32k..32k+31). (`ds_bpermute_b32` stays in its half too.) Not
+            // when it crosses halves (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_permute`
+            // (forward), masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
@@ -1452,7 +1459,6 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1512,8 +1518,8 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
-                            "ds_(b)permute"
+                        } else if n.starts_with("ds_permute") {
+                            "ds_permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
                         } else {
@@ -2454,6 +2460,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
+            #[cfg(test)]
+            has_half_wave_mask: self.s.m.has_i32_const(!31),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4890,7 +4900,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    /// LDS (thread-group shared memory) and `ds_swizzle`.
+    /// LDS (thread-group shared memory), `ds_swizzle` and `ds_bpermute`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
             dst,
@@ -4966,7 +4976,10 @@ impl<'a> Lower<'a> {
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
             // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
+            // within its own 32-lane half (RDNA 2 ISA 10.4.4: wave64 permutes
+            // lanes 0..31 and 32..63 independently; upstream 0665a0e8, QB); a
+            // source lane outside EXEC gives 0. On a 32-lane host each host wave
+            // is one half of the console's, so the permute never leaves it. (
             // the title's checkerboard shadow-mask generators read their
             // neighbours' samples with it; without them every shadowed light
             // was multiplied by an empty mask.)
@@ -4974,19 +4987,23 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let k31 = self.s.m.i32(31);
+            let within_half = self.s.m.bin(c, Bin::And, src, k31);
+            let src = if self.x.native.wave64 {
+                // the half this lane is in (0 on a 32-lane host, whose lane index is below 32)
+                let me = self.lane_index();
+                let not31 = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, not31);
+                self.s.m.bin(c, Bin::Or, base, within_half)
+            } else {
+                within_half
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
