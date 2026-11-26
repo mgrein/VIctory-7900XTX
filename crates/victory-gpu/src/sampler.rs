@@ -27,7 +27,11 @@ struct Fields {
 }
 
 impl Fields {
-    fn host(&self) -> D3D12_SAMPLER_DESC {
+    /// `aniso_point_mip`: the host has anisotropic filtering with point
+    /// mips (`D3D12_OPTIONS19`), which is what an anisotropic sampler
+    /// without a linear mip filter is; without it such a sampler filters
+    /// its mips linearly, as all of them did.
+    fn host(&self, aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
         let aniso = self.mag >= 2 || self.min >= 2;
         // The console compares when the instruction says so, with the
@@ -43,7 +47,8 @@ impl Fields {
             _ => u32::from(compares),
         };
         let filter = if aniso {
-            0x55
+            // (D3D12_FILTER_ANISOTROPIC, or _MIN_MAG_ANISOTROPIC_MIP_POINT.)
+            if aniso_point_mip && self.mip != 2 { 0x54 } else { 0x55 }
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
@@ -103,7 +108,17 @@ fn finite_lod(value: f32, fallback: f32) -> f32 {
 /// minification, mip and depth filters, filter mode, three address modes,
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
 /// and threshold, comparison, border color, then tuning words.
+#[cfg(test)]
 pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+    console_for(words, false)
+}
+
+/// [`console`] for a host that has anisotropic filtering with point mips
+/// or has not (`aniso_point_mip`): the samplers in shader code are made
+/// with it where the host has it (`pipeline/host.rs`), and a sampler of
+/// the title's heaps of the same description filtered its mips linearly
+/// all the same. (After maren-halv/VIctory-DXR 443fd629.)
+pub(crate) fn console_for(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
     let f = |i: usize| f32::from_bits(words[i]);
     Fields {
         mag: words[1],
@@ -118,7 +133,7 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
+    .host(aniso_point_mip)
 }
 
 #[cfg(test)]
@@ -143,6 +158,26 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    /// An anisotropic sampler keeps point mips where the host has that
+    /// filter, and only a sampler without a linear mip filter does.
+    #[test]
+    fn anisotropic_samplers_keep_point_mips_where_the_host_can() {
+        let mut w = [0u32; 27];
+        (w[1], w[2], w[13]) = (3, 3, 8);
+        for (mip, with, without) in [(0, 0x54, 0x55), (1, 0x54, 0x55), (2, 0x55, 0x55)] {
+            w[3] = mip;
+            assert_eq!(console_for(&w, true).Filter.0, with, "mip {mip}");
+            assert_eq!(console_for(&w, false).Filter.0, without, "mip {mip}");
+            assert_eq!(console_for(&w, true).MaxAnisotropy, 8);
+        }
+        // A comparison sampler keeps its reduction bits.
+        (w[3], w[16]) = (1, 4);
+        assert_eq!(console_for(&w, true).Filter.0, 0xd4);
+        // Not an anisotropic one: as it was.
+        (w[1], w[2], w[16]) = (1, 1, 0);
+        assert_eq!(console_for(&w, true).Filter.0, console_for(&w, false).Filter.0);
     }
 
     #[test]

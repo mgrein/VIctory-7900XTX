@@ -2168,6 +2168,32 @@ impl HostHeap {
     }
 }
 
+/// Whether the title's heap samplers that filter anisotropically without a
+/// linear mip filter are made with point mips: the host has that filter
+/// (`D3D12_OPTIONS19`, asked once; an older runtime does not know the
+/// question, which means no), and `VICTORY_HEAP_ANISO_POINT` is not 0 (as
+/// before: linear mips).
+fn aniso_point_mip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_HEAP_ANISO_POINT").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -5043,7 +5069,7 @@ fn make_twinned(
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console_for(words, aniso_point_mip());
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
