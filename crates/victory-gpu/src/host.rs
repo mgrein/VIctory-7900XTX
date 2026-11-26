@@ -1591,6 +1591,62 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the preludes of host lists that go wait for the lists that need
+/// one next (on by default; `VICTORY_PRELUDE_POOL=0`: each list makes its
+/// own when it first needs one, on the submitting thread, and it goes with
+/// the list, as before). A prelude was made under `Host::submit` for most
+/// lists made (78,226 for 105,508 in run x14, 5 % of the submitting thread
+/// in profile x28).
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most preludes kept for lists that need one ([`prelude_pool`]): each
+/// is an allocator and a closed list that records barriers and copies of
+/// twins, a small recording.
+const SPARE_PRELUDES_MOST: usize = 128;
+
+/// Preludes kept for the lists that need one next ([`prelude_pool`]).
+struct SparePreludes(Vec<Prelude>);
+
+// SAFETY: D3D12 objects are free-threaded; a kept prelude is closed and has
+// run, and nobody touches it until it is taken out again.
+unsafe impl Send for SparePreludes {}
+
+static SPARE_PRELUDES: Mutex<SparePreludes> = Mutex::new(SparePreludes(Vec::new()));
+
+/// A kept prelude ([`prelude_pool`]), if there is one.
+fn spare_prelude() -> Option<Prelude> {
+    if !prelude_pool() {
+        return None;
+    }
+    let taken = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.pop();
+    #[cfg(feature = "diagnostics")]
+    if taken.is_some() {
+        crate::copystat::add(crate::copystat::C::PreludesPooled, 1);
+    }
+    taken
+}
+
+/// Keeps `prelude` (closed, and run if it ever ran) for the next list that
+/// needs one, past [`SPARE_PRELUDES_MOST`] retired instead.
+fn give_prelude(prelude: Prelude) {
+    let mut spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+    if spare.0.len() < SPARE_PRELUDES_MOST {
+        spare.0.push(prelude);
+    } else {
+        drop(spare);
+        retire(prelude);
+    }
+}
+
+/// How many preludes are kept ([`prelude_pool`]).
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn spare_preludes() -> usize {
+    SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -7280,7 +7336,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| spare_prelude().or_else(|| host().and_then(|h| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -7618,6 +7674,7 @@ impl HostList {
     /// starts in (common: the list moves them back before it closes), and
     /// the budget's words are zeroed.
     pub(crate) fn give_back_buffers(&mut self) {
+        self.give_back_prelude();
         if !list_buffers_pooled() {
             return;
         }
@@ -7646,6 +7703,18 @@ impl HostList {
             }
             Some(())
         });
+    }
+
+    /// The list has run and goes: its prelude, if it had one, waits for
+    /// the next list that needs one ([`spare_prelude`]). It ran before the
+    /// list in the same submission, so it has run too.
+    fn give_back_prelude(&mut self) {
+        if !prelude_pool() {
+            return;
+        }
+        if let Some(Some(prelude)) = self.prelude.take() {
+            give_prelude(prelude);
+        }
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -10573,6 +10642,10 @@ fn list_buffers<R>(f: impl FnOnce(&mut ListBuffers) -> Option<R>) -> Option<R> {
 
 /// Under memory pressure: the buffers kept for lists go (retired).
 pub(crate) fn list_buffers_let_go() {
+    let preludes = std::mem::take(&mut SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0);
+    if !preludes.is_empty() {
+        retire(SparePreludes(preludes));
+    }
     let kept = {
         let mut b = LIST_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut kept: Vec<ID3D12Resource> = b.budgets.drain(..).map(|(buffer, _)| buffer).collect();
@@ -10667,6 +10740,30 @@ mod list_buffer_tests {
         list.reset();
         list.close();
         host.execute(&[&list]);
+    }
+
+    /// The prelude of a list that goes is kept and the next list that
+    /// needs one takes it.
+    #[test]
+    fn a_list_that_goes_leaves_its_prelude_to_the_next() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if !prelude_pool() {
+            return;
+        }
+        let mut list = host.new_list().expect("a host list");
+        let prelude = host.make_prelude().expect("a prelude");
+        let raw = prelude.1.as_raw();
+        let _ = list.prelude.set(Some(prelude));
+        list.close();
+        list.give_back_buffers();
+        assert!(list.prelude.get().is_none(), "given, not kept");
+        let kept = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.iter().any(|p| p.1.as_raw() == raw);
+        assert!(kept, "the prelude waits for the next list");
+        assert!(spare_preludes() > 0);
+        // (Other tests may take it meanwhile: any kept prelude will do.)
+        assert!(spare_prelude().is_some() || spare_preludes() == 0);
     }
 }
 

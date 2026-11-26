@@ -413,6 +413,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 #[cfg(windows)]
 static LISTS_FAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Host lists waiting in the pool, for the memory line.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pooled() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
 /// [`LISTS_FAT`], for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn lists_fat() -> u64 {
