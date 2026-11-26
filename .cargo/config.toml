@@ -1,2 +1,12 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# x86-64-v3 (AVX2, BMI2, FMA, LZCNT, MOVBE): the README already asks for a CPU
+# with AVX2, and the compares, copies and hashes the layer does by the
+# gigabyte vectorise wider with it. The `is_x86_feature_detected!` branches stay
+# as they are. Nothing of the shader cache key changes: it is the translator's
+# own source (crates/victory-shader/build.rs) and the translator's switches,
+# not how the executable was compiled. A RUSTFLAGS in the environment replaces
+# this.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

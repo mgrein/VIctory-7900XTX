@@ -53,6 +53,12 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 
+The faster build to play with is the plain release one, without the
+diagnostics feature: `cargo build --locked --release -p victory`, then
+`scripts\play.ps1 -Build release -Exe ...`. Both builds use thin LTO, one
+codegen unit and `target-cpu=x86-64-v3` (`Cargo.toml`, `.cargo/config.toml`),
+so a build takes longer than it did.
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
