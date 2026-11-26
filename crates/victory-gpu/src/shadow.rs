@@ -1129,16 +1129,93 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
+///
+/// A stretch the card did not change is only read: no byte of `held` or of
+/// `title` is stored where it would keep its value, so that pages of the
+/// copy's reference nothing changed are not written (dirtied) by every
+/// merge. 32 bytes at a time with AVX2 where the processor has it, else 8
+/// (after Belobug PR #123, altuux).
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let n = now.len().min(held.len()).min(title.len());
+    let (now, held, title) = (&now[..n], &mut held[..n], &mut title[..n]);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2; the three slices are `n` long.
+        return unsafe { merge_piece_avx2(now, held, title) };
     }
-    differs != 0
+    merge_piece_words(now, held, title)
+}
+
+/// [`merge_piece`], 8 bytes at a time.
+fn merge_piece_words(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let mut differs = false;
+    let words = now.len() / 8 * 8;
+    for at in (0..words).step_by(8) {
+        let word = |s: &[u8]| u64::from_ne_bytes(s[at..at + 8].try_into().unwrap());
+        let (n, h) = (word(now), word(held));
+        if n == h {
+            continue;
+        }
+        // 0xff in every byte the card changed.
+        let x = n ^ h;
+        let wrote = ((((x & LOW) + LOW) | x) & !LOW) >> 7;
+        let wrote = wrote * 0xff;
+        let t = word(title);
+        let merged = (t & !wrote) | (n & wrote);
+        if merged != t {
+            differs = true;
+            title[at..at + 8].copy_from_slice(&merged.to_ne_bytes());
+        }
+        // Every byte of `held` the card did not change equals `now`'s.
+        held[at..at + 8].copy_from_slice(&n.to_ne_bytes());
+    }
+    differs | merge_piece_bytes(&now[words..], &mut held[words..], &mut title[words..])
+}
+
+/// [`merge_piece`], a byte at a time (the end of a stretch).
+fn merge_piece_bytes(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let mut differs = false;
+    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        if *n != *h {
+            differs |= *t != *n;
+            *t = *n;
+            *h = *n;
+        }
+    }
+    differs
+}
+
+/// [`merge_piece`], 32 bytes at a time.
+///
+/// # Safety
+/// The processor has AVX2, and the three slices are of one length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+    let mut differs = false;
+    let wide = now.len() / 32 * 32;
+    for at in (0..wide).step_by(32) {
+        // SAFETY: `at + 32 <= len` of each; unaligned loads and stores.
+        unsafe {
+            let n = _mm256_loadu_si256(now.as_ptr().add(at).cast());
+            let h = _mm256_loadu_si256(held.as_ptr().add(at).cast());
+            let same = _mm256_cmpeq_epi8(n, h);
+            if _mm256_movemask_epi8(same) == -1 {
+                continue;
+            }
+            let t = _mm256_loadu_si256(title.as_ptr().add(at).cast());
+            // The title's byte where the card changed nothing, else the card's.
+            let merged = _mm256_blendv_epi8(n, t, same);
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, t)) != -1 {
+                differs = true;
+                _mm256_storeu_si256(title.as_mut_ptr().add(at).cast(), merged);
+            }
+            _mm256_storeu_si256(held.as_mut_ptr().add(at).cast(), n);
+        }
+    }
+    differs | merge_piece_words(&now[wide..], &mut held[wide..], &mut title[wide..])
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1162,6 +1239,67 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+#[cfg(test)]
+mod merge_piece_tests {
+    use super::{merge_piece, merge_piece_bytes, merge_piece_words};
+
+    /// The merge as it was written first: every byte stored.
+    fn plain(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+        let mut differs = 0u8;
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+        }
+        differs != 0
+    }
+
+    /// Random stretches of every length and start up to 200 bytes, sparse
+    /// and dense changes: the wide merges give the bytes and the answer of
+    /// the plain one.
+    #[test]
+    fn the_wide_merges_are_the_plain_one_bit_for_bit() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..4000usize {
+            let len = round % 201;
+            let start = round % 7;
+            let dense = round % 3;
+            let mut now = vec![0u8; start + len];
+            let mut held = vec![0u8; start + len];
+            let mut title = vec![0u8; start + len];
+            for i in 0..start + len {
+                held[i] = next() as u8;
+                let r = next();
+                // The card changes one byte in 40, one in 3, or none.
+                now[i] = match dense {
+                    0 if r % 40 == 0 => (r >> 8) as u8,
+                    1 if r % 3 == 0 => (r >> 8) as u8,
+                    _ => held[i],
+                };
+                let r = next();
+                title[i] = if r % 5 == 0 { (r >> 8) as u8 } else { held[i] };
+            }
+            let (mut h0, mut t0) = (held.clone(), title.clone());
+            let want = plain(&now[start..], &mut h0[start..], &mut t0[start..]);
+            type Merge = fn(&[u8], &mut [u8], &mut [u8]) -> bool;
+            for merge in [merge_piece as Merge, merge_piece_words, merge_piece_bytes] {
+                let (mut h, mut t) = (held.clone(), title.clone());
+                assert_eq!(merge(&now[start..], &mut h[start..], &mut t[start..]), want, "round {round}");
+                assert_eq!(h, h0, "held, round {round}");
+                assert_eq!(t, t0, "title, round {round}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5862,7 +6000,6 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // while it has room; past that the side shaders see is in the PC's
     // memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         let budget = host.video_memory().map(|[budget, ..]| budget);
