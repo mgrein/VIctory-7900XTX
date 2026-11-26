@@ -300,11 +300,26 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
-/// Ranges of one submission closer than this are asked about together:
-/// walking the pages between them costs less than another kernel call (a
-/// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// Ranges of one submission closer than this (pages) are asked about
+/// together: walking the pages between them costs less than another kernel
+/// call (`VICTORY_ASK_GAP=<KiB>`, 2,048 unless given; 8,192 as before).
+///
+/// What an asking costs is mostly the pages it walks, written or not:
+/// measured on the 4070's machine (Windows 11, 4 KiB pages), a call over
+/// clean write-watched memory took 1.2 microseconds for 1 MiB, 48 for 64
+/// MiB and 0.8 ms for 1 GiB, and with ten other threads of the process
+/// busy 3.6, 150 and 2,300; a thousand pages found written added some 20
+/// to 60. The submissions of a frame walked 8.6 GB in 16 ms (run x16-rt).
+/// Two calls instead of one across a gap cost one call more, a few
+/// microseconds; the 8 MiB gap walked cost 7 to 20.
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let kib = std::env::var("VICTORY_ASK_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048);
+        (kib << 10) / PAGE
+    })
+}
+
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -340,7 +355,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
-    let gap = AHEAD_GAP;
+    let gap = ahead_gap();
     let ends = known_ends();
     let mut runs = Vec::new();
     let mut i = 0;
