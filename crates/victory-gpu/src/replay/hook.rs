@@ -2,7 +2,7 @@
 //! is set to a copy of its table ([`Shim`]) with some entries changed. Other
 //! objects of the class keep theirs, so what is not asked for is untouched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,8 @@ pub(super) const SLOTS: usize = 512;
 const PRE: usize = 4;
 
 /// A copied method table. Objects point at `table`; what we keep for them
-/// lies before it. Never freed: an object may still use it while it dies.
+/// lies before it. Freed only through [`retire`], some time after its object
+/// died: an object may still use it while it dies.
 #[repr(C)]
 struct Shim {
     state: *const c_void,
@@ -25,8 +26,25 @@ struct Shim {
 
 const TO_ORIG: usize = std::mem::offset_of!(Shim, table) - std::mem::offset_of!(Shim, orig);
 
-/// The shims made, by the address objects point at.
-static MADE: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+/// The shims made: by the address objects point at, and by their object.
+struct Made {
+    tables: BTreeSet<usize>,
+    objects: BTreeMap<usize, Vec<usize>>,
+}
+
+static MADE: Mutex<Made> = Mutex::new(Made {
+    tables: BTreeSet::new(),
+    objects: BTreeMap::new(),
+});
+
+fn made() -> std::sync::MutexGuard<'static, Made> {
+    MADE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The shim whose table is at `table`.
+fn of_table(table: usize) -> *mut Shim {
+    (table - std::mem::offset_of!(Shim, table)) as *mut Shim
+}
 
 unsafe fn shim(this: *mut c_void) -> *const Shim {
     // SAFETY: the caller's object points into a shim.
@@ -46,7 +64,8 @@ pub(super) unsafe fn orig<T>(this: *mut c_void) -> &'static T {
     unsafe { &*(*shim(this)).orig.cast::<T>() }
 }
 
-/// What [`install`] was given for the object.
+/// What [`install`] was given for the object. It lives while the object's
+/// methods may be called: see [`install`].
 ///
 /// # Safety
 /// As [`orig`]; `T` is what `state` pointed at.
@@ -90,8 +109,9 @@ fn readable(at: usize, most: usize) -> usize {
 }
 
 /// Gives the object a table of its own, changed by `patch`. `state` is what
-/// [`state`] answers; it must live for good. False if the object has one
-/// already (then nothing changes).
+/// [`state`] answers; it must live as long as the object's table, which is
+/// for good unless [`retire`] is called for the object. False if the object
+/// has one already (then nothing changes).
 ///
 /// # Safety
 /// `this` is a live COM object no other thread uses yet; what `patch` puts
@@ -101,10 +121,10 @@ pub(super) unsafe fn install(
     state: *const c_void,
     patch: impl FnOnce(&mut [usize; SLOTS]),
 ) -> bool {
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = made();
     // SAFETY: a live COM object starts with its table's address.
     let at = unsafe { *this.cast::<usize>() };
-    if made.contains(&at) {
+    if made.tables.contains(&at) {
         return false;
     }
     let mut new = Box::new(Shim {
@@ -124,11 +144,52 @@ pub(super) unsafe fn install(
         };
     }
     patch(&mut new.table);
-    let new: &'static Shim = Box::leak(new);
-    made.insert(new.table.as_ptr() as usize);
+    let new = Box::into_raw(new);
+    // SAFETY: just made; freed only by `Shims`.
+    let table: *const usize = unsafe { (&raw const (*new).table).cast() };
+    made.tables.insert(table as usize);
+    made.objects
+        .entry(this as usize)
+        .or_default()
+        .push(table as usize);
     // SAFETY: the object's first word, its table's address.
-    unsafe { this.cast::<*const usize>().write(new.table.as_ptr()) };
+    unsafe { this.cast::<*const usize>().write(table) };
     true
+}
+
+/// Shims taken from their objects, freed when this is dropped.
+pub(super) struct Shims(Vec<usize>);
+
+#[cfg(test)]
+impl Shims {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Drop for Shims {
+    fn drop(&mut self) {
+        for &table in &self.0 {
+            // SAFETY: made by `install` as a box, taken out of `MADE` by
+            // `retire`, whose caller keeps it until nothing can use it.
+            drop(unsafe { Box::from_raw(of_table(table)) });
+        }
+    }
+}
+
+/// The shims made for an object that is dying: no longer ours. They are
+/// freed when what this returns is dropped, which must wait until no
+/// method of the object can still be running (some frames later).
+///
+/// # Safety
+/// The object at `this` is dying: no new calls of its methods are made.
+pub(super) unsafe fn retire(this: *mut c_void) -> Shims {
+    let mut made = made();
+    let tables = made.objects.remove(&(this as usize)).unwrap_or_default();
+    for table in &tables {
+        made.tables.remove(table);
+    }
+    Shims(tables)
 }
 
 /// The table the object points at.
@@ -147,12 +208,13 @@ pub(super) unsafe fn table(this: *mut c_void) -> usize {
 pub(super) unsafe fn ours(this: *mut c_void) -> bool {
     // SAFETY: the caller's.
     let at = unsafe { table(this) };
-    MADE.lock().unwrap_or_else(|e| e.into_inner()).contains(&at)
+    made().tables.contains(&at)
 }
 
 /// After a method that may have set the object's table pointer anew: it
-/// points at its shim (`before`, where it pointed) again. A table it did
-/// not have before gets a shim of its own.
+/// points at its shim (`before`, where it pointed) again, or at the one it
+/// has for the table it was given. A table it did not have before gets a
+/// shim of its own.
 ///
 /// # Safety
 /// As [`install`]; `before` is a shim's table.
@@ -167,13 +229,19 @@ pub(super) unsafe fn again(
         if now == before {
             return;
         }
-        let shim = (before as *const u8)
-            .sub(std::mem::offset_of!(Shim, table))
-            .cast::<Shim>();
+        let shim = of_table(before);
         if (*shim).orig as usize == now {
             this.cast::<usize>().write(before);
-        } else {
-            install(this, (*shim).state, patch);
+            return;
+        }
+        let had = made().objects.get(&(this as usize)).and_then(|all| {
+            all.iter()
+                .copied()
+                .find(|&t| (*of_table(t)).orig as usize == now)
+        });
+        match had {
+            Some(table) => this.cast::<usize>().write(table),
+            None => _ = install(this, (*shim).state, patch),
         }
     }
 }
@@ -184,11 +252,11 @@ pub(super) unsafe fn again(
 /// # Safety
 /// `this` is a live object, used by no other thread now.
 pub(super) unsafe fn remove(this: *mut c_void) {
-    let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let made = made();
     // SAFETY: as in `install`.
     unsafe {
         let at = *this.cast::<usize>();
-        if made.contains(&at) {
+        if made.tables.contains(&at) {
             let own = (*shim(this)).orig;
             this.cast::<*const usize>().write(own);
         }
@@ -344,6 +412,49 @@ mod tests {
             remove(this);
             assert!(std::ptr::eq(a.vtbl, &other));
             assert_eq!(call(&mut a, 0), 115);
+        }
+    }
+    #[test]
+    fn a_dying_object_gives_its_shims_back() {
+        static STATE: u64 = 7;
+        let first = Vtbl {
+            methods: [add as *const () as usize; 8],
+        };
+        let second = Vtbl {
+            methods: [add as *const () as usize; 8],
+        };
+        let mut a = Object {
+            vtbl: &first,
+            value: 1,
+        };
+        // SAFETY: the test's object; entries of `Add`'s type.
+        unsafe {
+            let this: *mut c_void = (&raw mut a).cast();
+            let patch = |t: &mut [usize; SLOTS]| t[0] = double as *const () as usize;
+            assert!(install(this, (&raw const STATE).cast(), patch));
+            let one = table(this);
+            // A method that switches between two tables: one shim for each,
+            // not one more each time.
+            a.vtbl = &second;
+            again(this, one, patch);
+            let two = table(this);
+            assert!(ours(this) && two != one);
+            for _ in 0..4 {
+                a.vtbl = &first;
+                again(this, two, patch);
+                assert_eq!(table(this), one);
+                a.vtbl = &second;
+                again(this, one, patch);
+                assert_eq!(table(this), two);
+            }
+            assert_eq!(call(&mut a, 0), 2 * 16 + 7);
+            let shims = retire(this);
+            assert_eq!(shims.len(), 2);
+            assert!(!ours(this), "no longer ours once retired");
+            assert_eq!(retire(this).len(), 0);
+            a.vtbl = &second;
+            drop(shims);
+            assert_eq!(call(&mut a, 0), 16);
         }
     }
 }

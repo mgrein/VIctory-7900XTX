@@ -113,7 +113,7 @@ fn stop(r: &Recorder, phase: &mut Phase, e: &(dyn std::error::Error + Send + Syn
     tracing::error!("frame recorder: the capture failed: {e}");
     let _ = std::fs::write(r.folder.join("failed.txt"), e.to_string());
     phase.stage = Stage::Done;
-    r.watching.store(false, Ordering::SeqCst);
+    r.stop_watching();
     r.arm(false);
     let held = std::mem::take(&mut *lock(&r.held));
     drop(held);
@@ -171,7 +171,7 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
             match done {
                 Ok(false) => {}
                 Ok(true) => {
-                    r.watching.store(false, Ordering::SeqCst);
+                    r.stop_watching();
                     r.arm(false);
                     if let Stage::Capturing(c) = std::mem::replace(&mut phase.stage, Stage::Done) {
                         finished = Some((c, std::mem::take(&mut *lock(&r.held))));
