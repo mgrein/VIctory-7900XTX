@@ -24,6 +24,12 @@ fn native(body: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativePro
         125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
     ];
     words.extend_from_slice(body);
+    native_raw(&words, wave64, threads, lds_bytes.div_ceil(512) << 15)
+}
+
+/// [`native`] without the descriptor's load, and with `rsrc2` bits besides the user SGPRs.
+fn native_raw(body: &[u32], wave64: bool, threads: u32, rsrc2: u32) -> NativeProgram {
+    let mut words = body.to_vec();
     words.push(S_ENDPGM);
     NativeProgram {
         stage: HwStage::Cs,
@@ -58,8 +64,8 @@ fn native(body: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativePro
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            // 5 user SGPRs (s0..s4), LDS in 512-byte granules
-            rsrc2: 5 << 1 | lds_bytes.div_ceil(512) << 15,
+            // 5 user SGPRs (s0..s4)
+            rsrc2: 5 << 1 | rsrc2,
             threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -483,4 +489,96 @@ fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
         let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
         assert_eq!(s.masks[&restored] == s.masks[&compare], intact, "high dword {high:#x}");
     }
+}
+
+/// The thread-group info SGPR (TG_SIZE_EN, after the user SGPRs: s5) holds the group's console
+/// waves in bits 0-5 and the wave's index among them in bits 6-11 (fxceless PR #799). With a
+/// `ds_swizzle_b32` a wave64 program runs relabelled in host waves of 32 (`wave_base`): the
+/// index is the relabelled console thread's wave.
+#[test]
+fn the_group_info_sgpr_counts_the_groups_console_waves_and_numbers_them() {
+    for (wave64, threads, swizzle) in
+        [(true, 128, false), (false, 96, false), (true, 64, false), (true, 128, true), (false, 64, true)]
+    {
+        let mut words = vec![
+            0xBE86_0305, // s_mov_b32 s6, s5 (the group info)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        ];
+        words.extend(store(1, 0));
+        if swizzle {
+            words.extend(ds(0x35, 0x1F | 1 << 10, 9, 0, 0)); // ds_swizzle_b32 v9, v0 (xor 1)
+            words.extend(store(9, 512));
+        }
+        let native = native_raw(&words, wave64, threads, 1 << 10);
+        let wave = if wave64 { 64 } else { 32 };
+        lowered(&native, 64).unwrap_or_else(|e| panic!("wave64={wave64} on 64 lanes: {e:?}"));
+        let (shader, l) = lowered(&native, 32).unwrap_or_else(|e| panic!("wave64={wave64}: {e:?}"));
+        if swizzle {
+            assert_eq!(l.wave_size, Some(32));
+        }
+        let Some(out) = run(&shader, [0; 4], 256) else { continue };
+        for t in 0..threads {
+            let want = (t / wave) << 6 | threads.div_ceil(wave);
+            assert_eq!(out[t as usize], want, "wave64={wave64}, {threads} threads, thread {t}");
+            if swizzle {
+                assert_eq!(out[128 + t as usize], t ^ 1, "swizzle, thread {t}");
+            }
+        }
+        eprintln!("ran on the hardware device: wave64={wave64}, {threads} threads, swizzle={swizzle}");
+    }
+}
+
+/// `s_pack_ll/lh/hh_b32_b16`: low or high halves of two dwords, the first's in bits 0-15
+/// (fxceless PR #799).
+#[test]
+fn scalar_packs_take_the_halves_they_name() {
+    let mut words = vec![
+        0x9906_0100, // s_pack_ll_b32_b16 s6, s0, s1
+        0x9987_0100, // s_pack_lh_b32_b16 s7, s0, s1
+        0x9A0C_0100, // s_pack_hh_b32_b16 s12, s0, s1
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0x7E06_020C, // v_mov_b32 v3, s12
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    ];
+    for (k, v) in [1u8, 2, 3].into_iter().enumerate() {
+        words.extend(store(v, 128 * k as u32));
+    }
+    let native = native(&words, false, 32, 0);
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    for n in ["s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+    let (shader, _) = lowered(&native, 32).expect("lower");
+    let (a, b) = (0x1234_5678u32, 0x9ABC_DEF0u32);
+    let Some(out) = run(&shader, [a, b, 0, 0], 96) else { return };
+    for t in 0..32 {
+        assert_eq!([out[t], out[32 + t], out[64 + t]], [0xDEF0_5678, 0x9ABC_5678, 0x9ABC_1234], "thread {t}");
+    }
+    eprintln!("ran on the hardware device: s_pack_ll/lh/hh");
+}
+
+/// `s_bfm_b32` with a literal width or offset is a constant source for descriptor words too
+/// (fxceless PR #799); width and offset take their low 5 bits.
+#[test]
+fn bit_masks_of_literal_operands_are_constant_sources() {
+    let words = [
+        0x9211_8CFF,
+        0x0000_000C, // s_bfm_b32 s17, 12, 12 (the width a literal)
+        0x9212_FF88,
+        0x0000_0028, // s_bfm_b32 s18, 8, 40 (the offset a literal: 40 & 31 = 8)
+        0x9213_8C8C, // s_bfm_b32 s19, 12, 12
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, false, 256).unwrap();
+    let insts = &p.blocks[0].insts;
+    assert_eq!(resource::constant_copy(&insts[0], 0), Some(0x00FF_F000));
+    assert_eq!(resource::constant_copy(&insts[1], 0), Some(0x0000_FF00));
+    assert_eq!(resource::constant_copy(&insts[2], 0), Some(0x00FF_F000));
 }

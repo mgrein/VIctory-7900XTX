@@ -2227,7 +2227,11 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        // as `wave_reduce`: each host wave on its own, or a group one host wave holds whole
+        // (32 threads or fewer, whose missing half writes no exchange dword), keeps its own sum
+        // (fxceless PR #799)
+        let own = self.local || self.exchange.as_ref().is_some_and(|e| e.1);
+        if self.exchange.is_some() && !own {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -2598,7 +2602,31 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            // The group's console waves in bits 0-5, this wave's index among
+            // them in bits 6-11, as Mesa reads `tg_size` (fxceless PR #799).
+            // The index is that of the console thread the program sees: with
+            // `halves` (a wave64 program in host waves of 32) the relabelled
+            // one, else the flat id, whose waves the relabelling keeps.
+            Input::GroupInfo => {
+                let StageIo::Cs(cs) = self.x.native.io else {
+                    return Val::Missing("the thread-group info SGPR");
+                };
+                let wave = self.wave();
+                let threads = cs.threads.iter().product::<u32>();
+                let (e, i32t) = (self.s.entry, self.s.t.i32);
+                let flat = if self.halves.is_some() {
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.console_thread()
+                } else {
+                    self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+                };
+                let w = self.s.m.i32(wave.trailing_zeros());
+                let index = self.s.m.bin(e, Bin::LShr, flat, w);
+                let six = self.s.m.i32(6);
+                let index = self.s.m.bin(e, Bin::Shl, index, six);
+                let count = self.s.m.i32(threads.div_ceil(wave) & 0x3F);
+                return Val::I32(self.s.m.bin(e, Bin::Or, index, count));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -5995,6 +6023,20 @@ impl<'a> Lower<'a> {
                     _ => Bin::AShr,
                 };
                 (self.s.m.bin(c, op, a, b), None)
+            }
+            // Low or high halves of two dwords packed, s0's in bits 0-15 (fxceless PR #799).
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let a = if name == "s_pack_hh_b32_b16" { self.s.m.bin(c, Bin::LShr, a, k16) } else { a };
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let high = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
