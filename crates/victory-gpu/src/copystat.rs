@@ -1022,7 +1022,7 @@ fn log_memory() {
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
          made by the host, {} preludes made for them, {} fat ones shrunk or retired, {} waiting in the pool and {} \
-         preludes kept for them, private bytes \
+         preludes kept for them, {} run again unreset and left out as empty, private bytes \
          grew {:.0} MB while lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
@@ -1037,6 +1037,7 @@ fn log_memory() {
         crate::list::lists_fat(),
         crate::list::pooled(),
         crate::host::spare_preludes(),
+        crate::host::stale_skips(),
         lists[2] as i64 as f64 / (1 << 20) as f64,
         mb(census[7]),
         mb(census[8]),

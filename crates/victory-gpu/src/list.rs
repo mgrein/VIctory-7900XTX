@@ -312,7 +312,10 @@ fn pools() -> bool {
 /// profile x28), and reset again by the title: now what it kept goes when
 /// it goes back (`HostList::let_go_recording`), it stays closed, and the
 /// title's reset is its one reset. A list cut at a wait, which records
-/// into it at once, resets it then.
+/// into it at once, resets it then. Until that reset the list still holds
+/// its old recording, whose memory serves other lists: a title list run
+/// again without a reset runs it as an empty list
+/// (`crate::host::HostList::stale`), as it ran the reset one before.
 #[cfg(windows)]
 fn pool_closed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -596,14 +599,20 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
+        // SAFETY: one of our lists, closed and submitted: nothing records
+        // into it until the title resets it.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        // Run again without a reset since a submission took its host list:
+        // the pooled one it holds instead has nothing to run (`stale`), and
+        // stays for the title's reset.
+        if list.host.as_ref().is_some_and(crate::host::HostList::stale) {
+            continue;
+        }
         // Closed: the title's next call on its list is a reset, which
         // wants it so.
         let Some(fresh) = fresh_list(false) else {
             continue;
         };
-        // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -667,12 +676,19 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
+        let list = this.cast_mut().cast::<List>();
+        // Run again without a reset since a submission took its host list:
+        // the pooled one it holds instead has nothing to run (`stale`), and
+        // stays for the title's reset.
+        // SAFETY: one of our lists, closed and submitted.
+        if unsafe { (*list).host.as_ref() }.is_some_and(crate::host::HostList::stale) {
+            continue;
+        }
         // Closed: the title's next call on its list is a reset, which
         // wants it so.
         let Some(fresh) = fresh_list(false) else {
             continue;
         };
-        let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {

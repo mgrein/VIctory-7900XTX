@@ -1565,6 +1565,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The list let go of what its recording uses but still holds the
+    /// recording ([`HostList::let_go_recording`]): its commands name
+    /// scratch memory, uploads and descriptor slots that serve other lists
+    /// now. Until its next reset it is run as an empty list ([`Host::submit`]
+    /// leaves it out), as the reset list that waited in the pool before was.
+    stale: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1667,6 +1673,26 @@ fn give_prelude(prelude: Prelude) {
 /// How many preludes are kept ([`prelude_pool`]).
 pub(crate) fn spare_preludes() -> usize {
     SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).0.len()
+}
+
+/// How many host lists submissions left out because they held a recording
+/// whose memory went ([`HostList::stale`]).
+static STALE_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A submission left out a stale host list ([`HostList::stale`]): counted,
+/// and said once.
+fn stale_skipped() {
+    if STALE_SKIPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::info!(
+            "a title list was run again without a reset: its host list, from the pool, holds a let-go recording and runs as an empty list (VICTORY_LIST_POOL_CLOSED)"
+        );
+    }
+}
+
+/// [`STALE_SKIPPED`], for the frame account.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stale_skips() -> u64 {
+    STALE_SKIPPED.load(Ordering::Relaxed)
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4634,6 +4660,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                stale: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6215,6 +6242,15 @@ impl Host {
         stage.next("submit: the lists' steps");
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
+            if list.stale() {
+                // A title list run again without a reset, its host list a
+                // pooled one whose recording names memory other lists use
+                // now ([`HostList::stale`]): nothing to run, as for the
+                // reset list it held before.
+                firsts.push(lists.len());
+                stale_skipped();
+                continue;
+            }
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -6317,8 +6353,12 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+                    // (A part of left-out lists only, [`HostList::stale`],
+                    // has nothing to send.)
+                    if to > from {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                    }
+                    from = from.max(to);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6376,7 +6416,10 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                // (Nothing to send if every list was left out, `HostList::stale`.)
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -6943,6 +6986,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.stale.store(false, Ordering::Release);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6958,6 +7002,9 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("letting go of a host list's recording");
         self.forget_recording();
+        // Its commands still name what was just let go: it must not run
+        // until it is reset ([`HostList::stale`]).
+        self.stale.store(true, Ordering::Release);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6989,7 +7036,17 @@ impl HostList {
         }
         retire(old);
         self.list.forget_most();
+        // Reset onto the new allocator and closed: it records nothing.
+        self.stale.store(false, Ordering::Release);
         true
+    }
+
+    /// Whether the list holds a recording whose memory it let go of
+    /// ([`HostList::let_go_recording`]) and has not been reset since: a
+    /// pooled list left in a title's list that the title runs again
+    /// without resetting it. Such a list runs as an empty one.
+    pub(crate) fn stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
     }
 
     /// The bookkeeping of [`HostList::reset`] and [`HostList::let_go_recording`].
@@ -10729,15 +10786,42 @@ mod list_buffer_tests {
         };
         let list = host.new_list().expect("a host list");
         list.close();
+        assert!(!list.stale());
         host.execute(&[&list]);
         list.let_go_recording();
+        assert!(list.stale(), "its recording's memory went");
         // Closed: a second close would fail, a reset succeeds.
         list.reset();
+        assert!(!list.stale(), "reset: nothing recorded");
         list.close();
         host.execute(&[&list]);
         list.let_go_recording();
         list.reset();
         list.close();
+    }
+
+    /// A list that let go of its recording and is run again without a
+    /// reset (a title list submitted twice) is left out of the submission:
+    /// the lists with it run, and so does it once it is reset.
+    #[test]
+    fn a_stale_list_runs_as_an_empty_one() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let stale = host.new_list().expect("a host list");
+        let other = host.new_list().expect("a host list");
+        stale.close();
+        other.close();
+        host.execute(&[&stale, &other]);
+        stale.let_go_recording();
+        assert!(stale.stale());
+        let before = STALE_SKIPPED.load(Ordering::Relaxed);
+        host.execute(&[&stale, &other, &stale]);
+        assert!(STALE_SKIPPED.load(Ordering::Relaxed) >= before + 2, "left out each time it is named");
+        host.execute(&[&stale]);
+        stale.reset();
+        stale.close();
+        host.execute(&[&stale, &other]);
     }
 
     /// A list that ran moves to a new allocator: it forgets its biggest
@@ -10758,7 +10842,9 @@ mod list_buffer_tests {
         assert!(list.new_allocator());
         assert_ne!(list.allocator.as_raw(), old, "a new allocator");
         assert_eq!(list.list.recorded_most(), 0, "nothing recorded on it yet");
+        assert!(!list.stale(), "reset onto the new allocator: nothing recorded");
         list.let_go_recording();
+        assert!(list.stale());
         list.reset();
         list.close();
         host.execute(&[&list]);
