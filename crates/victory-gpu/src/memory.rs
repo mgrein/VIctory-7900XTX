@@ -169,6 +169,45 @@ struct Held {
     theirs: bool,
 }
 
+/// Keys (pages, addresses) in the order they came, each once, and where the
+/// sweep over them is. A key that comes again while it is in keeps its
+/// place: a slot the title streams into again and again at the same address
+/// added one more each time, and those were taken out only by a sweep that
+/// came to them while the slot was empty.
+#[derive(Default)]
+struct Order {
+    keys: Vec<u64>,
+    has: std::collections::HashSet<u64>,
+    at: usize,
+}
+
+impl Order {
+    fn push(&mut self, key: u64) {
+        if self.has.insert(key) {
+            self.keys.push(key);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The sweep's next key.
+    fn next(&mut self) -> Option<u64> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        self.at = (self.at + 1) % self.keys.len();
+        Some(self.keys[self.at])
+    }
+
+    /// Takes out the key [`Order::next`] gave last.
+    fn take_last(&mut self) {
+        let key = self.keys.swap_remove(self.at);
+        self.has.remove(&key);
+    }
+}
+
 /// A packed structure the builder came to.
 struct Packed {
     /// The frame it last did.
@@ -191,15 +230,13 @@ struct Memory {
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
-    order: Vec<u64>,
-    sweep: usize,
+    order: Order,
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
     /// Packed structures the builder came to: the frame it last did.
     packed: HashMap<u64, Packed>,
     /// Their addresses in the order they came, and where the sweep is.
-    packed_order: Vec<u64>,
-    packed_sweep: usize,
+    packed_order: Order,
     /// Places of pages that are free: the copy, the address in the arena.
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
@@ -304,12 +341,10 @@ impl Memory {
             numbers: HashMap::new(),
             arenas: Vec::new(),
             pages: HashMap::new(),
-            order: Vec::new(),
-            sweep: 0,
+            order: Order::default(),
             windows: 0,
             packed: HashMap::new(),
-            packed_order: Vec::new(),
-            packed_sweep: 0,
+            packed_order: Order::default(),
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
@@ -520,25 +555,17 @@ impl Memory {
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
         for _ in 0..self.order.len().div_ceil(SWEEP) {
-            self.sweep = (self.sweep + 1) % self.order.len();
-            let page = self.order[self.sweep];
+            let Some(page) = self.order.next() else { break };
             if self.pages.contains_key(&page) {
                 self.bring(page, page + 1);
             } else {
-                self.order.swap_remove(self.sweep);
-                if self.order.is_empty() {
-                    break;
-                }
+                self.order.take_last();
             }
         }
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
-            self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
-            let address = self.packed_order[self.packed_sweep];
+            let Some(address) = self.packed_order.next() else { break };
             if !self.packed.contains_key(&address) {
-                self.packed_order.swap_remove(self.packed_sweep);
-                if self.packed_order.is_empty() {
-                    break;
-                }
+                self.packed_order.take_last();
             } else if !self.there(address) {
                 self.gone(address);
             }
@@ -1397,6 +1424,36 @@ mod tests {
         // The switch wins.
         assert_eq!(pages_most(Some(11 * GIB), Some(3072)), 3 << 14);
         assert_eq!(pages_most(Some(24 * GIB), Some(512)), pages(512));
+    }
+
+    /// A key that comes again while it is in keeps its one place; one the
+    /// sweep took out comes in again.
+    #[test]
+    fn a_key_is_in_the_order_once() {
+        let mut order = Order::default();
+        assert_eq!(order.next(), None);
+        for key in [5, 6, 5, 5, 7, 6] {
+            order.push(key);
+        }
+        assert_eq!(order.len(), 3);
+        let mut seen: Vec<u64> = (0..3).filter_map(|_| order.next()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [5, 6, 7]);
+        // The sweep takes one out.
+        while order.next() != Some(6) {}
+        order.take_last();
+        assert_eq!(order.len(), 2);
+        order.push(5);
+        assert_eq!(order.len(), 2);
+        order.push(6);
+        assert_eq!(order.len(), 3);
+        // All of them out, one at a time.
+        for _ in 0..3 {
+            order.next();
+            order.take_last();
+        }
+        assert_eq!((order.len(), order.next()), (0, None));
+        assert!(order.has.is_empty());
     }
 
     /// A failed try is not tried again for [`RETRY`] frames.
