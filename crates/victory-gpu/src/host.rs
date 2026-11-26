@@ -905,6 +905,9 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Whose card it is, before anything is named in the book.
+        #[cfg(feature = "diagnostics")]
+        crate::book::adapter(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);

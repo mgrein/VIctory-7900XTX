@@ -71,6 +71,13 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# One codegen unit and thin LTO (after Belobug a23d1b46, by Key; also
+# VItoriaBr 4e038bf3): the layer spends its time hashing, copying and
+# translating, so cross-crate inlining pays for the slower build. The diag
+# profile inherits both. Not `panic = "abort"`: the list threads
+# (`list/thin.rs`), the landing pool and the submitting thread catch panics.
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

@@ -300,7 +300,14 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    // `VICTORY_THIN_THREADS`: the threads that translate written-down lists;
+    // unset, the logical processors over three, from 2 to 8 (8 from 24 on:
+    // `crate::cores::pool`).
+    let threads = std::env::var("VICTORY_THIN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| crate::cores::pool(3, 2, 8))
+        .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
