@@ -135,7 +135,10 @@ described where it is read):
 - **The threads that translate lists** keep the views they make in a CPU-only
   heap of their own and copy them when the same view comes again
   (`VICTORY_VIEW_COPIES`): on NVIDIA making a view costs far more than copying
-  one. Copies of views' own bytes are pieces of shared 32 MiB buffers
+  one. The constant buffers copied into a list's scratch memory for each draw
+  have their views kept with the scratch chunk, by offset and size, for as
+  long as the chunk lives, on whichever thread (`VICTORY_CHUNK_VIEWS`).
+  Copies of views' own bytes are pieces of shared 32 MiB buffers
   (`VICTORY_EXACT_ARENA`), not a committed buffer each: on a host without raw
   twins (NVIDIA's capped heap) there are thousands a frame. Diagnostics
   counters reach one thread-local value per call.

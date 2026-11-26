@@ -1594,6 +1594,10 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 pub(crate) type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
+/// The views kept of a scratch chunk, and an offset in it
+/// ([`HostList::scratch_held`]).
+pub(crate) type ScratchViews = (std::sync::Arc<crate::descriptor::host::scratch_views::ChunkViews>, u64);
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -2297,6 +2301,8 @@ impl Drop for Counted {
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    /// The views made of its memory (`VICTORY_CHUNK_VIEWS`).
+    views: std::sync::Arc<crate::descriptor::host::scratch_views::ChunkViews>,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2426,6 +2432,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     Some(Chunk {
         buffer,
         data: data as usize,
+        views: Default::default(),
     })
 }
 
@@ -7807,17 +7814,29 @@ impl HostList {
     }
 
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
-    /// slot to hold: the slot outlives the list's use of it.
-    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+    /// slot to hold: the slot outlives the list's use of it. With the
+    /// views kept of the chunk it lies in, and the offset in it
+    /// (`VICTORY_CHUNK_VIEWS`; none for memory of a buffer of its own).
+    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8, Option<ScratchViews>)> {
+        let (buffer, at, data, views) = self.scratch_with(len, crate::descriptor::host::scratch_views::on())?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+        Some((buffer, gpu, data, views.map(|v| (v, at))))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
     fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_with(len, false).map(|(buffer, at, data, _)| (buffer, at, data))
+    }
+
+    /// [`HostList::scratch_at`]; with `views`, the views kept of the chunk.
+    #[allow(clippy::type_complexity)]
+    fn scratch_with(
+        &self,
+        len: u64,
+        views: bool,
+    ) -> Option<(ID3D12Resource, u64, *mut u8, Option<std::sync::Arc<crate::descriptor::host::scratch_views::ChunkViews>>)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -7825,7 +7844,7 @@ impl HostList {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            return Some((buffer, 0, data, None));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7842,10 +7861,12 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
+        let chunk = &s.chunks[s.current].0;
+        let (data, buffer) = (chunk.data, chunk.buffer.clone());
+        let kept = views.then(|| chunk.views.clone());
         let at = s.used;
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some((buffer, at, (data + at as usize) as *mut u8, kept))
     }
 
     /// After a reset, before the list waits in the pool

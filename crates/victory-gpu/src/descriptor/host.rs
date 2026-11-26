@@ -14,6 +14,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) mod copies;
+pub(crate) mod scratch_views;
 
 /// `CreateShaderResourceView` of `resource` (none: a null view) at `at`, a
 /// slot the card does not see: copied from the one this thread kept if it
@@ -3183,7 +3184,11 @@ impl HostHeap {
     /// chunks go back to the pool and are freed past its limit: session n02
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
-    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+    ///
+    /// With `views` (the memory is that of a list's scratch chunk, from that
+    /// offset in it), the views are copied from those the chunk kept, or
+    /// made there and kept ([`scratch_views`]).
+    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, views: Option<&crate::host::ScratchViews>) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         if host().is_none() {
@@ -3194,7 +3199,17 @@ impl HostHeap {
             SizeInBytes: constant_bytes(size),
         };
         // The memory is the caller's, of `buffer`.
-        create_cbv(Some(buffer), &desc, self.at(index));
+        let made = views.is_some_and(|(kept, offset)| {
+            let host = host().expect("checked above");
+            // SAFETY: a slot of a heap of views; the range lies in the
+            // live buffer.
+            kept.through(false, *offset, desc.SizeInBytes, self.at(index), |to| unsafe {
+                host.device.CreateConstantBufferView(Some(&desc), to)
+            })
+        });
+        if !made {
+            create_cbv(Some(buffer), &desc, self.at(index));
+        }
         self.put(index);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
@@ -3214,7 +3229,17 @@ impl HostHeap {
                     },
                 },
             };
-            create_srv(Some(buffer), Some(&raw), twin);
+            let made = views.is_some_and(|(kept, offset)| {
+                let host = host().expect("checked above");
+                // SAFETY: a slot of a heap of views; the buffer is live and
+                // holds the range.
+                kept.through(true, *offset, desc.SizeInBytes, twin, |to| unsafe {
+                    host.device.CreateShaderResourceView(buffer, Some(&raw), to)
+                })
+            });
+            if !made {
+                create_srv(Some(buffer), Some(&raw), twin);
+            }
         }
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
@@ -5602,7 +5627,7 @@ mod tests {
             assert!(alive(), "a view of {size} bytes");
         }
         // SAFETY: a live upload buffer.
-        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472, None);
         assert!(alive(), "a view of the list's own memory");
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
