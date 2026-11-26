@@ -6,7 +6,7 @@
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Nvidia       the NVIDIA profile even where no NVIDIA card is found (it is taken by itself on one; README.md, "NVIDIA")
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
-# -Fps <n>      the title's frame pacing at n frames a second (VICTORY_FPS; 0: no pacing sleep), in builds that read it
+# -Fps <n>      n frames a second: our frame clock and the title's own frame rate setting (VICTORY_FRAME_INTERVAL_MS=1000/n; 0: no pacing wait)
 # -SmoothMotion start a copy named victory_sm.exe, so that a Smooth Motion profile set for it in the NVIDIA App applies
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -24,7 +24,7 @@ $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
@@ -59,12 +59,15 @@ if ($Nvidia) {
     #   VICTORY_BVH_NO_HIT=1      ray walks find no hit while the structure builder is not running whole
     #   VICTORY_POOL_INPLACE=1    the page pool's windows mapped in place
 }
-if ($PSBoundParameters.ContainsKey('Fps')) { $settings.VICTORY_FPS = "$Fps" }
+if ($PSBoundParameters.ContainsKey('Fps')) {
+    # One frame-rate switch (upstream's): it paces our frame clock and the loader gives the title the same rate.
+    $settings.VICTORY_FRAME_INTERVAL_MS = if ($Fps -eq 0) { '0' } else { (1000.0 / $Fps).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) }
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
-if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
+if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
+if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 if ($SmoothMotion) {
     # (After trustno1-coder a1849fac, scripts/play-nvidia.ps1.) A copy under the name the NVIDIA App's
     # Smooth Motion profile is set for, refreshed when the build is newer.
@@ -77,8 +80,15 @@ if ($SmoothMotion) {
 }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
-Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+$inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
+foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+$discarded = $inherited | Where-Object {
+    $_.Name -notin $More.Keys -and -not $_.Value.Equals([Environment]::GetEnvironmentVariable($_.Name))
+} | Sort-Object Name
+if ($discarded) {
+    Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
+}
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory run $Exe --execute } finally { Pop-Location }
