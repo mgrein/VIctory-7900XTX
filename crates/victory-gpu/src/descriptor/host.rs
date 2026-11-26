@@ -2968,7 +2968,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3026,18 +3026,38 @@ impl HostHeap {
 
     /// Slot `index` now views `held` (or nothing of the host's).
     fn keep(&self, index: u32, held: Option<Held>) {
+        self.keep_with(index, held.as_ref().map(Held::identity), || held);
+    }
+
+    /// [`HostHeap::keep`] of what the caller holds: cloned only if the slot
+    /// held something else. Most writes of a slot view what it viewed, and
+    /// each clone given back at once is a pair of the driver's interlocked
+    /// counts on a resource every translating thread names (and a pair on
+    /// the piece's count): commit f9bcd8a3, lost when slots came to hold a
+    /// [`Held`].
+    fn keep_ref(&self, index: u32, held: Option<&Held>) {
+        self.keep_with(index, held.map(Held::identity), || held.cloned());
+    }
+
+    /// [`HostHeap::keep_ref`] of a buffer viewed whole (no piece).
+    fn keep_buffer(&self, index: u32, buffer: Option<&ID3D12Resource>) {
+        use windows::core::Interface;
+        self.keep_with(index, buffer.map(|b| (b.as_raw(), std::ptr::null())), || buffer.map(|b| b.clone().into()));
+    }
+
+    /// Slot `index` now views what `identity` names ([`Held::identity`]),
+    /// which `held` gives if the slot held something else.
+    fn keep_with(&self, index: u32, identity: Option<HeldIdentity>, held: impl FnOnce() -> Option<Held>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            match (slot.as_ref(), held.as_ref()) {
-                (None, None) => return,
-                (Some(a), Some(b)) if a.same(b) => return,
-                _ => {}
+            if slot.as_ref().map(Held::identity) == identity {
+                return;
             }
-            std::mem::replace(&mut *slot, held)
+            std::mem::replace(&mut *slot, held())
         };
         // A running submission may still read the old resource (or piece)
         // through this slot.
@@ -3080,7 +3100,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone().into()));
+        self.keep_buffer(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3118,7 +3138,7 @@ impl HostHeap {
         create_uav(Some(buffer), Some(&desc), self.at(index));
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone().into()));
+        self.keep_buffer(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3199,7 +3219,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone().into()));
+        self.keep_buffer(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3247,7 +3267,7 @@ impl HostHeap {
         self.put(index);
         create_srv(Some(buffer), Some(&raw), twin);
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone().into()));
+        self.keep_buffer(index, Some(buffer));
         true
     }
 
@@ -3888,16 +3908,21 @@ impl Held {
     }
 
     /// Whether the two hold the same.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn same(&self, other: &Held) -> bool {
+        self.identity() == other.identity()
+    }
+
+    /// What it holds, by address: equal for two that hold the same, read
+    /// without taking a reference to either.
+    fn identity(&self) -> HeldIdentity {
         use windows::core::Interface;
-        self.resource.as_raw() == other.resource.as_raw()
-            && match (&self.piece, &other.piece) {
-                (None, None) => true,
-                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
-                _ => false,
-            }
+        (self.resource.as_raw(), self.piece.as_ref().map_or(std::ptr::null(), std::sync::Arc::as_ptr))
     }
 }
+
+/// [`Held::identity`]: the resource's address and the piece's (null: none).
+type HeldIdentity = (*mut std::ffi::c_void, *const crate::shadow::Shadow);
 
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
@@ -5582,6 +5607,58 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// A slot written again with what it holds takes no reference to it, nor
+    /// to its piece; written with something else it holds that, and lets go
+    /// of what it held. Prints what a write of the same costs.
+    #[test]
+    fn a_slot_kept_again_takes_no_reference() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let refs = |r: &ID3D12Resource| {
+            use windows::core::Interface;
+            // SAFETY: plain reference counting of a live resource.
+            unsafe {
+                let unknown = &Interface::vtable(r).base__.base__.base__.base__;
+                (unknown.AddRef)(r.as_raw());
+                (unknown.Release)(r.as_raw())
+            }
+        };
+        let a = host.uav_buffer(1 << 12).expect("a buffer");
+        let b = host.uav_buffer(1 << 12).expect("a buffer");
+        let held: Held = a.clone().into();
+        heap.keep_ref(0, Some(&held));
+        assert_eq!(refs(&a), 3, "the caller's two and the slot's");
+        assert!(heap.kept[0].lock().unwrap().as_ref().unwrap().same(&held));
+        let n = 1_000_000u32;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            heap.keep_ref(0, Some(std::hint::black_box(&held)));
+        }
+        let by_ref = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            heap.keep(0, Some(std::hint::black_box(&held).clone()));
+        }
+        let by_clone = started.elapsed();
+        eprintln!(
+            "keep of the same: {:.1} ns by reference, {:.1} ns with a clone given back",
+            by_ref.as_nanos() as f64 / f64::from(n),
+            by_clone.as_nanos() as f64 / f64::from(n)
+        );
+        assert_eq!(refs(&a), 3, "no reference taken or lost");
+        heap.keep_buffer(0, Some(&a));
+        assert_eq!(refs(&a), 3, "a buffer viewed whole is the same");
+        heap.keep_buffer(0, Some(&b));
+        assert_eq!(refs(&b), 2, "the other buffer held");
+        heap.keep_ref(0, None);
+        assert!(heap.kept[0].lock().unwrap().is_none());
+        drop(held);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
