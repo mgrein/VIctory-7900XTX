@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod arena;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;

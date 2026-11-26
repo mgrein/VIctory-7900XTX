@@ -934,7 +934,7 @@ impl Rig {
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
-    fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+    pub(crate) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
             self.allocator.Reset()?;

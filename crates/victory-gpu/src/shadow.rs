@@ -102,6 +102,12 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// A copy of a view's own bytes ([`exact`]) in a piece of a chunk shared
+    /// with others (`crate::arena`): `buffer` is the chunk's, and the copy
+    /// begins this piece's bytes into it (`data` and `gpu` are of the
+    /// piece's first byte). Given back when the copy is dropped, through
+    /// `crate::host::retire`.
+    piece: Option<crate::arena::Piece>,
 }
 
 /// The ranges a copy's shaders write ([`Shadow::writing`]), in the order
@@ -2755,6 +2761,11 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // A list recorded before the copy went, or a submission running,
+        // may still read the piece: it is given back once they are done.
+        if let Some(piece) = self.piece.take() {
+            crate::host::retire(piece);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3318,7 +3329,25 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.bias()
+    }
+
+    /// Where the copy begins in its buffer: past the bytes before `start`
+    /// of a buffer placed on title memory's pages, or a piece's offset in
+    /// its chunk; else 0.
+    fn bias(&self) -> u64 {
+        match (&self.place, &self.piece) {
+            (Some(place), _) => place.1,
+            (None, Some(piece)) => piece.at,
+            (None, None) => 0,
+        }
+    }
+
+    /// Whether the copy is a piece of a chunk shared with other copies
+    /// (`crate::arena`): what holds its buffer says nothing of the copy,
+    /// and a descriptor slot that shows it holds the copy itself.
+    pub(crate) fn in_piece(&self) -> bool {
+        self.piece.is_some()
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -3345,8 +3374,12 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    /// The bytes of the host buffer.
+    /// The bytes of the host buffer; of a piece of a chunk, the chunk's
+    /// bytes up to the piece's end (views made on the copy end there).
     pub(crate) fn width(&self) -> u64 {
+        if let Some(piece) = &self.piece {
+            return piece.at + piece.len;
+        }
         // SAFETY: a live buffer.
         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
     }
@@ -3385,6 +3418,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            piece: None,
         }
     }
 
@@ -5948,9 +5982,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), Arc<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, copies made, and
-/// copies let go as not used lately.
-static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the last frame line: askings for such copies, copies made, those
+/// of them made in buffers of their own (not in pieces, `crate::arena`),
+/// and copies let go as not used lately.
+static EXACT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// How long a copy of a view's own bytes that nothing holds stays after it
 /// was last asked for, in milliseconds: the title's parameter blocks lie
@@ -5978,14 +6013,19 @@ fn exact_idle(used: u64, now: u64) -> bool {
 /// colour-bake parameter blocks among them and gives each a copy of its
 /// own bytes, as here).
 ///
+/// The copy's first byte in its buffer lies on a multiple of `align` (the
+/// view's elements, or 16 for a raw view). With `crate::arena` (on by
+/// default) it is a piece of a chunk shared with other such copies; one
+/// first asked for by an unordered access view (`unordered`: shaders write
+/// it) gets a buffer of its own unless `VICTORY_EXACT_ARENA=2`.
+///
 /// The copy is brought up to date and written back like any other (a list
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it, and for
 /// [`EXACT_KEEP_MS`] after it was last asked for; those not used lately are
 /// looked for at most once per frame or tenth of a second, once there are
-/// many. (They were kept for 512 askings: with ~3,000 a frame on a host
-/// without raw twins, less than a frame.)
-pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// many.
+pub(crate) fn exact(address: u64, len: u64, align: u64, unordered: bool) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for.
     const MANY: usize = 256;
     /// The largest, and no view the title made on purpose: off its dwords.
@@ -5993,6 +6033,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
+    let align = align.max(1);
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let now = crate::host::moment();
     let mut gone = Vec::new();
@@ -6003,31 +6044,54 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         if shadow.used.load(Ordering::Relaxed) != now {
             shadow.used.store(now, Ordering::Relaxed);
         }
-        return Some(shadow.clone());
+        // A piece placed for a view of other elements: a copy where this
+        // view can begin takes its place (the other stays while what shows
+        // it holds it).
+        if shadow.offset(address).is_multiple_of(align) {
+            return Some(shadow.clone());
+        }
     }
     if map.len() >= MANY && *looked != now {
         *looked = now;
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately. Dropped outside the
-        // lock.
+        // Held by the map alone (no list, and no slot: a slot that shows a
+        // piece holds the copy; one that shows a buffer of its own holds
+        // the buffer), and not asked for lately. Dropped outside the lock.
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, shadow)| {
                 Arc::strong_count(shadow) == 1
-                    && crate::host::references(&shadow.buffer) == 1
+                    && (shadow.in_piece() || crate::host::references(&shadow.buffer) == 1)
                     && exact_idle(shadow.used.load(Ordering::Relaxed), now)
             })
             .map(|(&key, _)| key)
             .collect();
         gone.extend(idle.iter().filter_map(|key| map.remove(key)));
-        EXACT_STATS[2].fetch_add(gone.len() as u64, Ordering::Relaxed);
+        EXACT_STATS[3].fetch_add(gone.len() as u64, Ordering::Relaxed);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), shadow.clone());
+    let size = len.next_multiple_of(crate::arena::LINE);
+    let mode = crate::arena::mode();
+    let taken = (mode == 2 || (mode == 1 && !unordered))
+        .then(|| crate::arena::take(size, crate::arena::line_for(align)))
+        .flatten();
+    let shadow = match taken {
+        Some(taken) => {
+            let mut shadow = Shadow::new(taken.buffer, taken.data, taken.gpu, address, len);
+            shadow.piece = Some(taken.piece);
+            shadow
+        }
+        None => {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            Shadow::new(buffer, data, gpu, address, len)
+        }
+    };
+    let shadow = Arc::new(shadow);
+    if let Some(old) = map.insert((address, len), shadow.clone()) {
+        gone.push(old);
+    }
     drop(guard);
     drop(gone);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -6039,19 +6103,24 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 
 /// With the frame line: the buffer views that got a copy of their own
-/// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
-/// Nothing while there are none.
+/// bytes ([`exact`]), per frame over `frames`, the copies kept now, and the
+/// pieces they are made in (`crate::arena`). Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made, idle] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, own, idle] = [0, 1, 2, 3].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let [chunks, used, pieces] = crate::arena::stats();
     tracing::info!(
-        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again):          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {:.1} let go per frame, {kept} kept",
+        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again):          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} of them in buffers of their own),          {:.1} let go per frame, {kept} kept; pieces of shared buffers (VICTORY_EXACT_ARENA={}): {chunks} chunks of {} MiB,          {pieces} pieces held, {:.2} MiB in use",
         asked as f64 / frames,
         made as f64 / frames,
-        idle as f64 / frames
+        own as f64 / frames,
+        idle as f64 / frames,
+        crate::arena::mode(),
+        crate::arena::CHUNK >> 20,
+        used as f64 / (1 << 20) as f64
     );
 }
 

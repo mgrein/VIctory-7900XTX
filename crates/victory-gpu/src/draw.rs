@@ -910,7 +910,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
         #[cfg(feature = "diagnostics")]
-        if host.shows(index, &shadow.buffer) == Some(false) {
+        if host.shows(index, &shadow) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
