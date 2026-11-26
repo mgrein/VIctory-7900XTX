@@ -335,6 +335,13 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Told before the ranges are looked at: a
+    // flush of the heap's buffer views brings some 4,000 of them, each
+    // looked up in the bits and sorted, for nothing.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -348,11 +355,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let gap = ahead_gap();

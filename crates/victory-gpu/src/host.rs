@@ -7761,6 +7761,40 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, where the refreshes of copies go (all
+/// threads): nanoseconds telling whether a refresh copies nothing, and how
+/// many were told; nanoseconds in the refreshes that do go on, and how many;
+/// the submitting thread's nanoseconds asking ahead; of each flush handed
+/// to other threads its longest refresh, summed, and how many such flushes.
+/// Says whether a frame's refreshes are the ones known to copy nothing, the
+/// copying, or one long copy that the others wait for.
+#[cfg(feature = "diagnostics")]
+static REFRESH_NS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// The longest refresh of the flush going on, nanoseconds ([`REFRESH_NS`]).
+#[cfg(feature = "diagnostics")]
+static FLUSH_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `shadow.nothing_new(from, to - from)`, timed into [`REFRESH_NS`].
+fn known_nothing(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let nothing = shadow.nothing_new(from, to - from);
+    #[cfg(feature = "diagnostics")]
+    {
+        REFRESH_NS[0].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        REFRESH_NS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    nothing
+}
+
+/// A flush handed to other threads is done: its longest refresh counted.
+#[cfg(feature = "diagnostics")]
+fn handed_done() {
+    REFRESH_NS[5].fetch_add(FLUSH_LONGEST.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+    REFRESH_NS[6].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -7822,6 +7856,17 @@ fn split_line(frames: f64) {
         ms[15],
         e[0],
         e[1] / 1e3,
+    );
+    let r: Vec<f64> = REFRESH_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes of copies per frame, all threads: {:.2} ms telling {:.0} whether they copy nothing, {:.2} ms in {:.0} that go on;          the submitting thread {:.2} ms asking ahead; of {:.0} flushes handed to other threads the longest refresh {:.2} ms summed",
+        r[0] / 1e6,
+        r[1],
+        r[2] / 1e6,
+        r[3],
+        r[4] / 1e6,
+        r[6],
+        r[5] / 1e6,
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -8196,7 +8241,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+        if !(crate::watch::light() && known_nothing(&shadow, from, to)) {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
@@ -8215,7 +8260,13 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            crate::copystat::range(from, to - from, us, 0);
+            let ns = started.elapsed().as_nanos() as u64;
+            REFRESH_NS[2].fetch_add(ns, Ordering::Relaxed);
+            REFRESH_NS[3].fetch_add(1, Ordering::Relaxed);
+            FLUSH_LONGEST.fetch_max(ns, Ordering::Relaxed);
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
@@ -8289,17 +8340,24 @@ impl Batch {
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            spans.retain(|(shadow, from, to)| !known_nothing(shadow, *from, *to));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
+            #[cfg(feature = "diagnostics")]
+            REFRESH_NS[4].fetch_add(asking.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        {
+            FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+            FLUSH_LONGEST.store(0, Ordering::Relaxed);
+        }
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8307,13 +8365,15 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            if many && known_nothing(shadow, *from, *to) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Self::update(shadow, *from, *to);
         });
+        #[cfg(feature = "diagnostics")]
+        handed_done();
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8358,12 +8418,20 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let handed = due.len() > 1;
+        #[cfg(feature = "diagnostics")]
+        FLUSH_LONGEST.store(0, Ordering::Relaxed);
         crate::shadow::wide_each(due.len(), move |i| {
             let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
+            if !known_nothing(shadow, *from, *to) {
                 Self::update(shadow, *from, *to);
             }
         });
+        #[cfg(feature = "diagnostics")]
+        if handed {
+            handed_done();
+        }
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
@@ -8447,7 +8515,7 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            self.refreshes.retain(|(shadow, from, to)| !known_nothing(shadow, *from, *to));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
@@ -8465,6 +8533,8 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            REFRESH_NS[4].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -8473,13 +8543,16 @@ impl Batch {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+            {
+                FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+                FLUSH_LONGEST.store(0, Ordering::Relaxed);
+            }
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    if refreshes.len() > FEW && known_nothing(shadow, *from, *to) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
@@ -8494,6 +8567,8 @@ impl Batch {
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
+            #[cfg(feature = "diagnostics")]
+            handed_done();
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
