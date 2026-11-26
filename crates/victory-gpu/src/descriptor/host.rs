@@ -1088,6 +1088,28 @@ impl Queued {
 /// others: the frame each was written in, the slot and its write's number.
 type Due = [Vec<(u64, u32, u64)>; 2];
 
+/// Keeps of `slots` the `new` newest writes and the `old` oldest (all of
+/// them if there are no more), the newest first: what a full sort would
+/// have at its two ends, without sorting the 10,000 to 40,000 due slots
+/// between them on a recording thread each pass (the idea of
+/// DexNom/VIctory PR #9, "Bound texture queue sorting", and
+/// fxceless/victory-fork PR #733).
+fn ends(slots: &mut Vec<(u64, u32, u64)>, new: usize, old: usize) {
+    let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+    let len = slots.len();
+    if len > new.saturating_add(old) {
+        if new > 0 {
+            slots.select_nth_unstable_by(new, newest_first);
+        }
+        if old > 0 {
+            let rest = &mut slots[new..];
+            rest.select_nth_unstable_by(rest.len() - old, newest_first);
+        }
+        slots.drain(new..len - old);
+    }
+    slots.sort_unstable_by(newest_first);
+}
+
 impl TextureQueue {
     fn insert(&mut self, index: u32, waiting: Waiting) {
         if self.slots.insert(index, waiting).is_none() {
@@ -1162,10 +1184,11 @@ impl TextureQueue {
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
+        // By the number of the write, counted over the run. Only what the
+        // order can name is sorted ([`ends`]).
+        ends(&mut again, max, 0);
+        let room = max.saturating_sub(again.len());
+        ends(&mut fresh, room.div_ceil(2), room / 2);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
@@ -6791,6 +6814,50 @@ void main(uint i : SV_DispatchThreadID) { uint4 r = v[i >> 2]; uint k = i & 3; d
         // The title keeps at least LEAST_TITLE when the setting asks for all.
         let null = 999_999;
         assert!(null - capped_dynamic_slots(u32::MAX, null, Some(null)) >= LEAST_TITLE);
+    }
+
+    /// The order of the due slots with only its two ends sorted is the one
+    /// a sort of all of them gave.
+    #[test]
+    fn the_due_order_of_a_bounded_sort_is_that_of_a_full_sort() {
+        let full = |[mut again, mut fresh]: Due, max: usize| -> Vec<(u32, u64)> {
+            let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+            again.sort_unstable_by(newest_first);
+            fresh.sort_unstable_by(newest_first);
+            let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old && order.len() < max {
+                order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+                if new < old && order.len() < max {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                }
+            }
+            order.truncate(max);
+            order
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300u64 {
+            // Writes are numbered apart; the slots come in any order.
+            let mut writes: Vec<u64> = (1..=(next() % 200)).collect();
+            for i in (1..writes.len()).rev() {
+                writes.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let mut due = Due::default();
+            for (index, &write) in writes.iter().enumerate() {
+                due[(next() % 3 != 0) as usize].push((round, index as u32, write));
+            }
+            for max in [0, 1, 2, 3, 7, 50, 199, 200, 4096] {
+                assert_eq!(TextureQueue::in_order(due.clone(), max), full(due.clone(), max), "round {round} max {max}");
+            }
+        }
     }
 
     #[test]
