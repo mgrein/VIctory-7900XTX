@@ -450,8 +450,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        // Kept by the guards ([`consider_cold`]): `writes` looks there.
-        .filter(|&(first, last)| !cold_overlaps(first, last))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -709,7 +707,6 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if !held_ahead.holds(first, last)
-            && !cold_overlaps(first, last)
             && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b)
         {
             alone_ranges.push((first, last));
@@ -726,10 +723,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         found
     });
     for (&(first, last), found) in alone_ranges.iter().zip(answers) {
-        if let Some(mut pages) = found {
-            if let Some(caught) = consider_cold(first, last, &pages) {
-                pages.extend(caught);
-            }
+        if let Some(pages) = found {
             written.extend(pages);
             ahead.push((first, last));
         }
@@ -842,7 +836,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(mut pages) = kernel_written(first, last) {
+    if let Some(pages) = kernel_written(first, last) {
         #[cfg(feature = "diagnostics")]
         {
             // The pages walked that lie in none of the ranges.
@@ -852,9 +846,6 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
                 to = to.max(b);
             }
             tally(13, ((last - first - covered) * (PAGE >> 10)) as u64);
-        }
-        if let Some(caught) = consider_cold(first, last, &pages) {
-            pages.extend(caught);
         }
         written.extend(pages);
         asked.push((first, last));
@@ -998,26 +989,18 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(known);
     }
     let mut guards_asked = false;
-    // Kept by the guards ([`consider_cold`]): no kernel walk.
-    let cold = cold_overlaps(first, last);
     // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = cold || (guarded && light() && PROTECTED.any(first, last));
+    let refused = guarded && light() && PROTECTED.any(first, last);
     let pages = match if refused { None } else { kernel_written(first, last) } {
-        Some(mut pages) => {
-            if let Some(caught) = consider_cold(first, last, &pages) {
-                pages.extend(caught);
-            }
-            pages
-        }
+        Some(pages) => pages,
         None => {
             guards_asked = true;
-            if !guarded && !cold {
+            if !guarded {
                 return None;
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let written = guard_known(first * PAGE, last * PAGE, cold)
-                .map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1497,228 +1480,6 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
     PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
 }
 
-/// Write-watched ranges (pages `first..last`, by first page) kept by the
-/// guards instead of the kernel ([`consider_cold`]), and the quiet askings
-/// in a row of the big ranges that may become so.
-struct Cold {
-    ranges: BTreeMap<usize, usize>,
-    quiet: Option<std::collections::HashMap<(usize, usize), u32>>,
-}
-
-static COLD: Mutex<Cold> = Mutex::new(Cold { ranges: BTreeMap::new(), quiet: None });
-/// Whether [`COLD`] has a range (the lock is not taken while it has none).
-static ANY_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Ranges sent to the guards since the start ([`consider_cold`]), and their
-/// bytes.
-pub(crate) static COLD_RANGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// Whether big write-watched ranges the title hardly writes go to the
-/// guards (`VICTORY_COLD_GUARDS=1`; off by default: every range stays with
-/// the kernel). Off since runs x12-x14 on an RTX 4070 with this fork: with
-/// it the copies sent up per frame went from 68 to 290-380 MB and the world
-/// from 12.7 to 8.3-9.2 frames a second (here the relay already lands what
-/// shaders wrote, and the guards' faults refreshed whole blocks).
-///
-/// A kernel asking walks the page tables of all of its range, whatever was
-/// written: the title's big buffers (one of 182 MB, asked about fourteen
-/// times a frame) cost by their size. A range of 16 MiB or more found
-/// written in under 1.6 % of its 4 KiB pages eight askings in a row
-/// ([`cold_step`]) is guarded as view memory is: its blocks are made
-/// read-only, a write faults and marks its block written, and an asking
-/// looks at the guards' bits instead of the page tables. On an RTX 4070 in
-/// the DexNom tree this took the world from 5.9 to 6.5 frames a second.
-/// Ported from local DexNom-tree work (`consider_cold`).
-fn cold_on() -> bool {
-    #[cfg(test)]
-    if TEST_COLD.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COLD_GUARDS").is_some_and(|v| v == "1"))
-}
-
-/// Tests of the guards for cold ranges turn them on for the process (they
-/// are off by default; other tests use small ranges they never take).
-#[cfg(test)]
-static TEST_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The fewest pages of a range [`consider_cold`] looks at: 16 MiB.
-const COLD_LEAST: usize = (16 << 20) / PAGE;
-/// The quiet askings in a row after which a range goes to the guards.
-const COLD_STREAK: u32 = 8;
-
-/// A range's quiet askings in a row after one more asking that found
-/// `written` of its `pages` 4 KiB pages written: one more if under 1.6 %
-/// of them, else none.
-fn cold_step(streak: u32, pages: usize, written: usize) -> u32 {
-    if written * 1000 < pages * 16 { streak + 1 } else { 0 }
-}
-
-/// Whether a range kept by the guards ([`consider_cold`]) holds a page of
-/// `[first, last)`.
-fn cold_overlaps(first: usize, last: usize) -> bool {
-    if !ANY_COLD.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
-    let cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
-    overlaps(&cold.ranges, first, last)
-}
-
-/// Whether one of `ranges` (apart, by first page) holds a page of
-/// `[first, last)`.
-fn overlaps(ranges: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
-    ranges.range(..last).next_back().is_some_and(|(_, &end)| end > first)
-}
-
-/// After a kernel asking of pages `[first, last)` (one reservation's, the
-/// caller holds them, [`Asking`]) that found `written`: counts the range's
-/// quiet askings, and at the [`COLD_STREAK`]th sends it to the guards. Its
-/// blocks are made read-only and noted clean, and the kernel is asked once
-/// more for what was written between the first asking and that: those
-/// pages come back, for the caller to note with the others (and its copies
-/// to take). From then on every block of the range is either read-only (a
-/// write faults and opens it, and it counts as written until the next
-/// asking guards it again) or open and counted as written at every asking:
-/// no write goes unseen. `None` if the range stays with the kernel.
-fn consider_cold(first: usize, last: usize, written: &[(usize, u16)]) -> Option<Vec<(usize, u16)>> {
-    if !cold_on() || last - first < COLD_LEAST {
-        return None;
-    }
-    let found: usize = written.iter().map(|&(_, parts)| parts.count_ones() as usize).sum();
-    {
-        let mut cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
-        if overlaps(&cold.ranges, first, last) {
-            return None;
-        }
-        let quiet = cold.quiet.get_or_insert_with(Default::default);
-        if quiet.len() >= 4096 {
-            quiet.clear();
-        }
-        let streak = quiet.entry((first, last)).or_insert(0);
-        *streak = cold_step(*streak, (last - first) * PARTS, found);
-        if *streak < COLD_STREAK {
-            return None;
-        }
-        quiet.remove(&(first, last));
-    }
-    install();
-    {
-        // Not the blocks the kernel writes now or the runtime is changing
-        // ([`Guards::left_alone`]): read-only, a file read into them would
-        // fail. They stay open and not clean, told as written at every
-        // asking until one can guard them.
-        let mut g = guards_timed();
-        for (from, to) in open_runs(&g, first, last) {
-            protect(&mut g, from, to);
-        }
-    }
-    // What was written since the asking that called: noted with it.
-    let caught = kernel_written(first, last).unwrap_or_else(|| (first..last).map(|page| (page, WHOLE)).collect());
-    {
-        let mut cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
-        cold.ranges.insert(first, last);
-        ANY_COLD.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    COLD_RANGES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    COLD_RANGES[1].fetch_add(((last - first) * PAGE) as u64, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(
-        start = format_args!("{:#x}", first * PAGE),
-        bytes = (last - first) * PAGE,
-        "a write-watched range found almost untouched goes to the guards (VICTORY_COLD_GUARDS=0 keeps it with the kernel)"
-    );
-    Some(caught)
-}
-
-/// The runs of blocks `[first, last)` that are not left alone
-/// ([`Guards::left_alone`]), in order.
-fn open_runs(g: &Guards, first: usize, last: usize) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    let mut from = first;
-    for block in first..last {
-        if g.left_alone(block) {
-            if from < block {
-                runs.push((from, block));
-            }
-            from = block + 1;
-        }
-    }
-    if from < last {
-        runs.push((from, last));
-    }
-    runs
-}
-
-/// The title frees `[first, last)` (pages): the ranges kept by the guards
-/// there are forgotten (the guards' own notes go with `title_memory_freed`).
-fn forget_cold(first: usize, last: usize) {
-    if !ANY_COLD.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let mut cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
-    let gone: Vec<usize> = cold
-        .ranges
-        .range(..last)
-        .filter(|&(_, &end)| end > first)
-        .map(|(&start, _)| start)
-        .collect();
-    for start in gone {
-        cold.ranges.remove(&start);
-    }
-    if let Some(quiet) = cold.quiet.as_mut() {
-        quiet.retain(|&(a, b), _| b <= first || last <= a);
-    }
-    ANY_COLD.store(!cold.ranges.is_empty(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether written block `block` of a range kept by the guards
-/// ([`consider_cold`]) is left open this time ([`hot_step`]): found written
-/// in four frames close together, it is hot. Guarding it again costs a
-/// protection change now and a fault with another at the title's next
-/// write, some 15 microseconds, for a block the title writes every frame;
-/// copying its 64 KiB at each refresh costs less. A block left open is
-/// counted as written at every asking (it is not noted clean).
-/// `VICTORY_HOT_BLOCKS=0` guards every block again. Ported from local
-/// DexNom-tree work (`hot`).
-fn hot_block(g: &mut Guards, block: usize) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HOT_BLOCKS").is_none_or(|v| v != "0")) {
-        return false;
-    }
-    let round = crate::frame::current();
-    let hot = g.hot.get_or_insert_with(Default::default);
-    if hot.len() >= 1 << 16 {
-        hot.clear();
-    }
-    hot_step(hot.entry(block).or_insert((0, 0, 0)), round)
-}
-
-/// [`hot_block`]'s state of a block: the frame it was last found written
-/// in, how many times in a row (frames at most two apart), and how many
-/// times it was left open since it became hot. Hot from the fourth such
-/// time on, and guarded again every 32nd time as hot, to see whether it
-/// cooled.
-fn hot_step(e: &mut (u64, u32, u32), round: u64) -> bool {
-    if e.1 >= 4 {
-        if round == e.0 {
-            // Twice in one frame: as hot as before.
-            return true;
-        }
-        e.0 = round;
-        e.2 += 1;
-        if e.2 < 32 {
-            return true;
-        }
-        // Guarded once more: written again soon, it is hot again.
-        *e = (round, 0, 0);
-        return false;
-    }
-    if round != e.0 {
-        e.1 = if e.0 != 0 && round <= e.0 + 2 { e.1 + 1 } else { 1 };
-        e.0 = round;
-    }
-    e.1 >= 4
-}
-
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
@@ -1939,9 +1700,6 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
-    /// Blocks of ranges kept by the guards found written again and again
-    /// ([`hot_block`]).
-    hot: Option<std::collections::HashMap<usize, (u64, u32, u32)>>,
 }
 
 impl Guards {
@@ -1978,7 +1736,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-    hot: None,
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -2189,14 +1946,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
-#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    guard_known(start, end, false)
-}
-
-/// [`guard`]; `cold`: the range is (partly) one kept by the guards
-/// ([`consider_cold`]), no view but guarded all the same.
-fn guard_known(start: usize, end: usize, cold: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2211,7 +1961,7 @@ fn guard_known(start: usize, end: usize, cold: bool) -> Option<Vec<usize>> {
             let g = guards_timed();
             g.protected.contains(first) || g.absent.contains(first)
         });
-    if !cold && !known && !is_view(start, end) {
+    if !known && !is_view(start, end) {
         return None;
     }
     install();
@@ -2290,11 +2040,7 @@ fn guard_known(start: usize, end: usize, cold: bool) -> Option<Vec<usize>> {
             if cover(&mut g, block, block + 1) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block)
-            && !g.left_alone(block)
-            && !g.rests(block, rest)
-            && !(cold && hot_block(&mut g, block))
-        {
+        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect(&mut g, from, to);
@@ -3039,10 +2785,6 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
-    if ANY_COLD.load(std::sync::atomic::Ordering::Relaxed) {
-        let end = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
-        forget_cold(at / PAGE, end.div_ceil(PAGE).max(at / PAGE + 1));
-    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -3393,116 +3135,6 @@ mod tests {
             unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
         }
     }
-
-    /// Eight quiet askings in a row make a range cold; a busy one starts
-    /// the count again.
-    #[test]
-    fn quiet_askings_in_a_row_make_a_range_cold() {
-        let pages = COLD_LEAST * PARTS;
-        let mut streak = 0;
-        for _ in 0..7 {
-            streak = cold_step(streak, pages, pages / 100);
-        }
-        assert_eq!(streak, 7);
-        // 1.6 % is not quiet.
-        assert_eq!(cold_step(streak, 10_000, 160), 0);
-        assert_eq!(cold_step(streak, 10_000, 159), COLD_STREAK);
-        let mut ranges = BTreeMap::new();
-        ranges.insert(10, 20);
-        ranges.insert(30, 40);
-        assert!(overlaps(&ranges, 15, 16) && overlaps(&ranges, 5, 11) && overlaps(&ranges, 19, 31));
-        assert!(!overlaps(&ranges, 20, 30) && !overlaps(&ranges, 0, 10) && !overlaps(&ranges, 40, 50));
-    }
-
-    /// A block found written in four frames close together is left open,
-    /// then guarded again on its 32nd time as hot; one found written frames
-    /// apart is not hot.
-    #[test]
-    fn blocks_written_frame_after_frame_are_hot_for_a_while() {
-        let mut e = (0, 0, 0);
-        let hot: Vec<bool> = (1..=40u64).map(|round| hot_step(&mut e, round)).collect();
-        assert_eq!(&hot[..4], &[false, false, false, true]);
-        assert!(hot[4..35].iter().all(|&h| h));
-        assert!(!hot[35]);
-        // Twice in one frame counts once.
-        let mut e = (0, 0, 0);
-        assert!(!hot_step(&mut e, 5) && !hot_step(&mut e, 5) && !hot_step(&mut e, 6));
-        assert_eq!(e.1, 2);
-        // Frames far apart: never hot.
-        let mut e = (0, 0, 0);
-        assert!((0..8u64).all(|i| !hot_step(&mut e, 100 + i * 10)));
-    }
-
-    /// A big write-watched range found untouched eight askings in a row goes
-    /// to the guards: the asking after walks no page tables, and a write is
-    /// still reported (by its fault) as written; freed, it is forgotten.
-    #[test]
-    fn a_quiet_big_range_goes_to_the_guards_and_still_reports_writes() {
-        TEST_COLD.store(true, std::sync::atomic::Ordering::Relaxed);
-        const SIZE: usize = 32 << 20;
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert_ne!(p, 0);
-        let (start, end) = (p, p + SIZE);
-        for _ in 0..COLD_STREAK {
-            writes(start, end, true).expect("watched");
-        }
-        assert!(cold_overlaps(start / PAGE, end / PAGE), "the range is cold");
-        assert!(guarded(start, end), "read-only by our hand");
-        // Nothing written: nothing new.
-        let (before, written) = writes(start, end, true).expect("guarded");
-        assert!(written.iter().all(|&(_, w)| w < before), "{written:?}");
-        // A write faults into the guards' handler and is reported.
-        // SAFETY: committed memory of ours.
-        unsafe { ((start + 5 * PAGE + 100) as *mut u8).write_volatile(9) };
-        let (now, written) = writes(start, end, false).expect("guarded, asked without guards too");
-        assert!(written.contains(&(start / PAGE + 5, now)), "{written:?}");
-        // Nothing written since: nothing new.
-        let (later, again) = writes(start, end, true).expect("guarded");
-        assert!(again.iter().all(|&(_, w)| w < later));
-        title_memory_freed(start, SIZE);
-        assert!(!cold_overlaps(start / PAGE, end / PAGE), "forgotten");
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-    }
-
-    /// A range going to the guards while the kernel writes part of it (a
-    /// file read) leaves that part writable, told as written at every
-    /// asking, and guards it at the first asking after.
-    #[test]
-    fn a_range_going_cold_leaves_alone_what_the_kernel_writes() {
-        TEST_COLD.store(true, std::sync::atomic::Ordering::Relaxed);
-        const SIZE: usize = 32 << 20;
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
-        } as usize;
-        assert_ne!(p, 0);
-        let (start, end) = (p, p + SIZE);
-        let (read_from, read_to) = (start + 3 * PAGE, start + 5 * PAGE);
-        let reading = kernel_writing(read_from, read_to - read_from);
-        for _ in 0..COLD_STREAK {
-            writes(start, end, true).expect("watched");
-        }
-        assert!(cold_overlaps(start / PAGE, end / PAGE), "the range is cold");
-        assert!(!guarded(read_from, read_to), "what the kernel writes stays writable");
-        assert!(guarded(start, read_from) && guarded(read_to, read_to + PAGE), "the rest is guarded");
-        // SAFETY: committed memory of ours, writable.
-        unsafe { ((read_from + 100) as *mut u8).write_volatile(7) };
-        let (now, written) = writes(start, end, true).expect("cold");
-        assert!(written.contains(&(read_from / PAGE, now)), "{written:?}");
-        assert!(written.contains(&(read_from / PAGE + 1, now)), "{written:?}");
-        drop(reading);
-        writes(start, end, true).expect("cold");
-        assert!(guarded(read_from, read_to), "guarded once the kernel is done");
-        title_memory_freed(start, SIZE);
-        assert!(!cold_overlaps(start / PAGE, end / PAGE), "forgotten");
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-    }
-
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
