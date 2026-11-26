@@ -1178,14 +1178,70 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// While a list thread translates a chunk of list calls timed whole: the
+/// calls of the chunk so far (`None`: each call is timed by itself).
+static CHUNK: Local<Cell<Option<u64>>> = Local::new(|| Cell::new(None));
+
+/// Whether the list threads (`list::thin`) time each chunk of calls they
+/// translate whole instead of each call (`VICTORY_CALL_TIMES=each`: each
+/// call, as before). Timing a call read the clock twice, some 40,000 times
+/// a frame on those threads (1.2% of their time in a sampled profile); a
+/// chunk is timed by the loop that runs it anyway. The calls' count and
+/// time in the log stay whole; the time then holds the translating between
+/// the calls too, and a thread's calls appear in the timeline as one run
+/// per chunk. With the timeline on (`VICTORY_TIMELINE`), each call is
+/// timed, for its long calls.
+fn chunks_timed() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var("VICTORY_CALL_TIMES").map_or(true, |v| v.trim() != "each"))
+        && !crate::timeline::on()
+}
+
+/// A list thread begins a chunk of calls: whether it is timed whole (then
+/// [`chunk_ends`] follows).
+pub(crate) fn chunk_begins() -> bool {
+    let whole = chunks_timed();
+    if whole {
+        CHUNK.set(Some(0));
+    }
+    whole
+}
+
+/// The chunk [`chunk_begins`] began at `started` is done.
+pub(crate) fn chunk_ends(started: std::time::Instant) {
+    let calls = CHUNK.replace(None).unwrap_or(0);
+    if calls > 0 {
+        recorded_many(started, calls);
+    }
+}
+
+/// A list call begins: when, unless it is part of a chunk timed whole
+/// (then it is counted there). Passed to [`recorded`] as it returns.
+#[inline]
+pub(crate) fn call_begins() -> Option<std::time::Instant> {
+    CHUNK.with(|c| match c.get() {
+        Some(calls) => {
+            c.set(Some(calls + 1));
+            None
+        }
+        None => Some(std::time::Instant::now()),
+    })
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
+    recorded_many(started, 1);
+}
+
+/// `calls` list calls on this thread, which began at `started`, have
+/// returned.
+fn recorded_many(started: std::time::Instant, calls: u64) {
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
     // One set of counters looked up for both.
     let count = &COUNT[bank()].0;
-    count[C::RecordCalls as usize].fetch_add(1, Relaxed);
+    count[C::RecordCalls as usize].fetch_add(calls, Relaxed);
     count[C::RecordNs as usize].fetch_add(ns, Relaxed);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
@@ -1193,7 +1249,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
     }
     let (unsent, calls) = CALLS.with(|c| {
         let was = c.get();
-        let (unsent, calls) = (was.unsent + ns, was.unsent_calls + 1);
+        let (unsent, calls) = (was.unsent + ns, was.unsent_calls + calls);
         // By thread, a couple of milliseconds at a time.
         let (kept, kept_calls) = if unsent < 2_000_000 { (unsent, calls) } else { (0, 0) };
         c.set(Calls { ours: was.ours + ns, unsent: kept, unsent_calls: kept_calls });

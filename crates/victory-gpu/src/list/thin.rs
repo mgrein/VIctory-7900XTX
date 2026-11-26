@@ -242,8 +242,15 @@ impl Recording {
                 }
                 (chunk, inner.back as This)
             };
+            // Diagnostics: the chunk's calls timed whole (`copystat::chunk_begins`).
+            #[cfg(feature = "diagnostics")]
+            let whole = crate::copystat::chunk_begins();
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            #[cfg(feature = "diagnostics")]
+            if whole {
+                crate::copystat::chunk_ends(began);
+            }
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
