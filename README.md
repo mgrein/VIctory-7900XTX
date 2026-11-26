@@ -70,12 +70,45 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
+## NVIDIA
+
+`scripts\play.ps1` takes an NVIDIA profile by itself when it finds an NVIDIA
+card (or with `-Nvidia`): device-removed data keeps only the faulting address
+(`VICTORY_D3D12_DRED=faults`, not `light`), no book of the card's memory
+(`VICTORY_BOOK=0`: it reads descriptors as AMD's), and the card is not kept
+awake by a spinning compute queue (`VICTORY_CARD_AWAKE` left unset, which
+contends with NVIDIA's time slicing; `-CardAwake` sets it all the same). AMD
+cards get the same settings as before. More:
+
+- `-Fps <n>` sets `VICTORY_FPS` (the title's frame pacing at n frames a
+  second; 0: no pacing sleep), in builds that read it.
+- `-SmoothMotion` starts a copy named `victory_sm.exe` (refreshed when the
+  build is newer), so a Smooth Motion profile set for it in the NVIDIA App
+  applies every time (after trustno1-coder's `play-nvidia.ps1`). It adds
+  about a frame of latency; `VICTORY_REFLEX=1` goes with it.
+- Switches to try one at a time with `-More @{NAME='value'}` are listed,
+  commented, in the script: `VICTORY_INDIRECT_WIDE`, `VICTORY_JOIN_BARRIERS`,
+  `VICTORY_UP_QUEUE`, `VICTORY_WINDOWS_BAR_MB`, `VICTORY_REFLEX`,
+  `VICTORY_FRAMES_AHEAD`, `VICTORY_PACE_AFTER`, `VICTORY_BVH_NO_HIT`,
+  `VICTORY_POOL_INPLACE`.
+
+Defaults that follow the machine rather than the script, on any card: on a
+budget of 12 GiB or less (an RTX 4070's is about 11) every title buffer from
+64 KiB has its copy in the card's memory, up to 1280 MiB of them
+(`VICTORY_CARD_BUFFERS_MIN_KB`, `VICTORY_CARD_BUFFERS_MB`); the pools of
+threads of ours scale with the logical processors (on 12: four list threads,
+three for the title's bytes under flights, three for descriptor records,
+three for views; as before from 24 on); with 12 logical processors or fewer
+the submitting thread has a core to itself (`VICTORY_LANE_CORE=0`: not); the
+book of the card's memory is kept only on AMD cards (`VICTORY_BOOK=1`: on
+any).
+
 ## What is different here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
 
 - **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
+  (`VICTORY_THIN`): up to eight threads of ours translate them.
 - **Submissions are prepared by a thread of ours and joined**
   (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
   threads spread: refreshes, compares (AVX2), descriptor records, landings.
