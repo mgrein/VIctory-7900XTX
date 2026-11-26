@@ -490,6 +490,19 @@ fn clamp_into(
     recorded
 }
 
+/// `VICTORY_CLAMP_AFTER_UAV=0` (experiment, off by default): a clamp of
+/// one execution ([`record_clamp_as`]) ends with the move of its scratch
+/// buffer to indirect arguments alone, without the wait for every shader
+/// write before it. That move already orders the pass's writes of the
+/// scratch buffer before the executions read them; the only other buffer
+/// it writes is the list's budget, read by the next clamp alone, which
+/// begins with a wait for every shader write of its own. The batched pass
+/// has always ended so (`batch::record`).
+fn clamp_after_uav() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_AFTER_UAV").is_none_or(|v| v != "0"))
+}
+
 /// Records the clamp into `dst`, which is in state `before` (common, or
 /// indirect arguments after an earlier clamp into it), and leaves `dst` in
 /// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
@@ -577,6 +590,9 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // `VICTORY_CLAMP_AFTER_UAV=0`: the trailing wait left out
+    // ([`clamp_after_uav`]).
+    let skip_second = usize::from(!waits || !clamp_after_uav());
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -590,7 +606,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
     true
 }
