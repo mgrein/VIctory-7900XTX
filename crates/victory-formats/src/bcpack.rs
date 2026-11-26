@@ -129,8 +129,9 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, then 32 i16
+    /// in the first entry, the 2 width bytes again and 16 + 15 i16 in the
+    /// others). Little-endian, no padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -210,7 +211,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|entry| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,10 +223,19 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                // The first entry's 32 indices follow its widths at once;
+                // the others repeat the two width bytes first and have
+                // only 15 slots for set 1, which no entry uses (0 bits).
+                // (Read like the others, the first entry lost its leading
+                // index and had the rest one place early: wrong texels in
+                // every block that builds on it.)
+                let slots = if entry == 0 {
+                    32
+                } else {
+                    r.u16();
+                    31
+                };
+                for v in &mut ix.ix.as_flattened_mut()[..slots] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -1348,6 +1358,47 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    /// The first BC7 dictionary entry has its 32 indices right after its
+    /// widths; the others repeat the widths first and have 31. A table
+    /// whose BC7 entries count their indices up from 1 reads back as
+    /// written, and the built-in table's first entry keeps its leading
+    /// indices.
+    #[test]
+    fn bc7_first_dictionary_entry_keeps_all_32_indices() {
+        const ENTRY: usize = 2 + 48 + 2 + 64;
+        let mut raw = tables();
+        let at = TABLES_SIZE - DICTIONARY * ENTRY;
+        for entry in 0..DICTIONARY {
+            let e = &mut raw[at + entry * ENTRY..][..ENTRY];
+            e[50] = 4;
+            e[51] = 2;
+            let indices = if entry == 0 {
+                &mut e[52..]
+            } else {
+                e[52] = 4;
+                e[53] = 2;
+                &mut e[54..]
+            };
+            for (k, v) in indices.chunks_exact_mut(2).enumerate() {
+                v.copy_from_slice(&(k as i16 + 1).to_le_bytes());
+            }
+        }
+        let t = Tables::parse(&raw).unwrap();
+        let all: Vec<i16> = (1..=32).collect();
+        assert_eq!(t.bc7[0].1.bits, [4, 2]);
+        assert_eq!(t.bc7[0].1.ix.as_flattened(), &all[..]);
+        for entry in [1, 2, DICTIONARY - 1] {
+            let ix = t.bc7[entry].1.ix.as_flattened();
+            assert_eq!(&ix[..31], &all[..31], "entry {entry}");
+            assert_eq!(ix[31], 0, "entry {entry}: set 1 has 15 slots");
+        }
+        let builtin = Tables::builtin().unwrap();
+        let first = &builtin.bc7[0].1;
+        assert_eq!(first.bits, [4, 0]);
+        assert_eq!(first.ix[0], [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(first.ix[1], [0; 16]);
     }
 
     #[test]
