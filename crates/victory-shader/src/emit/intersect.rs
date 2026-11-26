@@ -10,7 +10,8 @@
 //!
 //! The title's nodes are in title memory, named by address: they are read
 //! through the host's copies of title memory ([`Lower::memory`]), one look
-//! in its directory per node (two for a 128-byte box node).
+//! in its directory per node (two for a 128-byte box node across the end of
+//! a 64 KiB page).
 //!
 //! Shape of the code, under the instruction's lane guard:
 //!
@@ -25,7 +26,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, RootType, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -36,6 +37,11 @@ thread_local! {
     /// byte. (The card tests have no host to keep copies of title memory
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
+        const { std::cell::Cell::new(None) };
+    /// Where the tests' title memory ends, if before the end of its buffer:
+    /// an address from here on has no copy (a page the host has not got),
+    /// in the same 4 GiB as [`TEST_MEMORY`]'s first byte.
+    pub(in crate::emit) static TEST_MEMORY_END: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -135,6 +141,44 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // `VICTORY_BVH_NO_HIT=1` ([`crate::emit::bvh_no_hit`]): while the
+        // structures are not built, a box enters no child and anything else
+        // is missed, with nothing read.
+        let no_hit = crate::emit::bvh_no_hit();
+        let unbuilt = (no_hit != 0).then(|| {
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            bvh::MISS.map(|miss| {
+                let miss = self.s.m.i32(miss.to_bits());
+                self.s.m.select(c, is_box, none, miss)
+            })
+        });
+        if let (1, Some(unbuilt)) = (no_hit, unbuilt) {
+            // The builder never runs: decided here.
+            let _ = &ray;
+            for (k, &r) in unbuilt.iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
+        // Asked of the host: only the lanes that run where the builder runs
+        // whole read and test the node.
+        let built = (no_hit == 2).then(|| {
+            use super::super::shader::USER_STRUCTURES;
+            let word = self.host_word(RootType::Other(USER_STRUCTURES), 0, 0);
+            let zero = self.s.m.i32(0);
+            self.s.m.cmp(c, pred::NE, word, zero)
+        });
+        let tested = match (guard, built) {
+            (Some(g), Some(b)) => Some(self.s.m.bin(c, Bin::And, g, b)),
+            (g, None) => g,
+            (None, b) => b,
+        };
+        // (With `built`, the look in the directory is made inside the test's
+        // guard, so a node test that answers no hit reads nothing.)
+        let mut early = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -161,10 +205,16 @@ impl<'a> Lower<'a> {
                     *w = self.i32_of(v)?;
                 }
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
+                let mut look = guard;
+                if built.is_some() {
+                    early = Some(self.begin_guarded(tested));
+                    // Every lane in the guarded code runs the instruction.
+                    look = None;
+                }
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, look);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -175,7 +225,10 @@ impl<'a> Lower<'a> {
             }
         };
         let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
+        let gate = match early {
+            Some(gate) => gate,
+            None => self.begin_guarded(tested),
+        };
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -214,7 +267,13 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            // Outside the guard: lanes that do not run (not written), or
+            // with `built`, the answer while the structures are not built.
+            let outside = match (built, unbuilt) {
+                (Some(_), Some(unbuilt)) => unbuilt[k],
+                _ => zero,
+            };
+            results.push((phi, outside));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -241,36 +300,101 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Sub, low, base_low);
             let in_low = self.s.m.cmp(c, pred::IUGE, low, base_low);
             let in_high = self.s.m.cmp(c, pred::EQ, high, base_high);
-            let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
+            let mut inside = self.s.m.bin(c, Bin::And, in_low, in_high);
+            if let Some(end) = TEST_MEMORY_END.get() {
+                assert_eq!(end >> 32, base >> 32, "the tests' title memory ends in its first 4 GiB");
+                let end = self.s.m.i32(end as u32);
+                let before = self.s.m.cmp(c, pred::IULT, low, end);
+                inside = self.s.m.bin(c, Bin::And, inside, before);
+            }
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at, inside);
         }
-        let (handle, byte) = self.memory(low, high, guard, false);
+        let (handle, byte) = self.memory(low, high, guard, false, false);
         let mapped = self.page_there.expect("memory says");
         (handle, byte, mapped)
     }
 
-    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
-    /// their own maybe. Goes on in another block.
-    fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
+    /// The 12 dwords of the second 64 bytes of a 128-byte node from their
+    /// start, and for a node in title memory whether that page has a copy.
+    /// Goes on in another block.
+    ///
+    /// A node is 64 bytes on 64, so its second half lies in the page of its
+    /// first unless the node starts in the last 64 bytes of a 64 KiB page
+    /// (1 node start in 1,024): the look in the directory for the first half
+    /// serves (the same copy, 64 bytes on, there as much as the first).
+    /// Only a node across the end of a page looks again. After
+    /// DexNom/VIctory#21 and #54 (DexNom).
+    fn bvh_second_half(&mut self, at: NodeAt) -> (Vec<V>, Option<V>) {
         match at {
             NodeAt::Buffer { handle, byte } => {
                 let size = self.s.m.i32(64);
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
-                NodeAt::Buffer { handle, byte }
+                (self.bvh_node_words(NodeAt::Buffer { handle, byte }, None, 0, 12), None)
             }
-            NodeAt::Memory { low, high, .. } => {
+            NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped,
+            } => {
+                let head = self.cur;
+                let (in_page, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0x1_0000 - 64));
+                let within = self.s.m.bin(head, Bin::And, low, in_page);
+                let across = self.s.m.cmp(head, pred::IUGE, within, last);
+                let (same_block, across_block) = (self.s.m.new_block(), self.s.m.new_block());
+                let join = self.s.m.new_block();
+                self.s
+                    .m
+                    .terminate(head, Term::CondBr(across, across_block, same_block));
+                // In the same page: the same copy, 64 bytes on.
+                self.cur = same_block;
+                let size = self.s.m.i32(64);
+                let next = self.s.m.bin(same_block, Bin::Add, byte, size);
+                let same = NodeAt::Memory {
+                    handle,
+                    byte: next,
+                    low,
+                    high,
+                    mapped,
+                };
+                let same_words = self.bvh_node_words(same, None, 0, 12);
+                let same_end = self.cur;
+                self.s.m.terminate(same_end, Term::Br(join));
+                // In the next page: a copy of its own maybe.
+                self.cur = across_block;
                 let (low, high) = self.address_plus(low, high, 64);
                 // Every lane in this block runs the instruction.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
-                NodeAt::Memory {
+                let (handle, byte, there) = self.bvh_memory(low, high, None);
+                let other = NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
-                    mapped,
-                }
+                    mapped: there,
+                };
+                let across_words = self.bvh_node_words(other, None, 0, 12);
+                let across_end = self.cur;
+                self.s.m.terminate(across_end, Term::Br(join));
+                self.cur = join;
+                let i32t = self.s.t.i32;
+                let words = same_words
+                    .iter()
+                    .zip(&across_words)
+                    .map(|(&a, &b)| {
+                        let phi = self.s.m.phi(join, i32t);
+                        self.s.m.set_phi(phi, vec![(a, same_end), (b, across_end)]);
+                        phi
+                    })
+                    .collect();
+                let i1t = self.s.m.type_of(mapped);
+                let last = self.s.m.phi(join, i1t);
+                self.s
+                    .m
+                    .set_phi(last, vec![(mapped, same_end), (there, across_end)]);
+                (words, Some(last))
             }
         }
     }
@@ -346,8 +470,8 @@ impl<'a> Lower<'a> {
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
         let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
+        let (rest, last) = self.bvh_second_half(at);
+        words.extend(rest);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         // (The look for the second half goes on in another block.)
         let wide_block = self.cur;
@@ -378,8 +502,8 @@ impl<'a> Lower<'a> {
         // A page that is not there reads zeros, which are a child and a box:
         // no child of it is hit. (The last two boxes of a 128-byte node are in
         // its second half.)
-        let there = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
+        let there = match (at, last) {
+            (NodeAt::Memory { mapped: first, .. }, Some(last)) => {
                 let i1t = self.s.m.type_of(first);
                 let mapped = self.s.m.phi(join, i1t);
                 self.s

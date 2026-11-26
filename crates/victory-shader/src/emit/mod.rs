@@ -125,7 +125,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_STRUCTURES,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -202,6 +202,83 @@ pub fn builder_fences() -> bool {
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to translate as with `VICTORY_BVH_NO_HIT` ([`bvh_no_hit`]).
+    pub(crate) static TEST_NO_HIT: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// How the ray node tests (`image_bvh*_intersect_ray`) answer while the
+/// title's structures are not built (`VICTORY_BVH_NO_HIT=1`; off by default).
+///
+/// The title's structure builder does not run in the layer unless asked for
+/// (`VICTORY_BVH_BUILDER=1`), and runs all or none of its stages; its
+/// ray-traced passes run all the same. Each node test then reads whatever
+/// bytes lie where a structure would be, in a walk the title bounds at
+/// 65,535 steps a wave: what comes back is not the scene, differs from
+/// launch to launch, and how long a pass runs depends on those bytes. With
+/// the switch a box node enters no child and any other node is missed, as in
+/// a scene with nothing in it: every ray leaves at its first test.
+///
+/// - 0: off, the node is read and tested (unset, or any other value).
+/// - 1: `VICTORY_BVH_NO_HIT=1` without `VICTORY_BVH_BUILDER=1`: the builder
+///   never runs, so every node test answers no hit, decided at translation:
+///   nothing is read, and the program asks the host for neither the
+///   directory of title memory nor the list of missing pages. (fxceless
+///   96ff1356; the idea is fork pull request #994's; trustno1 24a479d3
+///   measured about 10 ms a frame less on NVIDIA with its `VICTORY_BVH_MISS`.)
+/// - 2: `VICTORY_BVH_NO_HIT=1` with `VICTORY_BVH_BUILDER=1`: the program asks
+///   the host word `USER_STRUCTURES` whether the builder runs whole, and
+///   answers no hit (reading nothing) where it does not: never while the
+///   structures are built.
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn bvh_no_hit() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_NO_HIT.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "1") {
+            0
+        } else if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+            2
+        } else {
+            1
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to translate as with `VICTORY_BVH_COHERENT=glc`
+    /// ([`builder_coherent_glc`]).
+    pub(crate) static TEST_COHERENT_GLC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Which accesses of the ray-tracing structure builder to title memory by
+/// address go through globally coherent views (`VICTORY_BVH_COHERENT`):
+///
+/// - unset or `all`: every one (as before; false here).
+/// - `glc`: only atomics, stores, loads the console marks to miss its
+///   wave's cache (`glc` or `dlc`), and every access of a program that
+///   invalidates the console's caches itself (`buffer_gl0_inv`,
+///   `buffer_gl1_inv`, `s_gl1_inv`, `s_dcache_inv`): what the console
+///   compiler marks as reading other groups' writes (a refit climbing from
+///   children to parents). The other loads get plain views, which NVIDIA
+///   serves from the SM's L1 instead of going to L2 for each.
+///
+/// Opt-in. Part of the translation: the shader cache keys on it.
+pub fn builder_coherent_glc() -> bool {
+    #[cfg(test)]
+    if let Some(glc) = TEST_COHERENT_GLC.get() {
+        return glc;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_COHERENT").is_some_and(|v| v == "glc"))
 }
 
 /// The clean-up passes that run over a translated program before it is

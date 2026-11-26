@@ -1217,6 +1217,12 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // Whether the ray-tracing structures are built: the node tests of a
+        // program that asks (`VICTORY_BVH_NO_HIT=1` with
+        // `VICTORY_BVH_BUILDER=1`) answer no hit at 0.
+        if kind == victory_shader::emit::USER_STRUCTURES {
+            return u32::from(crate::pipeline::builder_whole_now());
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
