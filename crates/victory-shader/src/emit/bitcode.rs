@@ -326,6 +326,20 @@ impl Module {
         }
     }
 
+    /// The flags of every `dx.op.barrier` call, in order (tests).
+    #[cfg(test)]
+    pub fn barrier_modes(&self) -> Vec<u32> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.barrier" => {
+                    Some(self.int_value(args[1]).expect("constant barrier flags") as u32)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether the module declares function `name` (tests).
     #[cfg(test)]
     pub fn has_function(&self, name: &str) -> bool {

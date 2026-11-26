@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The flags of every `dx.op.barrier`, in order.
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
     pub uses_lane_index: bool,
@@ -1391,6 +1394,30 @@ pub(super) fn code_table_start(p: &Program, addresses: &[&Address], lowest: u32)
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+/// The flags of the title's `s_barrier` ([`super::group_sync`]'s `setting`): a shared-memory
+/// fence (8), a UAV fence when the program writes UAVs (2), and the wait for the group (1)
+/// unless the setting leaves it out. Automatic (3, VItoriaBr f2a20970, Rivaldo Freitas de
+/// Carvalho): without the wait only on a host whose waves are narrower than the console's, in
+/// a group of one console wave, at a barrier not every lane reaches (`divergent`); a group of
+/// several console waves keeps its cross-wave sync.
+pub(super) fn barrier_mode(
+    setting: u8,
+    host_wave: u32,
+    console_wave: u32,
+    group_threads: Option<u32>,
+    divergent: bool,
+    writes_uavs: bool,
+) -> u32 {
+    let single_console_wave = group_threads.is_some_and(|t| t <= console_wave);
+    let waits = match setting {
+        0 => false,
+        1 => !divergent,
+        2 => true,
+        _ => !(host_wave != 0 && host_wave < console_wave && single_console_wave && divergent),
+    };
+    8 | if writes_uavs { 2 } else { 0 } | u32::from(waits)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -2460,6 +2487,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            barrier_modes: self.s.m.barrier_modes(),
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
@@ -5402,17 +5431,17 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
                 // Without the wait for the group (bit 0) where not every
-                // lane arrives, or where the switch says so.
-                let waits = match super::group_sync() {
-                    0 => false,
-                    1 => !self.fence_only.contains(&b),
-                    _ => true,
-                };
-                if !waits {
-                    mode &= !1;
-                }
+                // lane arrives, as the switch says ([`barrier_mode`]).
+                let group_threads = self.s.threads.map(|t| t.iter().product());
+                let mode = barrier_mode(
+                    super::group_sync(),
+                    host_max_wave(),
+                    self.wave(),
+                    group_threads,
+                    self.fence_only.contains(&b),
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s

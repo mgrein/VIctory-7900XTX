@@ -354,3 +354,104 @@ fn wave64_permutes_check_exec_within_each_half() {
         .collect();
     run_permute(true, &body, &want);
 }
+
+/// `VICTORY_GROUP_SYNC` unset (or not a mode) is automatic; 0, 1 and 2 stay explicit.
+#[test]
+fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+    for value in [None, Some("auto"), Some(""), Some("invalid")] {
+        assert_eq!(super::parse_group_sync(value), 3);
+    }
+    for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+        assert_eq!(super::parse_group_sync(Some(value)), mode);
+    }
+}
+
+/// Automatic barriers keep their fences and lose the wait only where it is unsafe: narrower host
+/// waves than the console's, one console wave in the group, a barrier not every lane reaches
+/// (VItoriaBr f2a20970).
+#[test]
+fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
+    let mode = super::lower::barrier_mode;
+    for writes in [false, true] {
+        let fence = 8 | if writes { 2 } else { 0 };
+        for (host, console, threads, divergent, waits) in [
+            (32, 64, Some(64), true, false),
+            (32, 64, Some(64), false, true),
+            (32, 64, Some(128), true, true),
+            (32, 64, None, true, true),
+            (64, 64, Some(64), true, true),
+            (32, 32, Some(32), true, true),
+            (0, 64, Some(64), true, true),
+        ] {
+            assert_eq!(mode(3, host, console, threads, divergent, writes), fence | u32::from(waits));
+        }
+        assert_eq!(mode(0, 32, 64, Some(64), false, writes), fence);
+        assert_eq!(mode(1, 64, 64, Some(64), true, writes), fence);
+        assert_eq!(mode(1, 32, 64, Some(64), false, writes), fence | 1);
+        assert_eq!(mode(2, 32, 64, Some(64), true, writes), fence | 1);
+    }
+}
+
+/// The automatic mode's flags reach the translated program.
+#[test]
+fn automatic_barrier_flags_reach_the_emitted_shader() {
+    let divergent = [
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz past the barrier
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut divergent32 = divergent;
+    divergent32[1] = 0xBE8C_3C6A; // s_and_saveexec_b32 s12, vcc_lo
+    divergent32[4] = 0xBEFE_030C; // s_mov_b32 exec_lo, s12
+    for (body, wave64, threads, host, expected) in [
+        (&divergent[..], true, 64, 32, 8),
+        (&divergent[..], true, 128, 32, 9),
+        (&divergent[..], true, 64, 64, 9),
+        (&divergent32[..], false, 64, 32, 9),
+        (&[0xBF8A_0000][..], true, 64, 32, 9),
+    ] {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [threads, 1, 1] }),
+            code: body.iter().copied().chain([S_ENDPGM]).flat_map(u32::to_le_bytes).collect(),
+        };
+        let was = super::TEST_GROUP_SYNC.replace(Some(3));
+        let shader = lowered(&native, host);
+        super::TEST_GROUP_SYNC.set(was);
+        let (_, l) = shader.unwrap_or_else(|e| panic!("wave64={wave64}, host={host}: {e:?}"));
+        assert_eq!(l.barrier_modes, vec![expected], "wave64={wave64}, {threads} threads, host={host}");
+    }
+}
+
+/// A barrier entered by only part of a console wave completes on 32-lane hardware in automatic
+/// mode (VItoriaBr f2a20970): 1, 10, 32, 33 and 64 lanes enter it.
+#[test]
+fn an_automatic_barrier_inside_a_lane_branch_runs_on_narrow_hardware() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz over the barrier
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0293, // v_mov_b32 v0, 19
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words, true, 64, 0);
+    let was = super::TEST_GROUP_SYNC.replace(Some(3));
+    let shader = lowered(&native, 32);
+    super::TEST_GROUP_SYNC.set(was);
+    let (shader, l) = shader.expect("lower divergent barrier");
+    assert!(l.barrier_modes.iter().all(|m| m & 1 == 0), "{:?}", l.barrier_modes);
+    for below in [1, 10, 32, 33, 64] {
+        let Some(out) = run(&shader, [below, 0, 0, 0], 1) else { return };
+        assert_eq!(out[0], 19, "{below} lanes enter the barrier");
+    }
+    eprintln!("ran automatic divergent barriers on the hardware device: 1, 10, 32, 33 and 64 lanes");
+}

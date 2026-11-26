@@ -166,7 +166,14 @@ pub fn helper_own() -> bool {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset (or anything but `0`, `1`, `2`; `3` internally): automatic
+///   (VItoriaBr f2a20970). On a host whose waves are narrower than the
+///   console's (NVIDIA's 32 lanes under a wave64 program), the title's
+///   `s_barrier` in a block not every lane runs (or in a program a lane can
+///   be cut out of at the iteration limit) keeps its memory fences and loses
+///   the wait, in groups of one console wave; elsewhere, as `2`. AMD hosts
+///   (64-lane waves) and groups of several console waves keep every wait.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -178,12 +185,28 @@ pub fn helper_own() -> bool {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`group_sync`], for its thread only.
+    pub(super) static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_GROUP_SYNC` read: `0`, `1` and `2` as given, anything else (unset) 3, automatic.
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
