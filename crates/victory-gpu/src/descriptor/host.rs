@@ -1088,6 +1088,15 @@ impl Queued {
 /// others: the frame each was written in, the slot and its write's number.
 type Due = [Vec<(u64, u32, u64)>; 2];
 
+/// Whether the texture pass takes the slots it looked at before and the
+/// others in turns ([`TextureQueue::in_turns`]): `VICTORY_TEXTURE_FAIR=1`.
+/// Off unless set: a texture uploaded in part gets its next look, and so
+/// the rest of its levels, later than it does now.
+fn texture_fair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FAIR").is_some_and(|v| v == "1"))
+}
+
 /// Keeps of `slots` the `new` newest writes and the `old` oldest (all of
 /// them if there are no more), the newest first: what a full sort would
 /// have at its two ends, without sorting the 10,000 to 40,000 due slots
@@ -1170,6 +1179,46 @@ impl TextureQueue {
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         Self::in_order(self.all_due(frame), max)
+    }
+
+    /// [`TextureQueue::in_order`], or [`TextureQueue::in_turns`] with
+    /// `VICTORY_TEXTURE_FAIR=1`.
+    fn order(due: Due, max: usize, frame: u64) -> Vec<(u32, u64)> {
+        if texture_fair() { Self::in_turns(due, max, frame) } else { Self::in_order(due, max) }
+    }
+
+    /// The order of `due` in which the slots looked at before and the
+    /// others take turns: one of the first (the newest write), one of the
+    /// others (the newest and the oldest write in turns), and so on; which
+    /// of the two begins, and which end of the others, changes with
+    /// `frame`. [`TextureQueue::in_order`] hands out every slot looked at
+    /// before ahead of any other: with more of those due than a pass takes
+    /// (textures uploaded in part, or whole and looked at again), a
+    /// texture the title has just written is not reached, and a pass that
+    /// stops early for time looks at the same slots each frame (late
+    /// textures while the world streams). After DexNom/VIctory 5f4c3df4
+    /// and PR #9 (`TextureQueue::due`).
+    fn in_turns([mut again, mut fresh]: Due, max: usize, frame: u64) -> Vec<(u32, u64)> {
+        ends(&mut again, max, 0);
+        ends(&mut fresh, max.div_ceil(2), max.div_ceil(2));
+        let count = max.min(again.len() + fresh.len());
+        let (mut again, mut fresh) = (again.into_iter(), fresh.into_iter());
+        let mut retry = frame & 1 == 0;
+        let mut newest = again.len() == 0 || frame & 2 == 0;
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            let next = if again.len() > 0 && (retry || fresh.len() == 0) {
+                again.next()
+            } else {
+                let next = if newest { fresh.next() } else { fresh.next_back() };
+                newest = !newest;
+                next
+            };
+            let Some((_, index, write)) = next else { break };
+            order.push((index, write));
+            retry = !retry;
+        }
+        order
     }
 
     /// The slots due at `frame`, for [`TextureQueue::in_order`].
@@ -2167,7 +2216,7 @@ impl HostHeap {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
-        (TextureQueue::in_order(due, max), census)
+        (TextureQueue::order(due, max, frame), census)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -6814,6 +6863,44 @@ void main(uint i : SV_DispatchThreadID) { uint4 r = v[i >> 2]; uint k = i & 3; d
         // The title keeps at least LEAST_TITLE when the setting asks for all.
         let null = 999_999;
         assert!(null - capped_dynamic_slots(u32::MAX, null, Some(null)) >= LEAST_TITLE);
+    }
+
+    /// In turns, a backlog of slots looked at before does not keep the pass
+    /// from a texture written since: each pass serves both.
+    #[test]
+    fn slots_looked_at_before_and_new_ones_take_turns() {
+        let mut due = Due::default();
+        // 1,000 slots looked at before, 10 never: writes 1..=1000, 1001..=1010.
+        due[0] = (1..=1000u64).map(|w| (0, w as u32, w)).collect();
+        due[1] = (1001..=1010u64).map(|w| (0, w as u32, w)).collect();
+        // As it was: a pass of 8 never reaches a new one.
+        assert!(TextureQueue::in_order(due.clone(), 8).iter().all(|d| d.1 <= 1000));
+        for frame in 0..8u64 {
+            let order = TextureQueue::in_turns(due.clone(), 8, frame);
+            assert_eq!(order.len(), 8);
+            let new: Vec<u64> = order.iter().filter(|d| d.1 > 1000).map(|d| d.1).collect();
+            assert_eq!(new.len(), 4, "frame {frame}");
+            // Of the new, the newest and the oldest in turns; of the others, the newest.
+            assert!(new.contains(&1010) && new.contains(&1001), "frame {frame}: {new:?}");
+            assert!(order.iter().any(|d| d.1 == 1000));
+            // A pass that stops after one slot: which kind it is changes with the frame.
+            assert_eq!(order[0].1 > 1000, frame & 1 == 1, "frame {frame}");
+            // No slot twice.
+            let mut slots: Vec<u32> = order.iter().map(|d| d.0).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), 8);
+        }
+        // One kind alone is served whole, up to the most asked for.
+        let only = |k: usize| {
+            let mut one = Due::default();
+            one[k] = due[k].clone();
+            one
+        };
+        assert_eq!(TextureQueue::in_turns(only(1), 100, 3).len(), 10);
+        assert_eq!(TextureQueue::in_turns(only(0), 100, 3).len(), 100);
+        assert_eq!(TextureQueue::in_turns(due.clone(), 4096, 0).len(), 1010);
+        assert!(TextureQueue::in_turns(due.clone(), 0, 0).is_empty());
     }
 
     /// The order of the due slots with only its two ends sorted is the one
