@@ -597,6 +597,40 @@ fn sweep() {
     press(pressed, lists);
 }
 
+/// How often a submission behind flights makes a moment with nothing in the
+/// air for the sweep, with the present sent ahead ([`late_free_present`]),
+/// in milliseconds (`VICTORY_SWEEP_MS`, 1500). Each such settle waits for
+/// everything sent: a frame-sized hitch.
+fn sweep_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SWEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1500).max(1))
+}
+
+/// Whether the sweep's settle ([`sweep_ms`]) is made now, `waited` ms
+/// after the last sweep, with `(started, finished)` submissions
+/// ([`submissions`]): only when at most one is still running, so that
+/// settling costs little, else put off for up to four more periods, after
+/// which it settles whatever is in the air, as before.
+fn sweep_due((started, finished): (u64, u64), waited: u64) -> bool {
+    const PUT_OFF: u64 = 4;
+    finished + 1 >= started || waited > sweep_ms() * (1 + PUT_OFF)
+}
+
+/// Whether the sweep behind flights settles them first (on by default;
+/// `VICTORY_SWEEP_SETTLE=0`: it runs behind them, opt-in). What the sweep
+/// lets go of (shadow, texture and resource `let_go_idle`, idle host
+/// lists, spare scratch chunks) it picks by reference counts alone: a list
+/// in the air holds every copy, staging buffer and window it names until
+/// it is reset, a descriptor slot holds what it views, and a slot the
+/// title changed retires what it showed; and it hands what it picks to
+/// [`retire`], which drops nothing before every submission begun has run.
+/// What needs the card at rest is diagnostics only (`upcheck`), skipped
+/// there.
+fn sweep_settles() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_SETTLE").is_none_or(|v| v != "0"))
+}
+
 /// The number of the newest submission begun, and of the newest of which all
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
@@ -5801,15 +5835,22 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            if upcheck::on() {
-                upcheck::at_rest(self);
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_ms() {
+            if !sweep_settles() {
+                // Behind the flights: what it lets go of is retired, and
+                // dropped once they have run ([`sweep_settles`]).
+                sweep();
+                SWEPT.store(now_ms(), Ordering::Relaxed);
+            } else if sweep_due(submissions(), now_ms().saturating_sub(SWEPT.load(Ordering::Relaxed))) {
+                // With the present sent ahead nothing else brings a moment
+                // with nothing in the air: one is made for the sweep.
+                self.settle(&mut submitted, WHY_SYNC);
+                if upcheck::on() {
+                    upcheck::at_rest(self);
+                }
+                sweep();
+                SWEPT.store(now_ms(), Ordering::Relaxed);
             }
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
@@ -10767,6 +10808,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn sweep_settles_when_flights_are_few_or_late() {
+        let period = super::sweep_ms();
+        // None or one in the air: at once.
+        assert!(super::sweep_due((10, 10), period + 1));
+        assert!(super::sweep_due((10, 9), period + 1));
+        // More: put off for four more periods.
+        assert!(!super::sweep_due((10, 7), period + 1));
+        assert!(!super::sweep_due((10, 7), period * 5));
+        assert!(super::sweep_due((10, 7), period * 5 + 1));
     }
 
     #[test]
