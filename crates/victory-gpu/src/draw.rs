@@ -2675,7 +2675,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        self.buffers_written();
+        self.buffers_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -3022,7 +3022,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3512,7 +3512,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3617,7 +3617,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3631,7 +3631,8 @@ impl State {
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
-    fn buffers_written(&mut self) {
+    fn buffers_written(&mut self, list: &HostList) {
+        list.list.note_uav_work(true);
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -3640,14 +3641,16 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            list.list.note_uav_work(true);
             self.batch = None;
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
-    pub(crate) fn copied(&mut self) {
+    pub(crate) fn copied(&mut self, list: &HostList) {
+        list.list.note_uav_work(true);
         self.window = None;
         self.batch = None;
     }
@@ -3784,6 +3787,38 @@ impl State {
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        // For timing only (`indirect_trust`, unsafe): one draw or mesh
+        // record without a count runs from the title's buffer as written,
+        // with no pass of ours (no batch, no window, no clamp of its own).
+        if kind != DISPATCH && max == 1 && count.is_none() && indirect_trust() {
+            self.window = None;
+            args.refresh(list, arguments, len);
+            let ran = match kind {
+                DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                _ => self.prepare_for(list, false, true),
+            };
+            if !ran {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max 1 at {arguments:#x} (trusted)"), false));
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            if kind == MESH {
+                self.mesh_scissor(list, true);
+            }
+            // SAFETY: an open list with everything set; the host copy is kept
+            // alive by the list (`refresh`) and stays common, promoted to
+            // indirect arguments as count buffers are; the signature is cached.
+            unsafe { list.list.ExecuteIndirect(&signature, 1, &args.buffer, args.offset(arguments), None, 0) };
+            if kind == MESH {
+                self.mesh_scissor(list, false);
+            }
+            self.drew(list, Some(p));
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
@@ -3926,9 +3961,9 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written();
+            self.buffers_written(list);
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -3940,6 +3975,34 @@ impl State {
         }
         true
     }
+}
+
+/// `VICTORY_INDIRECT_TRUST=draws`, for timing only (off by default): an
+/// indirect draw or mesh dispatch of one record without a count buffer is
+/// executed from the title's argument buffer as it wrote it, with no clamp
+/// pass of ours in front of it (no batch, no window, no barrier). Dispatch
+/// records keep their clamp. Measures what the clamp passes cost: run so
+/// on the fork it came from, the title's lists took 42.8 ms of card time a
+/// frame instead of 56 (fxceless/victory-fork PR #1171, 795311ba, KyleS98).
+///
+/// UNSAFE: a record is no longer bounded nor charged to its list's budget,
+/// so a garbage slot (the title leaves all ones in some) asks the card for
+/// more than it runs before the driver resets the device, and arguments a
+/// dispatch just wrote are read with no wait. `dispatches` (and `1`, both)
+/// are refused on purpose: trusting dispatch records removed the device.
+fn indirect_trust() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_TRUST").as_deref() {
+        Ok("draws") => {
+            tracing::warn!("VICTORY_INDIRECT_TRUST=draws: indirect draws run unclamped (timing only; garbage records can reset the device)");
+            true
+        }
+        Ok(other) => {
+            tracing::warn!(value = other, "VICTORY_INDIRECT_TRUST: only `draws` is taken; indirect records stay clamped");
+            false
+        }
+        Err(_) => false,
+    })
 }
 
 /// `DispatchX`: the counts are threads (the console's dispatch initiator bit

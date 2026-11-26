@@ -275,22 +275,64 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+/// indirect counts. So does an NVIDIA card (measured, [`wide_card`]).
+/// Other cards stay at 65,535.
+///
+/// `wide` is whether the card runs them by default ([`wide_card`]).
+/// `VICTORY_INDIRECT_WIDE=1` makes every card wide, `=0` none; unset (or
+/// anything else) the card's default holds.
+fn widest(wide: bool) -> u32 {
+    match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
+        Ok("1") => 1 << 20,
+        Ok("0") => 65_535,
+        _ if wide => 1 << 20,
+        _ => 65_535,
+    }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// Whether `device`'s card runs indirect dispatches wider than 65,535
+/// groups by default ([`widest`]).
+///
+/// NVIDIA's do too: on an RTX 4070 the test
+/// `card_runs_wide_indirect_dispatches` saw every group of 67,440,
+/// 115,200 and 2^20 run once under its own number, clamped one by one and
+/// in a batch, as on AMD.
+fn wide_card(device: &ID3D12Device) -> bool {
+    amd(device) || nvidia(device)
+}
+
+/// The PCI vendor of `device`'s adapter (0: not found), looked up through
+/// DXGI once per adapter and kept: callers ask on hot paths (the clamp, the
+/// host), and a test process may hold devices of more than one adapter
+/// (WARP and the card), so the answer is kept by adapter, not once.
+fn vendor(device: &ID3D12Device) -> u32 {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: plain queries.
-    unsafe {
-        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
-            .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+    static KNOWN: std::sync::Mutex<Vec<((u32, i32), u32)>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: a plain query of a live device.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let key = (luid.LowPart, luid.HighPart);
+    if let Some(&(_, v)) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return v;
     }
+    // SAFETY: plain queries.
+    let v = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .map_or(0, |d| d.VendorId)
+    };
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).push((key, v));
+    v
+}
+
+/// Whether `device` is an AMD card's (PCI vendor 0x1002).
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x1002
+}
+
+/// Whether `device` is an NVIDIA card's (PCI vendor 0x10DE).
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x10de
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -308,7 +350,7 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(wide_card(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -441,11 +483,64 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let wait = waits_before(list);
+    let recorded = record_clamp_waiting(c, &list.list, (dst, before), budget, src, count, spec, ahead, wait);
     if recorded {
         list.indirect_readable(dst);
+        // The pass wrote the budget; with no wait after it the next pass
+        // must wait for it.
+        list.list.note_uav_work(!clamp_after_uav() || !barrier_waits());
     }
     recorded
+}
+
+/// `VICTORY_CLAMP_AFTER_UAV=0` (experiment, off by default): a clamp of
+/// one execution ([`record_clamp_as`]) ends with the move of its scratch
+/// buffer to indirect arguments alone, without the wait for every shader
+/// write before it. That move already orders the pass's writes of the
+/// scratch buffer before the executions read them; the only other buffer
+/// it writes is the list's budget, read by the next clamp alone, and that
+/// one then waits ([`waits_before`] knows the pass left writes behind).
+/// The batched pass has always ended so (`batch::record`).
+fn clamp_after_uav() -> bool {
+    #[cfg(test)]
+    if let Some((after, _)) = tests::FORCE_CLAMP_UAV.get() {
+        return after;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_AFTER_UAV").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_CLAMP_BEFORE_UAV=0` (experiment, off by default): a clamp pass
+/// leaves out its leading wait for every shader write when the list has
+/// recorded nothing that can write buffers since its last such wait
+/// (`Rec::uav_work`: dispatches, draws whose shaders store, copies into
+/// title buffers and title barriers set it, as do clamp passes that end
+/// with no wait; a barrier on every unordered access clears it). The first
+/// clamp of a recording always waits. Work recorded in the list by other
+/// paths than those is not seen, hence off by default: a missing wait
+/// lets a pass read arguments before they are written, which can hang the
+/// card.
+fn clamp_before_tracked() -> bool {
+    #[cfg(test)]
+    if let Some((_, tracked)) = tests::FORCE_CLAMP_UAV.get() {
+        return tracked;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_BEFORE_UAV").is_some_and(|v| v == "0"))
+}
+
+/// Whether a clamp pass recorded now in `list` begins with a wait for
+/// every shader write ([`clamp_before_tracked`]).
+fn waits_before(list: &HostList) -> bool {
+    /// A key of `HostList::first_use`: the first clamp since the reset.
+    const CLAMP_USE: usize = usize::MAX - 0x79;
+    if !clamp_before_tracked() {
+        return true;
+    }
+    // (Both asked: the first use is noted either way.)
+    let first = list.first_use(CLAMP_USE);
+    first || list.list.uav_work()
 }
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
@@ -457,12 +552,30 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_waiting(c, l, dst, budget, src, count, spec, ahead, true)
+}
+
+/// [`record_clamp_as`], beginning with a wait for every shader write only
+/// if `wait` ([`waits_before`]); it ends with one unless
+/// `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_waiting(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    wait: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -518,10 +631,7 @@ fn record_clamp_as(
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = barrier_waits();
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
@@ -534,10 +644,12 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    // `wait`: the leading wait ([`waits_before`]); the trailing one unless
+    // `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]).
+    let (skip_first, skip_second) = (usize::from(!waits || !wait), usize::from(!waits || !clamp_after_uav()));
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -548,8 +660,17 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
+    true
+}
+
+/// Whether clamps of one execution wait for every shader write at all
+/// (diagnostics: `VICTORY_BARRIER_TEST=indirect` leaves both waits out).
+fn barrier_waits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    return crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
     true
 }
 
@@ -604,7 +725,9 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    batch::record_waiting(c, &list.list, (&dst, before), budget, sources, jobs, waits_before(list));
+    // The pass ends with no wait for what it wrote (the budget).
+    list.list.note_uav_work(true);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -638,6 +761,13 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    thread_local! {
+        /// For this test's thread alone: `VICTORY_CLAMP_AFTER_UAV` (the
+        /// trailing wait kept) and `VICTORY_CLAMP_BEFORE_UAV=0` (the
+        /// leading one tracked), whatever the environment says.
+        pub(crate) static FORCE_CLAMP_UAV: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
@@ -2960,9 +3090,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         sig.unwrap()
     }
 
-    /// An AMD card runs every group of an indirect dispatch of more than
-    /// 65,535, each under its own number: the title's tile lists
-    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    /// An AMD or NVIDIA card runs every group of an indirect dispatch of
+    /// more than 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are asked only
+    /// with `VICTORY_INDIRECT_WIDE=1`; with `=0` none is.
     #[test]
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
@@ -2981,7 +3112,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        if widest(wide_card(&gpu.device)) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3026,6 +3157,26 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
+        }
+    }
+
+    /// The vendor of a device is its adapter's, kept per adapter: WARP is
+    /// neither AMD's nor NVIDIA's however often it is asked, and the card
+    /// beside it in the same process keeps its own answer.
+    #[test]
+    fn vendors_are_kept_per_adapter() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        for _ in 0..2 {
+            assert_eq!(vendor(&warp.device), 0x1414, "WARP is Microsoft's");
+            assert!(!amd(&warp.device) && !nvidia(&warp.device));
+        }
+        drop(warp);
+        if let Some(card) = WarpHarness::on(false) {
+            let v = vendor(&card.device);
+            assert_ne!(v, 0x1414);
+            assert_eq!((amd(&card.device), nvidia(&card.device)), (v == 0x1002, v == 0x10de));
         }
     }
 
@@ -3262,6 +3413,116 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every execution runs what it asked for");
         }
+    }
+
+    /// Batches and clamps of one execution through a host list with
+    /// `VICTORY_CLAMP_AFTER_UAV=0` and `VICTORY_CLAMP_BEFORE_UAV=0`: a pass
+    /// leaves its leading wait out only when the list recorded nothing
+    /// since the last wait for every shader write, and every execution
+    /// still runs the record it asked for, including one a dispatch of the
+    /// list wrote just before, twice (the second recording after a reset).
+    #[test]
+    fn host_list_clamps_with_fewer_waits() {
+        const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer records : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    records.Store3(0, uint3(7, 1, 1));
+}
+"#;
+        FORCE_CLAMP_UAV.set(Some((false, true)));
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let writer = compile_cs(&host.device, WRITER_CS).expect("writer shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let Some((source, ptr)) = host.shared_buffer(1024) else {
+            return;
+        };
+        for i in 0..16u32 {
+            for (w, word) in [1 + i, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+            }
+        }
+        let Some(written) = host.uav_buffer(256) else {
+            return;
+        };
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: live buffers.
+        let (hits_gpu, written_gpu) = unsafe { (hits_buf.GetGPUVirtualAddress(), written.GetGPUVirtualAddress()) };
+        let execute = |scratch: &ID3D12Resource, at: u64| {
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, at, None, 0);
+            }
+        };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            let mut expected = 0;
+            // The first pass of a recording waits; a batch leaves the budget
+            // written, so the passes after it wait too.
+            for k in 0..3u32 {
+                let (mut table, scratch) = open_batch(&list, (1, &source), &[(1, source.clone())]).unwrap();
+                assert!(list.list.uav_work(), "a batch ends with no wait");
+                for record in [k, 4 + k, k] {
+                    execute(&scratch, table.place(1, u64::from(record) * 32, 2).unwrap());
+                    expected += 1 + record;
+                }
+            }
+            // Clamps of one execution, ending with no wait of their own.
+            for record in [2u32, 9] {
+                let scratch = bound(&list, (&source, u64::from(record) * 32), None, (2, 12, 1)).unwrap();
+                assert!(list.list.uav_work(), "with VICTORY_CLAMP_AFTER_UAV=0 a clamp leaves its budget write behind");
+                execute(&scratch, 0);
+                expected += 1 + record;
+            }
+            // After a wait for every shader write: the next pass waits for
+            // nothing.
+            // SAFETY: an open list.
+            unsafe { list.list.barriers(&[uav_barrier()]) };
+            assert!(!list.list.uav_work());
+            let scratch = bound(&list, (&source, 32), None, (2, 12, 1)).unwrap();
+            execute(&scratch, 0);
+            expected += 2;
+            // Arguments a dispatch of the list writes, as the title's do:
+            // the dispatch is noted (`crate::draw`), the pass waits for it.
+            // SAFETY: an open list; the writer's root signature and
+            // pipeline; a buffer the test holds.
+            unsafe {
+                list.list.barriers(&[uav_barrier()]);
+                list.list.SetComputeRootSignature(&writer.root);
+                list.list.SetPipelineState(&writer.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, written_gpu);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.list.note_uav_work(true);
+            let (mut table, scratch) = open_batch(&list, (2, &written), &[(2, written.clone())]).unwrap();
+            execute(&scratch, table.place(2, 0, 2).unwrap());
+            expected += 7;
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every execution runs what it asked for");
+        }
+        FORCE_CLAMP_UAV.set(None);
     }
 
     /// What clamps of a frame cost on the card one by one and in batches

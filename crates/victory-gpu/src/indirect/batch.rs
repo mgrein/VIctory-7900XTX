@@ -264,10 +264,25 @@ impl Table {
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    sources: [u64; SOURCES],
+    jobs: u64,
+) {
+    record_waiting(c, l, dst, budget, sources, jobs, true);
+}
+
+/// [`record`], beginning with a wait for every shader write only if
+/// `wait` (`VICTORY_CLAMP_BEFORE_UAV=0`: the list recorded nothing since
+/// its last such wait that can write buffers, `super::waits_before`).
+pub(super) fn record_waiting(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    wait: bool,
 ) {
     let after = transition(
         dst,
@@ -277,10 +292,11 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
+        let first = [
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ];
+        l.ResourceBarrier(&first[usize::from(!wait)..]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
