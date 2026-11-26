@@ -79,16 +79,15 @@ impl Host {
     /// Waits until the host fence reaches `value`, at most `timeout`;
     /// whether it did. At once if it is there (or `value` is 0).
     pub(crate) fn wait_fence(&self, value: u64, timeout: Duration) -> bool {
-        thread_local! {
+        static EVENT: crate::local::Local<Option<HANDLE>> =
             // SAFETY: plain event creation.
-            static EVENT: Option<HANDLE> = unsafe { CreateEventW(None, false, false, None) }.ok();
-        }
+            crate::local::Local::new(|| unsafe { CreateEventW(None, false, false, None) }.ok());
         // SAFETY: our fence; the event is this thread's.
         let done = || value == 0 || unsafe { self.fence.GetCompletedValue() } >= value;
         if done() {
             return true;
         }
-        let Some(Some(event)) = EVENT.try_with(|e| *e).ok() else {
+        let Some(event) = EVENT.with(|e| *e) else {
             return false;
         };
         let until = Instant::now() + timeout;

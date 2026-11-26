@@ -422,12 +422,10 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     out
 }
 
-thread_local! {
-    /// Room to read a texture's memory into: one buffer per submitting
-    /// thread. Each texture kept its own, a second copy in memory of every
-    /// write-watched or partly mapped texture ever sampled, for the run.
-    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Room to read a texture's memory into: one buffer per submitting
+/// thread. Each texture kept its own, a second copy in memory of every
+/// write-watched or partly mapped texture ever sampled, for the run.
+static READ: crate::local::Local<std::cell::RefCell<Vec<u8>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
@@ -656,13 +654,11 @@ pub(crate) fn upload(list: &HostList, resource: This, _texture: &ID3D12Resource)
     upload_from(list, resource, 0);
 }
 
-thread_local! {
-    /// The thread records uploads for a draw that bakes from them.
-    pub(crate) static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The thread records the upload of a texture picked by index, of which
-    /// that many bytes were found mapped just now (`u64::MAX`: not asked).
-    pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
+/// The thread records uploads for a draw that bakes from them.
+pub(crate) static BAKING: crate::local::Local<std::cell::Cell<bool>> = crate::local::Local::new(|| std::cell::Cell::new(false));
+/// The thread records the upload of a texture picked by index, of which
+/// that many bytes were found mapped just now (`u64::MAX`: not asked).
+pub(crate) static PICKING: crate::local::Local<std::cell::Cell<Option<u64>>> = crate::local::Local::new(|| std::cell::Cell::new(None));
 
 /// Whether a staging buffer made for one upload of a texture picked by index
 /// is filled without asking the write watch and the guards
@@ -1571,9 +1567,7 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
-    thread_local! {
-        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
+    static READ: crate::local::Local<std::cell::RefCell<Vec<u8>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
     let len = len as usize;
     let mut print = 0u128;
     READ.with(|read| {

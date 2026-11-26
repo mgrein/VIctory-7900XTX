@@ -760,12 +760,10 @@ pub(crate) mod tests {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
-    thread_local! {
-        /// For this test's thread alone: `VICTORY_CLAMP_AFTER_UAV` (the
-        /// trailing wait kept) and `VICTORY_CLAMP_BEFORE_UAV=0` (the
-        /// leading one tracked), whatever the environment says.
-        pub(crate) static FORCE_CLAMP_UAV: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
-    }
+    /// For this test's thread alone: `VICTORY_CLAMP_AFTER_UAV` (the
+    /// trailing wait kept) and `VICTORY_CLAMP_BEFORE_UAV=0` (the
+    /// leading one tracked), whatever the environment says.
+    pub(crate) static FORCE_CLAMP_UAV: crate::local::Local<std::cell::Cell<Option<(bool, bool)>>> = crate::local::Local::new(|| std::cell::Cell::new(None));
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"

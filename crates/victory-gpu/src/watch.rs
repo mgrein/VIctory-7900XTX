@@ -280,10 +280,8 @@ impl Drop for Asking {
     }
 }
 
-thread_local! {
-    /// Room for the kernel's answer.
-    static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Room for the kernel's answer.
+static FOUND: crate::local::Local<std::cell::RefCell<Vec<usize>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
 
 /// Whether an asking walks the pages without the kernel's reset, and resets
 /// only the pages it found written after (`VICTORY_ASK_NORESET=1`; off by
@@ -1912,10 +1910,8 @@ fn rest() -> std::time::Duration {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// [`rest`], for what this thread asks.
-    static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
-}
+/// [`rest`], for what this thread asks.
+static REST_IN_TEST: crate::local::Local<std::cell::Cell<std::time::Duration>> = crate::local::Local::new(|| std::cell::Cell::new(std::time::Duration::ZERO));
 
 struct Guards {
     /// Blocks we made read-only.
@@ -2831,11 +2827,9 @@ impl Drop for Remapping {
 /// shows: odd while one is under way.
 static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-thread_local! {
-    /// This thread holds [`Remapping`]; and put blocks in
-    /// [`Guards::changing`].
-    static CHANGING: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
-}
+/// This thread holds [`Remapping`]; and put blocks in
+/// [`Guards::changing`].
+static CHANGING: crate::local::Local<std::cell::Cell<(bool, bool)>> = crate::local::Local::new(|| std::cell::Cell::new((false, false)));
 
 /// For [`again_after_change`]: to be asked before what may fail.
 pub(crate) fn changes() -> u64 {

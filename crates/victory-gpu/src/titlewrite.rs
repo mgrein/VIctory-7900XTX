@@ -79,10 +79,8 @@ fn stores_on() -> bool {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// Both, for this thread's writes.
-    pub(crate) static ON_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// Both, for this thread's writes.
+pub(crate) static ON_IN_TEST: crate::local::Local<std::cell::Cell<bool>> = crate::local::Local::new(|| std::cell::Cell::new(false));
 
 /// The runtime's own `memcpy`, `memmove` and `memset`.
 static REAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];

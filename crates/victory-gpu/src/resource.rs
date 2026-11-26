@@ -1423,9 +1423,7 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
         return placed_bytes(desc);
     }
     type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
-    thread_local! {
-        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
-    }
+    static KNOWN: crate::local::Local<std::cell::RefCell<Known>> = crate::local::Local::new(std::cell::RefCell::default);
     KNOWN.with(|known| {
         *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;

@@ -43,9 +43,7 @@ pub(crate) fn allocation_error(error: &windows::core::Error) {
     }
 }
 
-thread_local! {
-    static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+static STAGING_DEFERRED: crate::local::Local<std::cell::Cell<bool>> = crate::local::Local::new(|| std::cell::Cell::new(false));
 
 pub(crate) fn note_staging_deferred() {
     STAGING_DEFERRED.set(true);

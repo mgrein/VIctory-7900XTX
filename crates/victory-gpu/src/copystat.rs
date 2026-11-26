@@ -5,9 +5,12 @@
 //! `VICTORY_MEMORY_CATEGORIES=1` for one extra periodic line that gathers the
 //! memory categories already counted here into one approximation.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use crate::local::Local;
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -148,15 +151,18 @@ static COUNT: [Bank<COUNTERS>; BANKS] = [const { Bank([const { AtomicU64::new(0)
 #[inline]
 fn bank() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    thread_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
-    // (Asked by the allocator too: nothing here allocates.)
-    MINE.try_with(|mine| {
-        if mine.get() == usize::MAX {
-            mine.set(NEXT.fetch_add(1, Relaxed) % BANKS);
+    /// The set plus one (0: none chosen yet). Asked by the allocator too:
+    /// nothing here allocates (a plain TLS word, not `thread_local!`, whose
+    /// every access cost more than the counting it serves: `crate::local`).
+    static MINE: crate::local::Word = crate::local::Word::new();
+    match MINE.get() {
+        0 => {
+            let mine = NEXT.fetch_add(1, Relaxed) % BANKS;
+            MINE.set(mine + 1);
+            mine
         }
-        mine.get()
-    })
-    .unwrap_or(0)
+        mine => mine - 1,
+    }
 }
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1102,17 +1108,15 @@ struct Submitter {
 static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
 static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 
-thread_local! {
-    /// This thread's last submission: when it returned ([`now_us`]) and the
-    /// thread's processor time then (user, kernel).
-    static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };
-    /// The thread's processor time when its running submission was called.
-    static ENTERED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-    /// List-call nanoseconds of this thread since its last submission.
-    static OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
-    static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
+/// This thread's last submission: when it returned ([`now_us`]) and the
+/// thread's processor time then (user, kernel).
+static LEFT: Local<Cell<Option<(u64, u64, u64)>>> = Local::new(|| Cell::new(None));
+/// The thread's processor time when its running submission was called.
+static ENTERED: Local<Cell<(u64, u64)>> = Local::new(|| Cell::new((0, 0)));
+/// List-call nanoseconds of this thread since its last submission.
+static OURS: Local<Cell<u64>> = Local::new(|| Cell::new(0));
+/// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
+static UNSENT: Local<Cell<(u64, u64)>> = Local::new(|| Cell::new((0, 0)));
 
 fn thread_id() -> u32 {
     // SAFETY: a plain query.

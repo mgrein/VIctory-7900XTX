@@ -3573,17 +3573,15 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
             }
         }
     }
-    thread_local! {
-        static PLACE: Place = {
-            let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
-            Place(places.0.pop().or_else(|| {
-                (places.1 < THREADS).then(|| {
-                    places.1 += 1;
-                    places.1 - 1
-                })
-            }))
-        };
-    }
+    static PLACE: crate::local::Local<Place> = crate::local::Local::new(|| {
+        let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+        Place(places.0.pop().or_else(|| {
+            (places.1 < THREADS).then(|| {
+                places.1 += 1;
+                places.1 - 1
+            })
+        }))
+    });
     let stage = STAGE
         .get_or_init(|| {
             if std::env::var_os("VICTORY_VIEW_COPY").is_some_and(|v| v == "0") {
@@ -3615,7 +3613,7 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         })
         .as_ref()?;
     // (A thread that is ending has none any more.)
-    let place = PLACE.try_with(|p| p.0).ok().flatten()?;
+    let place = PLACE.with(|p| p.0)?;
     let kind = usize::from(sampler);
     Some(D3D12_CPU_DESCRIPTOR_HANDLE {
         ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
@@ -6271,9 +6269,7 @@ impl ListViews {
     }
 }
 
-thread_local! {
-    static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
-}
+static LIST_VIEWS: crate::local::Local<std::cell::RefCell<Option<ListViews>>> = crate::local::Local::new(|| std::cell::RefCell::new(None));
 
 /// The view the record `words` names, as this thread made it for `recording`.
 pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {

@@ -84,11 +84,10 @@ static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
 /// The calling thread's part of [`RETIRED`].
 fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, Retired)>> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    thread_local! {
-        static PART: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len();
-    }
-    // (A thread that ends may come here after its locals are gone.)
-    let part = PART.try_with(|p| *p).unwrap_or(0);
+    static PART: crate::local::Local<usize> = crate::local::Local::new(|| NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len());
+    // (A thread that ends may come here after its locals are gone: a new
+    // one is made then, which is as good.)
+    let part = PART.with(|p| *p);
     RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
 }
 
