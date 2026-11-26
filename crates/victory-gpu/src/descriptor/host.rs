@@ -268,6 +268,8 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// [`NEXT_ID`]'s number for this heap.
+    id: u64,
     /// The slots that may be in `placed` (a slot noted there is put here
     /// under its lock, and taken out when it is forgotten there; a slot
     /// another's view made stale stays, which says only "may"): a write of
@@ -1652,6 +1654,11 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// Each host heap's number, handed out in order ([`HostHeap::id`]): dynamic
+/// slots are given back to the heap that took them, and a heap made later
+/// at the same address is not that heap ([`HostHeap::release_of`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Which dynamic slots are taken, a bit each, searched a word at a time.
 ///
 /// Why: a slot at a time, a table that found no run walked the whole ring
@@ -2016,6 +2023,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2188,6 +2196,11 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// This heap's number, for [`HostHeap::release_of`].
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -3048,6 +3061,20 @@ impl HostHeap {
             self.changed.put(index);
         }
         stale
+    }
+
+    /// [`HostHeap::release`], if this is the heap that took the slots: `id`
+    /// is [`HostHeap::id`] as it was when they were taken. The title can
+    /// release the heap a list's slots came from and make another at the
+    /// same address before the list is reset; the list then names the old
+    /// heap by that address, and gave back slots of the new one that other
+    /// lists held (their tables then read whatever was made there next).
+    /// From fxceless/victory-fork PR #1324 (CwWwWwW) and
+    /// maren-halv/VIctory-DXR f906534f.
+    pub(crate) fn release_of(&self, id: u64, first: u32, n: u32) {
+        if id == self.id {
+            self.release(first, n);
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -6998,6 +7025,25 @@ void main(uint i : SV_DispatchThreadID) { uint4 r = v[i >> 2]; uint k = i & 3; d
                 }
             }
         }
+    }
+
+    /// Dynamic slots are given back only to the heap that took them: the
+    /// title can release a heap while a list still holds slots of it, and a
+    /// later heap can be made at the same address before that list is
+    /// reset.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release_of(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's number gave the slots back");
+        a.release_of(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the slots back");
     }
 
     #[test]
