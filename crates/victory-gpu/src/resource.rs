@@ -2225,39 +2225,77 @@ pub(crate) fn let_go_idle() {
         }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        // (Without its lock first: most were used lately or have none.)
-        let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        let Some(gone) = (unsafe { let_go_one(at, idle_ms, IDLE_FRAMES) }) else {
             continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
-                None
-            }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
+        went += 1;
+        bytes += gone;
+        if first.is_none() {
+            first = Some(at);
+        }
+    }
+    // On a card short of room, blocks of textures at most half full
+    // (`crate::pool::draining`): every copy in such a block goes once all of
+    // them are idle and held by nothing else, so that the block goes too,
+    // the emptiest first and a few blocks a look. What is in a block only in
+    // part stays: letting go of some would free nothing.
+    if crate::pool::draining() {
+        const DRAIN_IDLE_MS: u64 = 5_000;
+        const DRAIN_BLOCKS: usize = 4;
+        let sparse = crate::pool::sparse_blocks();
+        let held: std::collections::HashMap<usize, u64> = sparse.iter().copied().collect();
+        let mut idle: std::collections::HashMap<usize, (u64, Vec<usize>)> = std::collections::HashMap::new();
+        for &at in all.iter().filter(|_| !held.is_empty()) {
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let used = r.host.used.load(Relaxed);
+            if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, DRAIN_IDLE_MS, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+                continue;
             }
-            crate::host::retire(host);
+            let piece = {
+                let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                // (The block first: most are in none of those looked at.)
+                made.as_ref().and_then(|(host, _)| {
+                    let (block, len) = crate::pool::piece_of(&host.texture).filter(|(block, _)| held.contains_key(block))?;
+                    (std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1).then_some((block, len))
+                })
+            };
+            if let Some((block, len)) = piece {
+                let entry = idle.entry(block).or_default();
+                entry.0 += len;
+                entry.1.push(at);
+            }
+        }
+        let mut drained = 0;
+        for &(block, block_held) in &sparse {
+            if drained == DRAIN_BLOCKS {
+                break;
+            }
+            let Some((idle_bytes, ats)) = idle.get(&block) else {
+                continue;
+            };
+            if *idle_bytes < block_held {
+                continue;
+            }
+            drained += 1;
+            let mut whole = true;
+            for &at in ats {
+                // SAFETY: as above.
+                match unsafe { let_go_one(at, DRAIN_IDLE_MS, IDLE_FRAMES) } {
+                    Some(gone) => {
+                        went += 1;
+                        bytes += gone;
+                        crate::pool::DRAINED[1].fetch_add(gone, Relaxed);
+                        if first.is_none() {
+                            first = Some(at);
+                        }
+                    }
+                    None => whole = false,
+                }
+            }
+            if whole {
+                crate::pool::DRAINED[0].fetch_add(1, Relaxed);
+            }
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
@@ -2272,6 +2310,51 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// For [`let_go_idle`]: lets go of the host copy of title texture `at` if it
+/// is one the title fills, the host never copied into, nothing used for
+/// `idle_ms` and `idle_frames` frames, and only the title texture holds (no
+/// list, no slot); its bytes if it went.
+///
+/// # Safety
+/// `at` is a texture in the table, whose lock the caller holds (a texture
+/// leaves the table before it is freed, under that lock: `Drop for
+/// Resource`).
+#[cfg(windows)]
+unsafe fn let_go_one(at: usize, idle_ms: u64, idle_frames: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: the caller's.
+    let r = unsafe { &*(at as *const Resource) };
+    // (Without its lock first: most were used lately or have none.)
+    let used = r.host.used.load(Relaxed);
+    if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, idle_frames) || crate::texture::host_wrote(at) {
+        return None;
+    }
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = made.as_ref().is_some_and(|(host, _)| {
+            crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+        });
+        if idle {
+            // Under the lock: the next use must not find the staging
+            // state of the texture let go (it says "uploaded").
+            crate::texture::unstage(at as This);
+            r.host.wanted.store(u32::MAX, Relaxed);
+            made.take()
+        } else {
+            None
+        }
+    };
+    let (host, _) = gone?;
+    r.host.gone.store(true, Relaxed);
+    KINDS[2].fetch_add(1, Relaxed);
+    KINDS[3].fetch_add(host.bytes, Relaxed);
+    let bytes = host.bytes;
+    crate::host::retire(host);
+    Some(bytes)
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the

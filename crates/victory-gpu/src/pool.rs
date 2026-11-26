@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -39,11 +39,106 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`];
+/// and whether blocks are drained ([`DRAIN`]). Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let drain = on() && drain_on() && drains(memory, texture_room());
+    if drain != DRAIN.swap(drain, Ordering::Relaxed) {
+        let blocks = lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20);
+        tracing::info!(
+            "texture blocks drained (VICTORY_POOL_DRAIN): {}; the card {} MB in use of a budget of {} MB, {blocks} MB of blocks, \
+             {} MB of them held by textures",
+            if drain { "from now on" } else { "no more" },
+            memory.map_or(0, |m| m[1] >> 20),
+            memory.map_or(0, |m| m[0] >> 20),
+            HELD.load(Ordering::Relaxed) >> 20,
+        );
+    }
+    // Empty blocks past those kept go now, not when the next piece is taken.
+    if on() {
+        let now = now();
+        lock(&TEXTURES).rested(now);
+        lock(&STAGING).rested(now);
+    }
 }
+
+/// Whether the blocks of textures are being drained ([`drains`]): pieces
+/// are then cut from the fullest ripe block that has room, and the sweep
+/// (`crate::resource::let_go_idle`) lets go of every copy in a block at
+/// most half full once all of them are idle ([`sparse_blocks`]), so that
+/// the block goes. Set once a second by [`room`].
+static DRAIN: AtomicBool = AtomicBool::new(false);
+
+/// [`DRAIN`].
+pub(crate) fn draining() -> bool {
+    DRAIN.load(Ordering::Relaxed)
+}
+
+/// Whether blocks may be drained at all (`VICTORY_POOL_DRAIN=0`: never,
+/// as before). Only ever while the card is short of room ([`drains`]), so
+/// a card far from its budget (AMD's 24 GB) does as before.
+///
+/// Pieces are cut from the lowest block with room, and a copy the sweep
+/// lets go leaves a hole wherever it was: in session x16 (ray tracing on,
+/// 12 GB card) the blocks were 4,544 MB and their textures 2,636 MB, so
+/// 1.9 GB of the card's memory was blocks no texture held, while the card
+/// stood at 97.6 % of its budget (10,973 MB of 11,239). The texture queue
+/// and the sweep count that room as free (`crate::resource::room`,
+/// `crate::host::vram_keep`), so nothing gave it back, and all else the
+/// card is asked for (title buffers' copies, title memory by address,
+/// render targets) found it full.
+fn drain_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_DRAIN").is_none_or(|v| v != "0"))
+}
+
+/// The card's memory in use from which blocks are drained, in percent of
+/// its budget, and the least room in the blocks worth it.
+const DRAIN_PERCENT: u128 = 92;
+const DRAIN_LEAST: u64 = 256 << 20;
+
+/// Whether to drain blocks with the card's `memory` (budget and use) and
+/// `room` bytes of blocks no texture holds: the card at [`DRAIN_PERCENT`]
+/// of its budget or more, and [`DRAIN_LEAST`] of room or more.
+fn drains(memory: Option<[u64; 4]>, room: u64) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            u128::from(used) * 100 >= u128::from(budget) * DRAIN_PERCENT && room >= DRAIN_LEAST
+        }
+        _ => false,
+    }
+}
+
+/// Blocks of textures at most half full, and the bytes their textures'
+/// pieces hold (none empty: nothing to let go there), the emptiest first.
+pub(crate) fn sparse_blocks() -> Vec<(usize, u64)> {
+    let pool = lock(&TEXTURES);
+    let mut sparse: Vec<(usize, u64)> = pool
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.as_ref().filter(|b| b.held > 0 && b.held * 2 <= BLOCK).map(|b| (i, b.held)))
+        .collect();
+    sparse.sort_unstable_by_key(|&(i, held)| (held, i));
+    sparse
+}
+
+/// The block a texture made in one lies in, and its piece's bytes.
+pub(crate) fn piece_of(texture: &ID3D12Resource) -> Option<(usize, u64)> {
+    let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    placed.get(&(texture.as_raw() as usize)).map(|p| (p.block, p.len))
+}
+
+/// Textures in blocks, by their raw pointer, and their pieces: from their
+/// making until their last reference goes. (Its lock is never held while
+/// another is taken.)
+static PLACED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Piece>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Since the start: blocks drained (every copy in them let go) and the
+/// bytes of those copies.
+pub(crate) static DRAINED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
@@ -133,6 +228,11 @@ impl Ranges {
         Some(at)
     }
 
+    /// Whether [`Self::take`] would find a place.
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| start.next_multiple_of(align) + len <= start + size)
+    }
+
     fn give(&mut self, mut start: u64, mut len: u64) {
         if let Some((&before, &size)) = self.0.range(..start).next_back()
             && before + size == start
@@ -170,6 +270,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// Bytes of the pieces taken and not given back.
+    held: u64,
 }
 
 struct Pool<B> {
@@ -190,17 +292,20 @@ impl<B: Clone> Pool<B> {
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, false, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. Of the ripe blocks with room, the
+    /// lowest; with `fullest` ([`draining`]), the one whose pieces hold the
+    /// most, so that the emptiest are left to empty.
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        fullest: bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -210,13 +315,27 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if fullest {
+            let best = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    b.as_ref().filter(|b| ripe.is(b) && b.free.fits(len, align)).map(|b| (b.held, std::cmp::Reverse(i)))
+                })
+                .max();
+            if let Some((_, std::cmp::Reverse(i))) = best {
+                found = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align)).map(|start| (i, start));
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -248,6 +367,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.held += len;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -261,11 +381,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms(), held: 0 });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(block) = self.blocks.get_mut(piece.block).and_then(Option::as_mut) {
+            block.held = block.held.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
     }
 
@@ -331,6 +454,12 @@ pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
+/// For the memory line: bytes of the pieces textures hold now.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn held() -> u64 {
+    HELD.load(Ordering::Relaxed)
+}
+
 /// Part of a block of mapped upload memory, back in the pool when dropped.
 pub(crate) struct StagingPiece(Piece);
 
@@ -372,6 +501,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's raw pointer ([`PLACED`]).
+    texture: usize,
 }
 
 struct Methods([*const (); 3]);
@@ -408,6 +539,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&gone.texture);
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
@@ -574,7 +706,10 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw }));
+    // Before the texture holds the object: its going takes the entry out.
+    PLACED.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, piece);
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -583,6 +718,7 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&raw);
         }
     }
 }
@@ -616,7 +752,7 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), draining(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -700,6 +836,49 @@ mod tests {
     }
 
     #[test]
+    fn blocks_are_drained_only_on_a_card_short_of_room() {
+        let gib = 1u64 << 30;
+        assert!(drains(Some([100 * gib, 92 * gib, 0, 0]), DRAIN_LEAST));
+        assert!(!drains(Some([100 * gib, 91 * gib, 0, 0]), 4 * gib));
+        assert!(!drains(Some([100 * gib, 99 * gib, 0, 0]), DRAIN_LEAST - 1));
+        assert!(!drains(Some([0, 7, 0, 0]), 4 * gib));
+        assert!(!drains(None, 4 * gib));
+    }
+
+    #[test]
+    fn draining_cuts_from_the_fullest_block_and_counts_what_blocks_hold() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        // Two blocks: the first holds one piece, the second three.
+        let quarter = BLOCK / 4;
+        let a = pool.take(quarter, 65536, 0, make).unwrap().0;
+        let b = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        assert_eq!(a.block, b.block);
+        let c = pool.take(BLOCK / 2, 65536, 0, make).unwrap().0;
+        assert_ne!(c.block, a.block);
+        pool.give(b, 0);
+        assert_eq!(pool.blocks[a.block].as_ref().unwrap().held, quarter);
+        assert_eq!(pool.blocks[c.block].as_ref().unwrap().held, BLOCK / 2);
+        // Rested: both have room for a quarter; the lowest is the first, the
+        // fullest the second.
+        let lowest = pool.take_ripe(65536, 65536, REST, Ripe::ALL, false, make).unwrap().0;
+        assert_eq!(lowest.block, a.block);
+        let fullest = pool.take_ripe(65536, 65536, REST, Ripe::ALL, true, make).unwrap().0;
+        assert_eq!(fullest.block, c.block);
+        assert_eq!(pool.blocks[c.block].as_ref().unwrap().held, BLOCK / 2 + 65536);
+        // What no longer fits in the fullest goes to the other.
+        let half = pool.take_ripe(BLOCK / 2, 65536, REST, Ripe::ALL, true, make).unwrap().0;
+        assert_eq!(half.block, a.block);
+        assert_eq!(made.get(), 2);
+        assert!(!Ranges::new(1024).fits(2048, 4));
+        assert!(Ranges::new(1024).fits(1024, 4));
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
         let mut pool: Pool<u32> = Pool::new(SPARE);
         let made = std::cell::Cell::new(0);
@@ -744,7 +923,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, false, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -760,7 +939,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), false, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
@@ -828,11 +1007,16 @@ mod tests {
         assert_eq!(crate::host::references(&t), 1, "what the texture holds is no reference to it");
         let resting = || lock(&TEXTURES).resting.len();
         let before = resting();
+        let (block, len) = piece_of(&t).expect("a texture in a block is known by its block");
+        let held = || lock(&TEXTURES).blocks[block].as_ref().map_or(0, |b| b.held);
+        assert!(held() >= len);
+        let raw = t.as_raw() as usize;
         let other = t.clone();
         drop(t);
         assert_eq!(resting(), before);
         drop(other);
         assert_eq!(resting(), before + 1);
+        assert!(!PLACED.lock().unwrap().contains_key(&raw), "a texture gone is not known any more");
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
             let (piece, _, at, data) = staging(host, 4096).unwrap();

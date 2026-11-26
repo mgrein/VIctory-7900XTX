@@ -790,7 +790,14 @@ fn log_memory() {
     );
     {
         let [textures, staging] = crate::pool::memory();
-        tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let held = crate::pool::held() >> 20;
+        let [drained, drained_bytes] = [&crate::pool::DRAINED[0], &crate::pool::DRAINED[1]].map(|a| a.load(Relaxed));
+        tracing::info!(
+            "memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {held} MB of them held by textures, \
+             {staging} MB of their staging buffers; blocks drained (VICTORY_POOL_DRAIN): {} now, {drained} so far, their copies let go {} MB",
+            if crate::pool::draining() { "yes" } else { "no" },
+            drained_bytes >> 20
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
