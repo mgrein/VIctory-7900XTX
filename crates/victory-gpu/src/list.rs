@@ -1764,6 +1764,53 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Sentinel `sync` arguments carrying a queued [`crate::dxr::DxrOp`] token
+/// through `VICTORY_THIN=1`'s command stream without running DXR work on
+/// thin-translation worker threads.
+#[cfg(windows)]
+const DXR_OP_MAGIC_FLAGS: u32 = 0x5644_5852;
+#[cfg(windows)]
+const DXR_OP_MAGIC_CONTROL: u32 = 0x4458_524F;
+
+#[cfg(windows)]
+static NEXT_DXR_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(windows)]
+static THIN_DXR_OPS: std::sync::Mutex<std::collections::BTreeMap<u64, crate::dxr::DxrOp>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Attaches a native DXR operation to guest command list `this` in exact
+/// command-recording order (safe under both `VICTORY_THIN=0` and `VICTORY_THIN=1`).
+#[cfg(windows)]
+pub(crate) fn queue_dxr_op(this: This, op: crate::dxr::DxrOp) {
+    if this.is_null() {
+        return;
+    }
+    if let Some(list) = host_list(this) {
+        list.push_dxr_op(op);
+        return;
+    }
+    let token = NEXT_DXR_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut ops = THIN_DXR_OPS.lock().unwrap_or_else(|e| e.into_inner());
+        if ops.len() > 4096 {
+            let cutoff = token.saturating_sub(4096);
+            ops.retain(|&k, _| k >= cutoff);
+        }
+        ops.insert(token, op);
+    }
+    let slot_idx = if crate::device::newer() {
+        newer_slot(129)
+    } else {
+        129
+    };
+    // SAFETY: `this` is a valid guest command list COM object whose vtable has slot `slot_idx`.
+    let invoke: extern "system" fn(This, u32, u32, u64, u64) = unsafe {
+        let vtable = *(this as *const *const usize);
+        std::mem::transmute::<usize, extern "system" fn(This, u32, u32, u64, u64)>(*vtable.add(slot_idx))
+    };
+    invoke(this, DXR_OP_MAGIC_FLAGS, DXR_OP_MAGIC_CONTROL, token, 0);
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
 /// nothing between dispatches by itself: what shaders wrote is waited for
@@ -1774,6 +1821,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
+        if flags == DXR_OP_MAGIC_FLAGS && control == DXR_OP_MAGIC_CONTROL && size == 0 {
+            let op = THIN_DXR_OPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&address);
+            if let (Some(op), Some(list)) = (op, host_list(this)) {
+                list.push_dxr_op(op);
+            }
+            return;
+        }
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
