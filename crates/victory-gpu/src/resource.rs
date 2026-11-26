@@ -1697,6 +1697,20 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Whether `r`, a texture object the title made over memory it mapped
+/// itself (not a view it placed there), may be made level by level too
+/// (`crate::tiles`): `VICTORY_LEVELS_AT_ADDRESS=1`, off by default, and
+/// only with `VICTORY_LEVELS_ON_DEMAND=1`. Such a texture streams its
+/// levels in like a placed one; cool_fox 6ad1eff1 (Xyzstk, PR #30) makes
+/// them so together with a refresh of the staging buffer before the tiles
+/// are mapped, which is not here yet.
+#[cfg(windows)]
+fn streamed_at_address(r: &Resource) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    matches!(&r.backing, Backing::Address(_))
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_AT_ADDRESS").is_some_and(|v| v == "1"))
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1757,7 +1771,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if shape_fits && (r.host.placed.load(Relaxed) || streamed_at_address(r)) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -2995,7 +3009,12 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    // Not one asked for without memory of its own: a piece of a block has
+    // every level's memory, the card cuts no tiles of it, and levels on
+    // demand fell back to the old kind for every texture of at most half a
+    // block, which is nearly all of them (cool_fox 6ad1eff1, Xyzstk).
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
