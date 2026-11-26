@@ -100,10 +100,10 @@ per run (median of the last 15 five-second lines):
 
 | | before (main 85d5641) | now |
 |---|---|---|
-| World frame time | 160 ms (6.2 fps) | 79 ms (12.7 fps) |
+| World frame time | 160 ms (6.2 fps) | 74 ms (13.6 fps) |
 | Draws dropped a frame | ~850 | ~350 (4 with ray tracing on) |
-| Peak private memory | 29.5 GB | 26-27 GB |
-| Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.4-8.5 fps, 28-29 GB peak, no device loss in 10 min |
+| Peak private memory | 29.5 GB | 25-26 GB |
+| Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.0-8.5 fps, 28-29 GB peak, no device loss in 10 min |
 | Device losses in 10-minute runs | none | none |
 | Render queue (`VICTORY_REFLEX=1`, driver-measured) | not available | 0.2 ms |
 
@@ -130,7 +130,14 @@ described where it is read):
   every 4 ms on a high-priority thread, a frame-wait race fixed; optional
   NVIDIA Reflex (`VICTORY_REFLEX=1`) and pacing after the present
   (`VICTORY_PACE_AFTER=1`).
-- **Frame time**: thin LTO with x86-64-v3, thread pools sized to the CPU, small
+- **The threads that translate lists** keep the views they make in a CPU-only
+  heap of their own and copy them when the same view comes again
+  (`VICTORY_VIEW_COPIES`): on NVIDIA making a view costs far more than copying
+  one. Copies of views' own bytes are pieces of shared 32 MiB buffers
+  (`VICTORY_EXACT_ARENA`), not a committed buffer each: on a host without raw
+  twins (NVIDIA's capped heap) there are thousands a frame. Diagnostics
+  counters reach one thread-local value per call.
+- **Frame time**: thin LTO with x86-64-v3 (also for a windows-gnu toolchain), thread pools sized to the CPU, small
   title buffers' copies in the card's memory, the submission's list resets on
   a thread of ours.
 
