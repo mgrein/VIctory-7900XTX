@@ -3298,14 +3298,19 @@ impl HostHeap {
         if host().is_none() {
             return;
         }
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // SAFETY: a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let Some((first, elements)) = raw_within(width, offset, len) else {
+            once!(offset, len, width, "raw buffer view past its buffer left null");
+            return self.null_raw_at(index);
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
@@ -3337,13 +3342,18 @@ impl HostHeap {
         if host().is_none() {
             return;
         }
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // SAFETY: a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let Some((first, elements)) = raw_within(width, offset, len) else {
+            once!(offset, len, width, "raw unordered buffer view past its buffer left null");
+            return self.null_raw_uav_at(index);
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
@@ -4744,6 +4754,20 @@ fn slot_raw_desc(buffer: &ID3D12Resource, gpu: u64, size: u32) -> Option<D3D12_S
     raw_span(offset, width, size).map(|(first, elements)| raw_desc(first, elements))
 }
 
+/// The first dword and the dwords of a raw view of `len` bytes from byte
+/// `offset` of a buffer of `width` bytes ([`HostHeap::raw_at`],
+/// [`HostHeap::raw_uav_at`]), kept inside the buffer: a description that
+/// runs past it is an invalid call, and what a refused creation leaves in
+/// the slot is undefined. The start is never moved (a view of the buffer's
+/// tail is not what was asked for): `None` if no dword from it on is in
+/// the buffer. A length under a dword is one element, as before. (From
+/// fxceless/victory-fork PR #1266, lichenlang89.)
+fn raw_within(width: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+    let (first, dwords) = (offset / 4, width / 4);
+    let left = dwords.checked_sub(first).filter(|&left| left > 0)?;
+    Some((first, (len / 4).max(1).min(left).min(u64::from(u32::MAX)) as u32))
+}
+
 /// [`slot_raw_desc`]'s first dword and dwords for a constant buffer of
 /// `size` bytes `offset` bytes into a buffer of `width` bytes.
 fn raw_span(offset: u64, width: u64, size: u32) -> Option<(u64, u32)> {
@@ -5693,6 +5717,25 @@ mod tests {
         assert_eq!(raw_span(8, 4096, 64), None, "off 16 bytes");
         assert_eq!(raw_span(4096, 4096, 64), None, "past the end");
         assert_eq!(raw_span(0, 2, 64), None, "no whole dword");
+    }
+
+    /// A raw view of a root buffer stays inside its buffer, and one that
+    /// begins past it is none (after fxceless/victory-fork PR #1266).
+    #[test]
+    fn raw_views_stay_inside_their_buffer() {
+        assert_eq!(raw_within(1024, 0, 256), Some((0, 64)));
+        assert_eq!(raw_within(1024, 768, 512), Some((192, 64)), "the length is cut");
+        assert_eq!(raw_within(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(raw_within(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(raw_within(100, 112, 16), None, "never the tail");
+        assert_eq!(raw_within(100, 96, 16), Some((24, 1)), "the last dword");
+        assert_eq!(raw_within(0, 0, 16), None, "an empty buffer");
+        assert_eq!(raw_within(3, 0, 16), None, "no whole dword");
+        assert_eq!(raw_within(1024, 0, 0), Some((0, 1)), "one element at least, as before");
+        assert_eq!(raw_within(1024, u64::MAX, 16), None);
+        assert_eq!(raw_within(1024, 0, u64::MAX), Some((0, 256)));
+        let far = (u64::from(u32::MAX) + 10) * 16;
+        assert_eq!(raw_within(1 << 40, far, 64), Some((far / 4, 16)), "a start past 32 bits is kept");
     }
 
     /// A 2-D texture's view as an array of one is rebased as a plain one is,
