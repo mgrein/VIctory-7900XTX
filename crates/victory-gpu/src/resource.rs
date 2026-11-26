@@ -1956,11 +1956,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
     match memory {
         // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
+        // (`crate::shadow::card_room_kept`), for the render targets a
+        // world makes in its first frame ([`targets_room_kept`]) and for
+        // native acceleration structures ([`dxr_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
+                + dxr_room_kept()
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -1997,6 +2001,39 @@ pub(crate) fn targets_room_kept() -> u64 {
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// The bytes of the card's memory the texture queue and the sweep leave
+/// free for the slabs of native acceleration structures not made yet
+/// (`crate::dxr`, `VICTORY_NATIVE_RT=1`; none without it):
+/// `VICTORY_CARD_ROOM_FOR_DXR_MB` (1,024; 0: none, as before; at most
+/// 4,096) less what the slabs hold now, so the room comes back to the
+/// textures as the structures are built. The slabs are made with no room
+/// test, moments after the streamed textures have filled the card to its
+/// line, and what does not fit is moved to the PC's memory by the system.
+/// (After VIctory-DXR ce8d4588, whose figure is 1,536 for a 16 GB card.)
+#[cfg(windows)]
+pub(crate) fn dxr_room_kept() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        if !crate::dxr::enabled() {
+            return 0;
+        }
+        let most = dxr_room_from(std::env::var("VICTORY_CARD_ROOM_FOR_DXR_MB").ok().as_deref());
+        tracing::info!(
+            "{} MB of the card are kept free of streamed textures for native acceleration structures (VICTORY_CARD_ROOM_FOR_DXR_MB)",
+            most >> 20
+        );
+        most
+    });
+    most.saturating_sub(crate::dxr::dxr_slab_bytes())
+}
+
+/// [`dxr_room_kept`]'s most, in bytes, as `VICTORY_CARD_ROOM_FOR_DXR_MB`
+/// says it.
+#[cfg(any(windows, test))]
+fn dxr_room_from(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).map_or(1024, |mb| mb.min(4096)) << 20
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2302,7 +2339,8 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept()
+                + dxr_room_kept();
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -5171,5 +5209,14 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(r.host.refused.load(Relaxed) && !retrying(image) && !host_waits(image));
         assert!(hosted(image, true).is_none());
         resource_release(image);
+    }
+
+    #[test]
+    fn the_room_kept_for_acceleration_structures_is_bounded() {
+        assert_eq!(dxr_room_from(None), 1024 << 20);
+        assert_eq!(dxr_room_from(Some("0")), 0);
+        assert_eq!(dxr_room_from(Some(" 768 ")), 768 << 20);
+        assert_eq!(dxr_room_from(Some("999999")), 4096 << 20);
+        assert_eq!(dxr_room_from(Some("no")), 1024 << 20);
     }
 }

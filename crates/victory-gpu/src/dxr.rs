@@ -567,10 +567,21 @@ impl<B: Clone> SlabAllocator<B> {
     }
 }
 
+/// The bytes of every slab made for acceleration structures ([`dxr_slab_bytes`]).
+static DXR_SLAB_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of the card's memory the slabs of native acceleration
+/// structures hold (slabs are never given back): what
+/// `crate::resource::dxr_room_kept` takes off the room it keeps for them.
+pub(crate) fn dxr_slab_bytes() -> u64 {
+    DXR_SLAB_BYTES.load(Ordering::Relaxed)
+}
+
 impl SlabAllocator<ID3D12Resource> {
     fn alloc(&mut self, host: &Host, size: u64) -> Option<(ID3D12Resource, SlabSlice, u64)> {
         self.alloc_with(size, |slab_size, slab_idx| {
             let buffer = create_as_slab(host, slab_size, slab_idx)?;
+            DXR_SLAB_BYTES.fetch_add(slab_size, Ordering::Relaxed);
             // SAFETY: live committed buffer resource.
             let gpu_base = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, gpu_base))
