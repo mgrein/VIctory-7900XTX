@@ -28,8 +28,11 @@ use windows::core::Interface;
 
 use crate::host::host;
 
-/// Views a thread keeps at most.
-const SLOTS: u32 = 16384;
+/// Views a thread keeps at most: a heavy area makes some 12,000 distinct
+/// views a frame on each of four translating threads, and keeps them for
+/// [`KEEP_FRAMES`] turns, in a heap the card does not see (32 bytes a view
+/// on NVIDIA). With 16,384 the slots ran out within a turn.
+const SLOTS: u32 = 65536;
 
 /// Turns of [`turn`] a kept view nobody asks for stays.
 const KEEP_FRAMES: u64 = 2;
@@ -51,8 +54,10 @@ pub(crate) fn on() -> bool {
 }
 
 /// Since the last frame line: views copied from one kept, views made and
-/// kept, views let go, and views made in place (no slot was free).
-pub(crate) static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// kept, views let go, views made in place (no slot was free), and of the
+/// views made and kept, constant buffer views and other buffer views (the
+/// rest are of textures, or null ones).
+pub(crate) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// What a view is made of: the kind of view and its dimension, the resource
 /// (none: 0), and the description's fields that count for that dimension.
@@ -67,6 +72,28 @@ impl std::hash::Hash for Key {
         state.write_usize(self.resource);
         for pair in self.words.chunks_exact(2) {
             state.write_u64(u64::from(pair[0]) | u64::from(pair[1]) << 32);
+        }
+    }
+}
+
+/// What a view made and kept was ([`Key::kind`]).
+enum Made {
+    Constant,
+    Buffer,
+    Other,
+}
+
+impl Key {
+    fn kind(&self) -> Made {
+        let w = self.words[0];
+        if w & 0xff00_0000 == CBV {
+            Made::Constant
+        } else if w & OWN == 0 && w & 0xffff == 1 {
+            // (Buffer is dimension 1 of shader resource and unordered access
+            // views both.)
+            Made::Buffer
+        } else {
+            Made::Other
         }
     }
 }
@@ -213,6 +240,10 @@ struct Copies {
     free: Vec<u32>,
     next: u32,
     frame: u64,
+    /// The turn in which every slot was found taken by a view asked for in
+    /// it: until the next, a view not kept is made in place with no look
+    /// for a slot to free.
+    full: Option<u64>,
     kept: std::collections::HashMap<Key, Kept, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
@@ -239,6 +270,7 @@ impl Copies {
                 free: Vec::new(),
                 next: 0,
                 frame: turn(),
+                full: None,
                 kept: Default::default(),
             })
         }
@@ -283,9 +315,19 @@ impl Copies {
             self.next += 1;
             return Some(self.next - 1);
         }
-        // Full: the views not asked for this turn go.
+        // Full: the views not asked for this turn go. If none did, none will
+        // before the next turn: the pass over every view kept is not made
+        // again for each view asked for (2% of the translating threads' time
+        // in a heavy area, 2026-11-26, at some 20 us a pass).
+        if self.full == Some(self.frame) {
+            return None;
+        }
         self.let_go_before(self.frame);
-        self.free.pop()
+        let slot = self.free.pop();
+        if slot.is_none() {
+            self.full = Some(self.frame);
+        }
+        slot
     }
 }
 
@@ -364,6 +406,11 @@ pub(crate) fn through(
                 make(to);
                 c.kept.insert(key, Kept { slot, used: frame, resource: resource.cloned() });
                 COUNTS[1].fetch_add(1, Relaxed);
+                match key.kind() {
+                    Made::Constant => COUNTS[4].fetch_add(1, Relaxed),
+                    Made::Buffer => COUNTS[5].fetch_add(1, Relaxed),
+                    Made::Other => 0,
+                };
                 to
             }
         };
@@ -393,15 +440,17 @@ pub(crate) fn kept() -> usize {
 
 /// The frame line's words on kept views; nothing if no thread kept any.
 pub(crate) fn line(frames: f64) {
-    let [copied, made, gone, in_place] = [0, 1, 2, 3].map(|i| COUNTS[i].swap(0, Relaxed));
+    let [copied, made, gone, in_place, constant, buffer] = [0, 1, 2, 3, 4, 5].map(|i| COUNTS[i].swap(0, Relaxed));
     if copied + made + in_place == 0 {
         return;
     }
     tracing::info!(
         "views per frame on the threads that translate lists (VICTORY_VIEW_COPIES): {:.0} copied from one kept, {:.0} made \
-         and kept, {:.0} let go, {:.1} made in place (no room)",
+         and kept ({:.0} constant buffer views, {:.0} other buffer views), {:.0} let go, {:.1} made in place (no room)",
         copied as f64 / frames,
         made as f64 / frames,
+        constant as f64 / frames,
+        buffer as f64 / frames,
         gone as f64 / frames,
         in_place as f64 / frames
     );
@@ -567,5 +616,43 @@ mod tests {
         assert_eq!(c.kept.len(), 1, "the one asked for stays");
         assert_eq!(refs(&buffer), 2);
         assert_eq!(c.free.len(), 2, "their slots are free again");
+    }
+
+    /// With every slot taken by a view asked for this turn, a view asked for
+    /// finds no slot after one pass over the views kept, not one pass each;
+    /// in the next turn the views not asked for again go as before. Prints
+    /// what each costs.
+    #[test]
+    fn a_full_turn_looks_for_room_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let buffer = host.uav_buffer(1 << 12).expect("a buffer");
+        let Some(mut c) = Copies::new() else { return };
+        let key = |n: u64| cbv_key(Some(&buffer), &D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: n * 256, SizeInBytes: 256 });
+        let mut n = 0u64;
+        while let Some(slot) = c.take_slot() {
+            c.kept.insert(key(n), Kept { slot, used: c.frame, resource: None });
+            n += 1;
+        }
+        assert_eq!(n, u64::from(SLOTS));
+        assert_eq!(c.full, Some(c.frame));
+        // What the pass costs, as each view asked for made it before.
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            c.let_go_before(c.frame);
+        }
+        let pass = started.elapsed().as_secs_f64() * 1e9 / 100.0;
+        let started = std::time::Instant::now();
+        for _ in 0..100_000 {
+            assert!(c.take_slot().is_none());
+        }
+        let now = started.elapsed().as_secs_f64() * 1e9 / 100_000.0;
+        eprintln!("a view asked for with every slot taken this turn: {now:.1} ns, {pass:.0} ns with a pass over the {n} views kept");
+        // The next turn looks again: the views not asked for in it go.
+        c.frame += 1;
+        c.kept.get_mut(&key(0)).unwrap().used = c.frame;
+        assert!(c.take_slot().is_some(), "the views not asked for this turn went");
+        assert_eq!(c.kept.len(), 1);
     }
 }
