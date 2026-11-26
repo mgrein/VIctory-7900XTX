@@ -75,8 +75,10 @@ pub(crate) fn draining() -> bool {
     DRAIN.load(Ordering::Relaxed)
 }
 
-/// Whether blocks may be drained at all (`VICTORY_POOL_DRAIN=0`: never,
-/// as before). Only ever while the card is short of room ([`drains`]), so
+/// Whether blocks may be drained at all (`VICTORY_POOL_DRAIN=1`; off by
+/// default: in runs x18/x20 on an RTX 4070 with ray tracing it drained
+/// nothing, placing pieces in the fullest block cost the card time, 6.1
+/// against 8.5 fps, and peak private memory was 30.0 against 28.2 GB). Only ever while the card is short of room ([`drains`]), so
 /// a card far from its budget (AMD's 24 GB) does as before.
 ///
 /// Pieces are cut from the lowest block with room, and a copy the sweep
@@ -90,7 +92,7 @@ pub(crate) fn draining() -> bool {
 /// render targets) found it full.
 fn drain_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_DRAIN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_DRAIN").is_some_and(|v| v == "1"))
 }
 
 /// The card's memory in use from which blocks are drained, in percent of
