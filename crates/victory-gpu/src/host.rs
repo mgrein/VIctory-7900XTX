@@ -5892,17 +5892,40 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            // (What of the spans lies between their copies' refreshed ranges,
+            // for the frame line.)
+            #[cfg(feature = "diagnostics")]
+            let mut exact: ByCopy<Vec<(usize, usize)>> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && shadow.asked_ahead()
                     {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                        // Inside the copy: a refresh asks about nothing past
+                        // it (`Shadow::update` keeps to the copy).
+                        let (start, size) = shadow.span();
+                        let from = (*address).max(start as usize);
+                        let to = (*address + *len).min((start + size) as usize);
+                        if from >= to {
+                            continue;
+                        }
+                        let span = spans.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert((from, to));
+                        *span = (span.0.min(from), span.1.max(to));
+                        #[cfg(feature = "diagnostics")]
+                        exact.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((from, to));
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            for mut ranges in exact.into_values() {
+                ranges.sort_unstable();
+                let span = ranges.iter().map(|r| r.1).max().unwrap_or(0) - ranges[0].0;
+                let (mut covered, mut end) = (0, 0);
+                for (a, b) in ranges {
+                    covered += b.saturating_sub(a.max(end));
+                    end = end.max(b);
+                }
+                crate::watch::span_slack(((span - covered) >> 10) as u64);
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             #[cfg(feature = "diagnostics")]
@@ -7802,7 +7825,9 @@ fn split_line(frames: f64) {
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
-         written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
+         written, {:.0} askings refused; {:.0} MB walked between the ranges a submission asked about together, VICTORY_ASK_GAP, {:.0} MB of the copies' spans asked \
+         about between their refreshed ranges; refused runs \
+         split where allocations begin, VICTORY_ASK_ENDS); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
          as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
@@ -7811,6 +7836,8 @@ fn split_line(frames: f64) {
         a[11] / 1e6,
         a[12],
         a[10],
+        a[13] / 1024.0,
+        a[14] / 1024.0,
         a[9],
         a[2],
         a[3],
