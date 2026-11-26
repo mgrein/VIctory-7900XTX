@@ -117,6 +117,16 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
+/// The hashes of the shaders of `p` translated in an approximate form
+/// (`HostShader::approximate`); empty when none is (or none is translated).
+pub(crate) fn approximate(p: &Pending) -> Vec<String> {
+    p.shaders
+        .iter()
+        .filter(|s| s.translated().is_some_and(|t| t.host.approximate))
+        .map(|s| s.hash.clone())
+        .collect()
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 

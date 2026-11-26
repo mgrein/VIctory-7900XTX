@@ -338,6 +338,27 @@ pub(crate) fn builder_runs() -> bool {
         return true;
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    // A stage translated in an approximate form counts as missing too (unless
+    // `VICTORY_BVH_APPROXIMATE=1`, `victory_shader::emit::approximate_allowed`): what
+    // it writes feeds the next stage's store offsets (per-half-wave builder programs lost
+    // the device within two minutes on an RTX 4070 SUPER, Marvisak #2711). Translation
+    // already keeps the builder's programs out of those forms; this is for a translation
+    // that took one all the same.
+    let approximate: Vec<String> = if victory_shader::emit::approximate_allowed() {
+        Vec::new()
+    } else {
+        b.pipelines.iter().flat_map(|p| make::approximate(p)).collect()
+    };
+    if !approximate.is_empty() {
+        b.off = b.pipelines.len();
+        tracing::warn!(
+            approximate = approximate.len(),
+            of = b.pipelines.len(),
+            which = ?approximate,
+            "the ray-tracing structure builder stays off: some of its programs translated only approximately (VICTORY_BVH_APPROXIMATE=1 runs it anyway)"
+        );
+        return false;
+    }
     if !missing.is_empty() {
         b.off = b.pipelines.len();
         tracing::warn!(

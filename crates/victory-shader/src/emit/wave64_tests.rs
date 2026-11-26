@@ -19,7 +19,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// the result to dword 0 of the raw UAV.
 /// `skip`: the branch past the body when no thread is below s0: `s_cbranch_execz`, or
 /// `s_cbranch_scc0` on the SCC `s_and_saveexec` sets ("some lane is left").
-fn program(skip: u32) -> NativeProgram {
+pub(super) fn program(skip: u32) -> NativeProgram {
     let mut words = vec![
         0x7E0A_0281, // v_mov_b32 v5, 1
         0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
@@ -142,6 +142,7 @@ fn lowered_counted(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        approximate: false,
     })
 }
 
@@ -281,6 +282,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        approximate: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -740,7 +742,7 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
 /// every lane of that wave, where the two host waves cannot meet. `v_mbcnt` (stored past the
 /// first 128 dwords) makes the program read lanes. `read`: the VGPR the first-lane read takes
 /// (9: the wave's value; 1: the lane's number).
-fn wave_number_program(read: u8) -> NativeProgram {
+pub(super) fn wave_number_program(read: u8) -> NativeProgram {
     native_of(
         &[
             0x3404_0082, // v_lshlrev_b32 v2, 2, v0
@@ -844,6 +846,7 @@ fn lowered_live(native: &NativeProgram, p: &ir::Program) -> Result<HostShader, S
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        approximate: false,
     })
 }
 

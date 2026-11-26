@@ -75,6 +75,9 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_BVH_APPROXIMATE",
+            "VICTORY_WAVE_SAME",
+            "VICTORY_WAVE_LIVE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -176,7 +179,9 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// The entry format: `VSH2` added whether the translation is approximate
+/// (`HostShader::approximate`, a word after the root-indexed views).
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -267,6 +272,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, u32::from(s.approximate));
     out
 }
 
@@ -335,6 +341,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let approximate = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,6 +356,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        approximate,
     })
 }
 
@@ -379,6 +391,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            approximate: false,
         }
     }
 
@@ -403,12 +416,17 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        // Whether it is approximate comes back too.
+        let approximate = HostShader { approximate: true, ..shader() };
+        assert_eq!(decode(&encode(&approximate)), Some(approximate));
+        assert_eq!(decode(&encode(&shader())), Some(shader()));
 
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());

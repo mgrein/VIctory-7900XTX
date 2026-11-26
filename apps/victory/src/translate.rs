@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// Emitted programs by the form they took (`emit::take_form`), and
+    /// "refused" for those emission stopped.
+    forms: BTreeMap<&'static str, usize>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -134,6 +137,9 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        for (form, n) in other.forms {
+            *self.forms.entry(form).or_default() += n;
+        }
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -239,7 +245,12 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    filter: Option<String>,
 ) -> Result<()> {
+    // `--filter`: those containers alone (as `VICTORY_TRANSLATE_ONLY`, and by digest too).
+    if let Some(filter) = filter {
+        let _ = FILTER.set(filter.split(',').map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty()).collect());
+    }
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
@@ -390,8 +401,19 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    // The forms emitted programs took, the plain translation first: on a host of 32-lane
+    // waves, how many console wave64 programs needed which retry, how many are APPROXIMATE
+    // and how many kept 64 lanes.
+    let mut forms: Vec<_> = t.forms.into_iter().collect();
+    forms.sort_by_key(|&(form, n)| (form != "exact", form == "refused", std::cmp::Reverse(n)));
+    let forms: Vec<String> = forms.iter().map(|(form, n)| format!("{form} {n}")).collect();
+    println!("forms        {}", forms.join(", "));
     Ok(())
 }
+
+/// `translate --filter <hash or digest>[,...]`: the containers whose hash (the 16 hex digits a
+/// run's log names a shader by) or container digest (32 hex digits) starts with one of these.
+static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
@@ -482,9 +504,17 @@ fn translate(
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    let filter = FILTER.get().filter(|f| !f.is_empty());
+    let parsed = Container::parse(&bytes);
+    if let Some(filter) = filter {
+        let digest = parsed.as_ref().map(|c| format!("{:032x}", u128::from_be_bytes(c.digest))).unwrap_or_default();
+        if !filter.iter().any(|f| hash.starts_with(f.as_str()) || !digest.is_empty() && digest.starts_with(f.as_str())) {
+            return;
+        }
+    }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
+    let Ok(container) = parsed else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let Some(dxil) = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC)).map(|p| p.data) else {
@@ -605,7 +635,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    let emitted = emit::emit(container, &p, &program, &s, &i, &r);
+                    let form = emit::take_form();
+                    *t.forms.entry(if emitted.is_ok() { form } else { "refused" }).or_default() += 1;
+                    // (with `--list`, the programs that took another form than the plain one)
+                    if t.list && emitted.is_ok() && form != "exact" {
+                        t.lines.push(format!("{}  form {form}", label()));
+                    }
+                    match emitted {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;

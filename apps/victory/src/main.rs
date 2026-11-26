@@ -95,6 +95,11 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Only the containers whose hash (16 hex digits, as a run's log
+        /// names them) or container digest (32) starts with one of these,
+        /// comma-separated.
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Translate every shader found (as `translate` finds them) into the
     /// shader cache, so that no run has to: a few minutes, once per change
@@ -199,6 +204,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            filter,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -211,7 +217,7 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, filter)
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
