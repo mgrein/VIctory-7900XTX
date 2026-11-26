@@ -60,6 +60,10 @@ pub(crate) fn in_place_on() -> bool {
 /// host without raw twins (`VICTORY_PORT_CBV_SLOT=1` with the port; off by
 /// default; `victory_shader::emit::constants_in_slot`): then the host makes
 /// every slot that shows a constant buffer a raw view of its bytes.
+/// NOT SAFE YET: run xh10 (RTX 4070) lost the device with an invalid call
+/// 105 s in, while the heap's buffer views were made; the raw view made
+/// per draw in `HostHeap::constant_at` is as long as the constant buffer
+/// rounded up to 256 bytes, which can reach past the end of its buffer.
 pub(crate) fn in_slot() -> bool {
     victory_shader::emit::constants_in_slot()
 }
