@@ -281,16 +281,38 @@ fn widest(amd: bool) -> u32 {
     if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// The PCI vendor of `device`'s adapter (0: not found), looked up through
+/// DXGI once per adapter and kept: callers ask on hot paths (the clamp, the
+/// host), and a test process may hold devices of more than one adapter
+/// (WARP and the card), so the answer is kept by adapter, not once.
+fn vendor(device: &ID3D12Device) -> u32 {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: plain queries.
-    unsafe {
-        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
-            .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+    static KNOWN: std::sync::Mutex<Vec<((u32, i32), u32)>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: a plain query of a live device.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let key = (luid.LowPart, luid.HighPart);
+    if let Some(&(_, v)) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return v;
     }
+    // SAFETY: plain queries.
+    let v = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .map_or(0, |d| d.VendorId)
+    };
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).push((key, v));
+    v
+}
+
+/// Whether `device` is an AMD card's (PCI vendor 0x1002).
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x1002
+}
+
+/// Whether `device` is an NVIDIA card's (PCI vendor 0x10DE).
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x10de
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -3026,6 +3048,26 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
+        }
+    }
+
+    /// The vendor of a device is its adapter's, kept per adapter: WARP is
+    /// neither AMD's nor NVIDIA's however often it is asked, and the card
+    /// beside it in the same process keeps its own answer.
+    #[test]
+    fn vendors_are_kept_per_adapter() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        for _ in 0..2 {
+            assert_eq!(vendor(&warp.device), 0x1414, "WARP is Microsoft's");
+            assert!(!amd(&warp.device) && !nvidia(&warp.device));
+        }
+        drop(warp);
+        if let Some(card) = WarpHarness::on(false) {
+            let v = vendor(&card.device);
+            assert_ne!(v, 0x1414);
+            assert_eq!((amd(&card.device), nvidia(&card.device)), (v == 0x1002, v == 0x10de));
         }
     }
 
