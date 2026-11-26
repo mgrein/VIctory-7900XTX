@@ -1298,8 +1298,14 @@ fn consider_cold(first: usize, last: usize, written: &[(usize, u16)]) -> Option<
     }
     install();
     {
+        // Not the blocks the kernel writes now or the runtime is changing
+        // ([`Guards::left_alone`]): read-only, a file read into them would
+        // fail. They stay open and not clean, told as written at every
+        // asking until one can guard them.
         let mut g = guards_timed();
-        protect(&mut g, first, last);
+        for (from, to) in open_runs(&g, first, last) {
+            protect(&mut g, from, to);
+        }
     }
     // What was written since the asking that called: noted with it.
     let caught = kernel_written(first, last).unwrap_or_else(|| (first..last).map(|page| (page, WHOLE)).collect());
@@ -1316,6 +1322,25 @@ fn consider_cold(first: usize, last: usize, written: &[(usize, u16)]) -> Option<
         "a write-watched range found almost untouched goes to the guards (VICTORY_COLD_GUARDS=0 keeps it with the kernel)"
     );
     Some(caught)
+}
+
+/// The runs of blocks `[first, last)` that are not left alone
+/// ([`Guards::left_alone`]), in order.
+fn open_runs(g: &Guards, first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut from = first;
+    for block in first..last {
+        if g.left_alone(block) {
+            if from < block {
+                runs.push((from, block));
+            }
+            from = block + 1;
+        }
+    }
+    if from < last {
+        runs.push((from, last));
+    }
+    runs
 }
 
 /// The title frees `[first, last)` (pages): the ranges kept by the guards
@@ -3004,6 +3029,40 @@ mod tests {
         // Nothing written since: nothing new.
         let (later, again) = writes(start, end, true).expect("guarded");
         assert!(again.iter().all(|&(_, w)| w < later));
+        title_memory_freed(start, SIZE);
+        assert!(!cold_overlaps(start / PAGE, end / PAGE), "forgotten");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A range going to the guards while the kernel writes part of it (a
+    /// file read) leaves that part writable, told as written at every
+    /// asking, and guards it at the first asking after.
+    #[test]
+    fn a_range_going_cold_leaves_alone_what_the_kernel_writes() {
+        const SIZE: usize = 32 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + SIZE);
+        let (read_from, read_to) = (start + 3 * PAGE, start + 5 * PAGE);
+        let reading = kernel_writing(read_from, read_to - read_from);
+        for _ in 0..COLD_STREAK {
+            writes(start, end, true).expect("watched");
+        }
+        assert!(cold_overlaps(start / PAGE, end / PAGE), "the range is cold");
+        assert!(!guarded(read_from, read_to), "what the kernel writes stays writable");
+        assert!(guarded(start, read_from) && guarded(read_to, read_to + PAGE), "the rest is guarded");
+        // SAFETY: committed memory of ours, writable.
+        unsafe { ((read_from + 100) as *mut u8).write_volatile(7) };
+        let (now, written) = writes(start, end, true).expect("cold");
+        assert!(written.contains(&(read_from / PAGE, now)), "{written:?}");
+        assert!(written.contains(&(read_from / PAGE + 1, now)), "{written:?}");
+        drop(reading);
+        writes(start, end, true).expect("cold");
+        assert!(guarded(read_from, read_to), "guarded once the kernel is done");
         title_memory_freed(start, SIZE);
         assert!(!cold_overlaps(start / PAGE, end / PAGE), "forgotten");
         // SAFETY: our allocation.
