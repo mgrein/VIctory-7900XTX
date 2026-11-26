@@ -4306,11 +4306,13 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // (The answer in a list this thread keeps: `watch::with_writes`.)
+            if let Some(copied) = crate::watch::with_writes(from, to, true, |now, written| {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                self.copy_stale(from, to, now, written)
+            }) {
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {

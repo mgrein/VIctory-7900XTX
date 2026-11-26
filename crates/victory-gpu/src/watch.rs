@@ -192,11 +192,17 @@ impl Notes {
     /// The notes of pages `[first, last)` in page order. A part at a time.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         let mut out = Vec::new();
+        self.range_into(first, last, &mut out);
+        out
+    }
+
+    /// [`Notes::range`] into `out` (emptied first, its room kept).
+    fn range_into(&self, first: usize, last: usize, out: &mut Vec<(usize, u64)>) {
+        out.clear();
         self.each(first, last, |p, w| {
             out.push((p, w));
             true
         });
-        out
     }
 
     /// The parts `shards` (a bit each), held until dropped: for writing
@@ -269,21 +275,29 @@ impl Held<'_> {
     }
 
     /// The notes of pages `[first, last)` in page order; their parts held.
+    #[cfg(test)]
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        self.range_into(first, last, &mut out);
+        out
+    }
+
+    /// [`Held::range`] into `out` (emptied first, its room kept).
+    fn range_into(&self, first: usize, last: usize, out: &mut Vec<(usize, u64)>) {
+        out.clear();
         match pieces(first, last) {
-            Some(pieces) => pieces
-                .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
-                .collect(),
+            Some(pieces) => {
+                for (from, to) in pieces {
+                    out.extend(self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)));
+                }
+            }
             None => {
-                let all = if self.write.is_empty() {
-                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
+                if self.write.is_empty() {
+                    out.extend(self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)));
                 } else {
-                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                };
-                let mut all = all;
-                all.sort_unstable();
-                all
+                    out.extend(self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)));
+                }
+                out.sort_unstable();
             }
         }
     }
@@ -1371,20 +1385,80 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut pages = Vec::new();
+    let now = writes_into(start, end, guarded, &mut pages)?;
+    Some((now, pages))
+}
+
+/// Whether [`with_writes`] reuses one list of each thread for the answer
+/// (`VICTORY_REFRESH_SCRATCH=0`: a new list each time, as before): the
+/// answers of a submission's refreshes were lists made and dropped by the
+/// thousand.
+fn refresh_scratch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SCRATCH").is_none_or(|v| v != "0"))
+}
+
+/// [`writes`] of `[start, end)` with `guarded`, the answer handed to
+/// `use_pages` (the asking's number, the pages as last written) in a list
+/// the calling thread keeps for its next asking ([`refresh_scratch`]).
+/// `None` as [`writes`] gives it.
+pub(crate) fn with_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    use_pages: impl FnOnce(u64, &[(usize, u64)]) -> T,
+) -> Option<T> {
+    /// Entries kept past an asking at most (16 bytes each): a rare huge
+    /// answer does not keep its room for good.
+    const KEPT: usize = 1 << 16;
+    thread_local! {
+        static PAGES: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if !refresh_scratch() {
+        let (now, pages) = writes(start, end, guarded)?;
+        return Some(use_pages(now, &pages));
+    }
+    PAGES.with(|kept| match kept.try_borrow_mut() {
+        Ok(mut pages) => {
+            let answer = writes_into(start, end, guarded, &mut pages).map(|now| use_pages(now, &pages));
+            if pages.capacity() > KEPT {
+                *pages = Vec::new();
+            }
+            answer
+        }
+        // Asked again from within `use_pages`: a list of its own.
+        Err(_) => {
+            let (now, pages) = writes(start, end, guarded)?;
+            Some(use_pages(now, &pages))
+        }
+    })
+}
+
+/// [`writes`] with the pages put into `out` (emptied first, its room kept);
+/// returns the asking's number.
+fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
-    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
+    let ahead = |j: &Journal, out: &mut Vec<(usize, u64)>| {
+        j.ahead.holds(first, last).then(|| {
+            j.notes.range_into(first, last, out);
+            j.ahead_asked
+        })
+    };
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
-    let fresh = || {
+    let fresh = |out: &mut Vec<(usize, u64)>| {
         let j = journal();
         let held = j.notes.hold(shards_of(first, last), false);
-        (next_asking(), held.range(first, last))
+        let now = next_asking();
+        held.range_into(first, last, out);
+        now
     };
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), out) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -1394,7 +1468,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             tally(2, 1);
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
-        return Some(fresh());
+        return Some(fresh(out));
     }
     // Renderer port #6: view memory, which the kernel would refuse, and the
     // caller does not ask the guards (textures, which then guard by a way of
@@ -1405,7 +1479,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), out) {
         return Some(known);
     }
     let mut guards_asked = false;
@@ -1452,7 +1526,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
-        return Some(fresh());
+        return Some(fresh(out));
     }
     let answer = if port_journal() {
         // Renderer port #7: shared, the range's parts held for writing (the
@@ -1464,14 +1538,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             held.note(page, parts, now);
         }
         port7_count(P7_SHARED_NOTES, 1);
-        (now, held.range(first, last))
+        held.range_into(first, last, out);
+        now
     } else {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
             j.notes.note(page, parts, now);
         }
-        (now, j.notes.range(first, last))
+        j.notes.range_into(first, last, out);
+        now
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -5890,16 +5966,26 @@ mod port7_tests {
             held.note(page, WHOLE, n);
             want.insert(page, n);
         }
+        let mut kept: Vec<(usize, u64)> = vec![(1, 1); 3];
         for _ in 0..500 {
             let first = rng(&mut seed, 70 * P);
             let last = first + rng(&mut seed, 3 * P);
             let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
             assert_eq!(notes.range(first, last), expected, "{first}..{last} a part at a time");
             assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected, "{first}..{last} held");
+            // Into a list kept from an answer before: only this answer is in it.
+            notes.range_into(first, last, &mut kept);
+            assert_eq!(kept, expected, "{first}..{last} a part at a time, into a kept list");
+            kept.push((usize::MAX, 0));
+            notes.hold(shards_of(first, last), false).range_into(first, last, &mut kept);
+            assert_eq!(kept, expected, "{first}..{last} held, into a kept list");
+            kept.push((usize::MAX, 0));
         }
         // The whole space: each part once.
         assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
         assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+        notes.hold(u64::MAX, false).range_into(0, usize::MAX / 2, &mut kept);
+        assert_eq!(kept, want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
     }
 
     /// Noted out of order (shared noters' numbers may come in any order): a
