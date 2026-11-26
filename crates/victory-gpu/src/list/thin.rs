@@ -83,6 +83,14 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        // Uploads in words never handed over are never translated, so nothing
+        // else takes them back: they go now, as a list's uploads go at its
+        // reset (the card never saw them; they were not submitted).
+        for upload in uploads_in(&self.words) {
+            // SAFETY: made by `allocate_upload`, named once, and these words
+            // are cleared right after: nobody else reads them.
+            drop(unsafe { Box::from_raw(upload as *mut Upload) });
+        }
         self.words.clear();
     }
 
@@ -706,6 +714,23 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// The uploads a stream names (their boxes, as `allocate_upload` made them),
+/// call by call as [`translate`] goes.
+fn uploads_in(stream: &[u64]) -> impl Iterator<Item = u64> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < stream.len() {
+            let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+            let at = i + 1;
+            i += 1 + len;
+            if op == UPLOAD && len >= 1 && at < stream.len() {
+                return Some(stream[at]);
+            }
+        }
+        None
+    })
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
@@ -925,6 +950,26 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    /// The uploads of words never handed over are found between other calls
+    /// (also blobs that look like an upload call) and let go of when the
+    /// recording is.
+    #[test]
+    fn uploads_not_handed_over_go_with_the_recording() {
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(Plain::DRAW_INDEXED as u64, &[3, 1, 0, 0, 5]);
+        let a = Box::into_raw(Box::new(Upload::new(64).unwrap())) as u64;
+        f.put(UPLOAD, &[a]);
+        f.put_with(VIEWPORTS, &[1], &[bytes_of([UPLOAD | 1 << 16, 7].as_ptr(), 2)]);
+        let b = Box::into_raw(Box::new(Upload::new(64).unwrap())) as u64;
+        f.put(UPLOAD, &[b]);
+        assert_eq!(uploads_in(&f.words).collect::<Vec<_>>(), [a, b]);
+        assert!(f.words.len() < CHUNK);
+        f.leave();
+        assert!(f.words.is_empty());
+        assert_eq!(uploads_in(&[]).count(), 0);
     }
 
     /// A view's record is the one at the call, also if its slot is written
