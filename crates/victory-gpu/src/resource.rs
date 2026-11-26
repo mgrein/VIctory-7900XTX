@@ -1170,6 +1170,11 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// The levels over the cap ([`cap_first`]) it was made without, as the
+    /// cap was then (0: none): [`want_level`] goes by this, not by the cap
+    /// as it is now, so a cap that loosens for a moment does not replace
+    /// every capped copy with a level-0 view at once.
+    pub(crate) capped: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1455,8 +1460,14 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    // Never past the levels over the cap ([`cap_first`]), as it is now.
-    if host.base == 0 || host.base <= base_level(&r.desc, first.max(cap_first(&r.desc))) {
+    // Never past the levels over the cap ([`cap_first`]) as it was when the
+    // copy was made: the cap follows how full the card is, asked every
+    // 50 ms, and every capped texture has views from level 0, so going by
+    // the cap as it is now replaced every one of them each time the card
+    // dipped under a threshold, and the new copies (with the old ones still
+    // alive in `REPLACED`) filled it again. The cap loosens for a texture
+    // when its copy is made again (after the sweep let it go).
+    if host.base == 0 || host.base <= base_level(&r.desc, first.max(host.capped)) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1682,11 +1693,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // A large block-compressed one also goes without the levels over
         // the cap ([`cap_first`]): its first level is the larger of the two.
         let mut base = 0;
+        let mut cap_used = 0;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
             let capped = cap_first(&r.desc);
+            cap_used = capped;
             if first != u32::MAX || capped > 0 {
                 let held = if first == u32::MAX { 0 } else { base_level(&r.desc, first) };
                 base = base_level(&r.desc, if first == u32::MAX { capped } else { first.max(capped) });
@@ -1734,6 +1747,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.capped = cap_used;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2417,6 +2431,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            capped: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2442,6 +2457,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            capped: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
