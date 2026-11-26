@@ -322,6 +322,24 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether the structure builder runs whole now: it is asked for
+/// (`VICTORY_BVH_BUILDER=1`), a dispatch of it found every one of its
+/// programs with a host pipeline ([`builder_runs`]), none was added since,
+/// and it does not rest this frame ([`builder_rests`]). Unlike
+/// [`builder_runs`] it changes nothing, so any bind may ask: the host word
+/// `victory_shader::emit::USER_STRUCTURES` of the programs that walk the
+/// structures with `VICTORY_BVH_NO_HIT=1`, whose node tests answer no hit
+/// while this is false.
+#[cfg(windows)]
+pub(crate) fn builder_whole_now() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole && b.off != b.pipelines.len() && crate::frame::current() >= b.rests
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]

@@ -75,6 +75,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_BVH_NO_HIT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -83,6 +84,11 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // How the ray node tests answer while the structures are not built:
+        // with `VICTORY_BVH_NO_HIT=1` that depends on `VICTORY_BVH_BUILDER`
+        // too (keyed this way so the builder's switch alone retranslates
+        // nothing).
+        bytes.push(victory_shader::emit::bvh_no_hit());
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

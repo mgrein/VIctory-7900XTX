@@ -763,6 +763,120 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     }
 }
 
+/// Lowers `wide`'s program over title memory as `VICTORY_BVH_NO_HIT` would
+/// have it ([`super::bvh_no_hit`]: 1 or 2).
+fn build_no_hit(wide: bool, mode: u8) -> (HostShader, resource::Resources) {
+    super::TEST_NO_HIT.set(Some(mode));
+    let built = build(wide, WHOLE);
+    super::TEST_NO_HIT.set(None);
+    built.expect("lowers with no hit")
+}
+
+/// What a node test answers while the structures are not built: a box
+/// enters no child, anything else is the triangle miss.
+fn no_hit(case: &Case) -> [u32; 4] {
+    match case {
+        Some((_, 4 | 5, _)) => [bvh::NONE; 4],
+        Some(_) => bvh::MISS.map(f32::to_bits),
+        None => BEFORE,
+    }
+}
+
+/// With `VICTORY_BVH_NO_HIT=1` (and the builder not asked for) a node test
+/// over title memory lowers and validates, and reads nothing: the program
+/// asks the host neither for the directory of title memory nor for the list
+/// of pages it found no copy of, which it does without the switch (the test
+/// above). After fxceless 96ff1356.
+#[test]
+fn a_node_test_that_answers_no_hit_reads_nothing() {
+    for wide in [true, false] {
+        let (shader, _) = build_no_hit(wide, 1);
+        assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
+        assert!(!shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_STRUCTURES)));
+        // And with it off again, as before.
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_STRUCTURES)));
+    }
+}
+
+/// With `VICTORY_BVH_NO_HIT=1` and `VICTORY_BVH_BUILDER=1` the program asks
+/// the host whether the structures are built (`USER_STRUCTURES`): at 0 every
+/// node test answers no hit, at 1 the node is read and tested as without
+/// the switch, on the card.
+#[test]
+fn a_node_test_answers_no_hit_while_the_host_says_the_structures_are_not_built() {
+    for wide in [true, false] {
+        // Through the directory: it lowers, validates and asks for it.
+        let (shader, _) = build_no_hit(wide, 2);
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_STRUCTURES)));
+    }
+    let _memory = Memory::at(BASE);
+    let (shader, _) = build_no_hit(true, 2);
+    let word = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_STRUCTURES))
+        .expect("the program asks whether the structures are built")
+        .index as usize;
+    let (scene, batches) = scene();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for built in [0u32, 1] {
+            for (b, batch) in batches.iter().enumerate() {
+                let data = buffer(&scene, batch, BASE + u64::from(NODES));
+                let mut constants = vec![0; (shader.user_data_dwords() as usize).max(5)];
+                constants[word] = built;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(constants))],
+                            views: &[
+                                View::Buffer {
+                                    data: &data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4 * THREADS),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                for t in 0..THREADS as usize {
+                    let case = batch.get(t).copied().flatten();
+                    let want = match (batch.get(t), built) {
+                        (Some(c), 0) => no_hit(c),
+                        (Some(c), _) => expected(&scene, c, true),
+                        (None, _) => BEFORE,
+                    };
+                    assert_eq!(
+                        out[0][4 * t..4 * t + 4],
+                        want,
+                        "{label}, built {built}, batch {b} thread {t}: {case:x?}"
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     // Triangle return mode 0 (bit 24 of dword 3 clear): the last two
