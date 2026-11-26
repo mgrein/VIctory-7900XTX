@@ -2944,7 +2944,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3002,6 +3002,18 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_with(index, resource.as_ref().map(windows::core::Interface::as_raw), || resource);
+    }
+
+    /// [`HostHeap::keep`] of a resource the caller holds: taken only if the
+    /// slot held another (most writes of a slot view what it viewed, and
+    /// each reference taken and given back is a pair of the driver's
+    /// interlocked counts on a resource every translating thread names).
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        self.keep_with(index, resource.map(windows::core::Interface::as_raw), || resource.cloned());
+    }
+
+    fn keep_with(&self, index: u32, raw: Option<*mut std::ffi::c_void>, resource: impl FnOnce() -> Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3009,10 +3021,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == raw {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, resource())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3053,7 +3065,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3091,7 +3103,7 @@ impl HostHeap {
         create_uav(Some(buffer), Some(&desc), self.at(index));
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3172,7 +3184,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3220,7 +3232,7 @@ impl HostHeap {
         self.put(index);
         create_srv(Some(buffer), Some(&raw), twin);
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
