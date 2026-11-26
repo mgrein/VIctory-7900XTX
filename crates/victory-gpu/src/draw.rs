@@ -3883,6 +3883,21 @@ impl State {
             _ => false,
         };
         if !ran {
+            // The reason a plain draw would name (`note_drop`): a pipeline refused, being made,
+            // a builder stage left off; "prepare failed" alone hid ~1,700 draws a frame.
+            #[cfg(feature = "diagnostics")]
+            {
+                let this = self.pipeline as This;
+                let missing = if this.is_null() {
+                    Some("no pipeline set".to_owned())
+                } else if kind == DISPATCH && crate::pipeline::is_builder(this) && !crate::pipeline::builder_runs() {
+                    Some("a builder stage, which is off".to_owned())
+                } else {
+                    crate::pipeline::missing_reason(this)
+                };
+                why(&format!("prepare failed ({})", missing.as_deref().unwrap_or("pipeline there: binding or buffers")));
+            }
+            #[cfg(not(feature = "diagnostics"))]
             why("prepare failed");
             return false;
         }

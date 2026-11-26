@@ -526,6 +526,13 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// Why `this` has no host pipeline now, if it has none (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn missing_reason(this: This) -> Option<String> {
+    let p = pipeline(this);
+    skipped_shader(p).map(|hash| format!("skipped shader {hash}")).or_else(|| make::missing(&p.host))
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
