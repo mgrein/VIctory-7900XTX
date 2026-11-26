@@ -60,10 +60,11 @@ pub(crate) fn in_place_on() -> bool {
 /// host without raw twins (`VICTORY_PORT_CBV_SLOT=1` with the port; off by
 /// default; `victory_shader::emit::constants_in_slot`): then the host makes
 /// every slot that shows a constant buffer a raw view of its bytes.
-/// NOT SAFE YET: run xh10 (RTX 4070) lost the device with an invalid call
-/// 105 s in, while the heap's buffer views were made; the raw view made
-/// per draw in `HostHeap::constant_at` is as long as the constant buffer
-/// rounded up to 256 bytes, which can reach past the end of its buffer.
+/// Off by default: on an RTX 4070 (runs xh12/xh13, same save and load) it
+/// read ~11,000 constant buffers a frame in place (3.9 MB not copied) but the
+/// frame time did not move (17.9 against 17.7 ms per thousand draws). (Run
+/// xh10 lost the device before the slot's raw view was kept inside its
+/// buffer and on 16 bytes.)
 pub(crate) fn in_slot() -> bool {
     victory_shader::emit::constants_in_slot()
 }
