@@ -11,7 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -24,6 +24,8 @@ const ORIGIN: u32 = 0;
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
+/// The flip event: the title waits for it (blocking) before each present.
+const FLIP: u32 = 2;
 
 struct Clock {
     start: Instant,
@@ -189,6 +191,13 @@ pub(crate) extern "system" fn wait(
 ) -> HRESULT {
     let origin = kind == ORIGIN;
     let limit = Duration::from_millis(u64::from(timeout_ms));
+    // Paced after the present already ([`after_present`]): the flip wait
+    // ends at once and takes no tick (that present took it).
+    if kind == FLIP && PACED.load(Ordering::Relaxed) && limit >= interval() && PACED.swap(false, Ordering::Relaxed) {
+        #[cfg(feature = "diagnostics")]
+        tracing::debug!(kind, timeout_ms, flags, frame = current(), "frame wait paced after the present");
+        return S_OK;
+    }
     // The tick is only logged (diagnostics); taking it is what counts (the
     // binding from DexNom 882664e1, Manuel Pérez).
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
@@ -228,6 +237,43 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// The clock's interval (that of a 60 Hz display before the title sets one).
+fn interval() -> Duration {
+    clock().as_ref().map_or(SIXTIETH, |c| c.interval)
+}
+
+/// `VICTORY_PACE_AFTER=1` (read here once; off by default): the title is
+/// paced after its present instead of before it ([`after_present`]), so the
+/// frame is shown as soon as it is made and the next one starts (reading
+/// input) after the pacing sleep. Subsumes fxceless PR #457 (GamingRipperDoc).
+fn pace_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PACE_AFTER").is_some_and(|v| v == "1"))
+}
+
+/// A present paced the flip ([`after_present`]) and no blocking flip wait
+/// has ended on it yet.
+static PACED: AtomicBool = AtomicBool::new(false);
+
+/// The last thing the title's present does (`VICTORY_PACE_AFTER=1`): sleeps
+/// to the next flip tick as the flip wait would (taking it, with the late
+/// rule), so the title's next blocking flip wait ends at once. Tokens and
+/// ticks count as before.
+pub(crate) fn after_present() {
+    if pace_after() {
+        pace_flip();
+    }
+}
+
+fn pace_flip() {
+    let (_, wait) = next_tick(FLIP, Duration::MAX);
+    if !wait.is_zero() {
+        let _sleeping = crate::timeline::span("the title paced after its present");
+        std::thread::sleep(wait);
+    }
+    PACED.store(true, Ordering::Relaxed);
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -285,7 +331,6 @@ mod tests {
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
-        const FLIP: u32 = 2;
         // (The ticks are far apart, and it may take a few tries: a busy PC
         // wakes a wait tens of milliseconds late at times.)
         assert_eq!(set_interval(null, null, 60_000, 3, 0), S_OK);
@@ -347,5 +392,30 @@ mod tests {
         assert_eq!(second, first + 1);
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+
+    /// A present that paced the flip makes the next blocking flip wait end
+    /// at once without a tick; the one after it waits again. A poll does not
+    /// use it up.
+    #[test]
+    fn a_present_side_pace_ends_the_next_flip_wait_at_once() {
+        let _turn = turn();
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 40_000, 1, 0), S_OK);
+        let mut token = 0;
+        pace_flip();
+        let paced = last(FLIP).load(Ordering::Relaxed);
+        assert!(PACED.load(Ordering::Relaxed));
+        let _ = wait(null, FLIP, 0, std::ptr::null(), 0, &mut token);
+        assert!(PACED.load(Ordering::Relaxed), "a poll took it");
+        // (The poll may have taken a tick, as polls do.)
+        let before = last(FLIP).load(Ordering::Relaxed);
+        let began = Instant::now();
+        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+        assert!(began.elapsed() < Duration::from_millis(30), "{:?}", began.elapsed());
+        assert_eq!(last(FLIP).load(Ordering::Relaxed), before);
+        assert!(paced >= 1 && !PACED.load(Ordering::Relaxed));
+        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+        assert!(last(FLIP).load(Ordering::Relaxed) > before);
     }
 }

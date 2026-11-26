@@ -955,6 +955,8 @@ extern "system" fn present(
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
+        // Last: pacing after the present (`VICTORY_PACE_AFTER`).
+        crate::frame::after_present();
         return S_OK;
     }
     #[cfg(windows)]
@@ -984,6 +986,8 @@ extern "system" fn present(
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    // Last: pacing after the present (`VICTORY_PACE_AFTER`).
+    crate::frame::after_present();
     S_OK
 }
 
