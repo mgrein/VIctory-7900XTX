@@ -139,15 +139,39 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// The host's memory now, from `GlobalMemoryStatusEx`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryStatus {
+    /// Physical RAM free.
+    pub(crate) avail_phys: u64,
+    /// Commit headroom: what may still be committed before the commit
+    /// limit (RAM plus page file) is reached (`ullAvailPageFile`). Private
+    /// memory counts against it whether it is resident or not.
+    pub(crate) avail_commit: u64,
+    /// Physical RAM in all.
+    pub(crate) total_phys: u64,
+}
+
+/// See [`MemoryStatus`].
+pub(crate) fn memory_status() -> Option<MemoryStatus> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some(MemoryStatus { avail_phys: m.ullAvailPhys, avail_commit: m.ullAvailPageFile, total_phys: m.ullTotalPhys })
+}
+
+/// Physical RAM in all, asked once.
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|m| m.total_phys))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|m| m.avail_phys)
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -453,6 +477,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::let_go_idle(false);
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -6372,6 +6397,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.list.reset_count();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -7018,6 +7044,29 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((buffer, at, (data + at as usize) as *mut u8))
+    }
+
+    /// After a reset, before the list waits in the pool
+    /// (`crate::list::recycle`): an indirect-argument scratch buffer past
+    /// 1 MiB, grown for one big execution, and the batched clamps' buffers
+    /// past the first go (retired: [`retire_resource`]); the next recording
+    /// that needs them makes them again. Card memory a pooled list held
+    /// for the run otherwise.
+    pub(crate) fn trim_args(&self) {
+        let big = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, cap)| *cap > 1 << 20) { slot.take() } else { None }
+        };
+        if let Some((buffer, _)) = big {
+            retire_resource(buffer);
+        }
+        let extra = {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            if args.0.len() > 1 && args.1 == 0 { args.0.split_off(1) } else { Vec::new() }
+        };
+        for buffer in extra {
+            retire_resource(buffer);
+        }
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:

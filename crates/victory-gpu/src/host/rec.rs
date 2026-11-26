@@ -13,7 +13,7 @@
 //! its upload followed by the next texture's aliasing).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -44,11 +44,37 @@ pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Calls recorded since the last reset (each use through `Deref`, each
+    /// barrier call asked for), and the most of any recording of the
+    /// list's life ([`Rec::reset_count`]): a command allocator keeps the
+    /// memory of its biggest recording across resets, so a pooled list
+    /// that once recorded a big frame holds it for the run
+    /// (`crate::list::recycle`, `VICTORY_LIST_FAT`).
+    recorded: AtomicU32,
+    most: AtomicU32,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+            recorded: AtomicU32::new(0),
+            most: AtomicU32::new(0),
+        }
+    }
+
+    /// The most calls any recording of the list made, this one included.
+    pub(crate) fn recorded_most(&self) -> u32 {
+        self.most.load(Relaxed).max(self.recorded.load(Relaxed))
+    }
+
+    /// At the list's reset: this recording's calls count toward the most
+    /// ([`Rec::recorded_most`]), and the next recording counts from 0.
+    pub(crate) fn reset_count(&self) {
+        let n = self.recorded.swap(0, Relaxed);
+        self.most.fetch_max(n, Relaxed);
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -59,6 +85,7 @@ impl Rec {
         if barriers.is_empty() {
             return;
         }
+        self.recorded.fetch_add(1, Relaxed);
         if !on() {
             // (What was held while it was on goes first.)
             if self.any.load(Relaxed) {
@@ -117,6 +144,7 @@ impl std::ops::Deref for Rec {
 
     /// The list, with what is held recorded first.
     fn deref(&self) -> &ID3D12GraphicsCommandList {
+        self.recorded.fetch_add(1, Relaxed);
         if self.any.load(Relaxed) {
             self.flush();
         }
