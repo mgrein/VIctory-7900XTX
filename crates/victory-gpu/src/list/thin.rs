@@ -319,12 +319,26 @@ fn start() {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
+            // The views it makes it keeps and copies (`VICTORY_VIEW_COPIES`).
+            crate::descriptor::host::copies::here();
             loop {
                 let recording = {
                     let mut ready = held(&READY);
                     loop {
                         match ready.pop_front() {
                             Some(r) => break r,
+                            // Views kept: after a while with nothing to
+                            // translate they go, with the resources they hold.
+                            None if crate::descriptor::host::copies::kept() > 0 => {
+                                let idle = std::time::Duration::from_millis(crate::descriptor::host::copies::IDLE_MS);
+                                let (back, waited) = WORK.wait_timeout(ready, idle).unwrap_or_else(|e| e.into_inner());
+                                ready = back;
+                                if waited.timed_out() && ready.is_empty() {
+                                    drop(ready);
+                                    crate::descriptor::host::copies::idle();
+                                    ready = held(&READY);
+                                }
+                            }
                             None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
                         }
                     }
