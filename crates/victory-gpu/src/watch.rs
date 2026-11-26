@@ -1221,7 +1221,11 @@ static ANY_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 pub(crate) static COLD_RANGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether big write-watched ranges the title hardly writes go to the
-/// guards (`VICTORY_COLD_GUARDS=0`: every range stays with the kernel).
+/// guards (`VICTORY_COLD_GUARDS=1`; off by default: every range stays with
+/// the kernel). Off since runs x12-x14 on an RTX 4070 with this fork: with
+/// it the copies sent up per frame went from 68 to 290-380 MB and the world
+/// from 12.7 to 8.3-9.2 frames a second (here the relay already lands what
+/// shaders wrote, and the guards' faults refreshed whole blocks).
 ///
 /// A kernel asking walks the page tables of all of its range, whatever was
 /// written: the title's big buffers (one of 182 MB, asked about fourteen
@@ -1234,7 +1238,7 @@ pub(crate) static COLD_RANGES: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// Ported from local DexNom-tree work (`consider_cold`).
 fn cold_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COLD_GUARDS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COLD_GUARDS").is_some_and(|v| v == "1"))
 }
 
 /// The fewest pages of a range [`consider_cold`] looks at: 16 MiB.
