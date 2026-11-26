@@ -5209,8 +5209,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
+    // With whole windows (the default with much RAM on an AMD card) there
+    // is one window to a cell and nothing to choose: exactly `find`.
     if !fine() {
         return find(address, len);
     }
@@ -5332,23 +5332,71 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
 
-/// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// The grid the windows of asks with a length are cut on, in bytes: what
+/// `VICTORY_WINDOW_KB` names, a power of two from 64 to 4096 (4 MiB for
+/// anything else).
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
 /// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
 /// window ends nearer to what is read. An ask without a length keeps the
 /// 4 MiB grid whatever is set: a root view reads from its address to its
 /// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// Unset, it is 256 KiB where windows are cut finer by default
+/// ([`fine_by_default`]: 40 GiB of RAM or less, or a card not AMD's), else
+/// 4 MiB as before. The same memory asked for with different ranges can
+/// then lie in more than one window; an ask takes a window alive that holds
+/// it before it makes one of its own ([`holder_below`]).
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+    *GRID.get_or_init(|| match std::env::var("VICTORY_WINDOW_KB") {
+        Ok(v) => grid(v.trim().parse::<u64>().ok()),
+        Err(_) => grid(fine_by_default().then_some(FINE_KB)),
     })
+}
+
+/// The grid of [`window`] where windows are cut finer by default, in KiB.
+const FINE_KB: u64 = 256;
+
+/// Whether windows are cut finer and tails are on unless their switches
+/// say otherwise ([`window`], [`tails`]): with 40 GiB of RAM or less, or on
+/// a card that is not AMD's. Windows on the 4 MiB grid held 3.3 GB for
+/// 1.6 GB ever asked for (run 60), and 513 of 782 were asked for without a
+/// length (run 65); on a 256 KiB grid with tails and windows that hold an
+/// ask taken, DexNom/VIctory PR #55 measured 1,499 MB of windows against
+/// 2,496. A 12 GB card and 32 GB of RAM need that room; a 24 GB AMD card
+/// with more RAM keeps what it had.
+fn fine_by_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let ram = total_physical_ram();
+        let amd = crate::host::host().map(|h| crate::indirect::amd(&h.device));
+        let on = fine_for(ram, amd);
+        tracing::info!(
+            ram_gib = ram.map(|r| r >> 30),
+            ?amd,
+            on,
+            "windows of title memory outside buffers cut on 256 KiB with tails by default \
+             (VICTORY_WINDOW_KB and VICTORY_WINDOW_TAILS say otherwise)"
+        );
+        on
+    })
+}
+
+/// [`fine_by_default`] for so much RAM (bytes) and a card that is AMD's or
+/// not (None: not known).
+fn fine_for(ram: Option<u64>, amd: Option<bool>) -> bool {
+    ram.is_some_and(|r| r <= 40 << 30) || amd == Some(false)
+}
+
+/// The host's physical RAM in bytes, from `GlobalMemoryStatusEx`.
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullTotalPhys)
 }
 
 /// The window grid in bytes for a setting in KiB: a power of two from
@@ -5376,16 +5424,20 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// window is the cell's tail from the ask's step on ([`TAIL_STEP`]); an ask
 /// lower in the cell later makes a longer tail, which every ask from then
 /// on takes, and the shorter one goes when nothing holds it any more.
-/// shortcut: off unless `VICTORY_WINDOW_TAILS=1`. A longer tail is another
-/// host buffer than the shorter one: what was bound to the shorter stays
-/// right only because every list brings up to date the copy it bound
-/// (`draw.rs` keeps a root view's copy with its slot). It pays only
-/// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
-/// with a length in the same cell makes the whole cell's window, and the
-/// tail is that.
+/// `VICTORY_WINDOW_TAILS=1` turns it on, any other value off; unset, it is
+/// on where windows are cut finer by default ([`fine_by_default`]). A
+/// longer tail is another host buffer than the shorter one: what was bound
+/// to the shorter stays right only because every list brings up to date
+/// the copy it bound (`draw.rs` keeps a root view's copy with its slot). It
+/// pays only together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB
+/// grid an ask with a length in the same cell makes the whole cell's
+/// window, and the tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => fine_by_default(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -5402,6 +5454,19 @@ fn tail_of(address: u64, end: u64) -> (u64, u64) {
     let (cell, len) = window_of(address, end, WINDOW);
     let start = address & !(TAIL_STEP - 1);
     (start, cell + len - start)
+}
+
+/// Of `windows` (start, bytes), the one an ask of `[address, end)` that
+/// found no window of its own takes: the first that begins at or below the
+/// ask, and no lower than `lowest`, and holds all of it (DexNom/VIctory PR
+/// #55, wymd-wn118). An ask without a length and one with a length in the
+/// same cell name windows of different lengths, so without this the same
+/// title memory was copied once for each: 2,496 MB of windows lay over
+/// 1,636 MB of title memory there, 1,499 MB over 1,198 MB with it.
+fn holder_below(windows: impl Iterator<Item = (u64, u64)>, lowest: u64, address: u64, end: u64) -> Option<(u64, u64)> {
+    windows
+        .filter(|&(start, bytes)| start >= lowest && start <= address && start + bytes >= end)
+        .min()
 }
 
 /// Of `windows` (start, bytes), the one an ask of `[address, end)` that
@@ -5549,30 +5614,52 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // The window the ask takes, if it is there, and else the one it makes:
+    // the same under either lock.
+    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| -> ((u64, u64), Option<Arc<Shadow>>) {
+        let wanted = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask
+            // (one that begins in a cell below and reaches this far is
+            // passed over: the ask then makes its own).
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        if let Some(shadow) = map.get(&wanted) {
+            return (wanted, Some(shadow.clone()));
+        }
+        // None at exactly that: one alive that begins no lower than it and
+        // holds the whole ask serves it ([`holder_below`]). An ask without
+        // a length reads on to its window's end: the window must reach the
+        // end of the ask's cell, as the one it would make does. (Only where
+        // windows may be smaller than their cell: on the whole cells there
+        // is nothing else to take.)
+        if fine() {
+            let reach = if unsized_ask { cell + WINDOW } else { end };
+            let there = map.range((wanted.0, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            if let Some(key) = holder_below(there, wanted.0, address, reach) {
+                return (wanted, map.get(&key).cloned());
+            }
+        }
+        (wanted, None)
+    };
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
-            note(shadow);
-            return Some(shadow.clone());
+        if let (_, Some(shadow)) = pick(&map) {
+            note(&shadow);
+            return Some(shadow);
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
+    let ((start, len), there) = pick(&map);
+    if let Some(shadow) = there {
+        note(&shadow);
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -5718,9 +5805,68 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, fine_for, grid, holder, holder_below, longest_tail,
+        resolve_card_limits, tail_of, window_of,
     };
+
+    /// An ask that found no window of its own takes one that holds all of
+    /// it: the lengths the two kinds of ask make in one cell differ, so
+    /// without this the same title memory was copied once for each
+    /// (DexNom/VIctory PR #55).
+    #[test]
+    fn an_ask_takes_a_window_that_holds_it() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x9_0000, cell + 0xb_0000);
+        let lowest = cell;
+        assert_eq!(holder_below([].into_iter(), lowest, ask, end), None);
+        let mut there = vec![
+            (cell, 0x4_0000),             // ends below the ask
+            (cell + 0x8_0000, 0x2_0000),  // holds its first half only
+            (cell + 0x8_0000, 0x4_0000),  // holds it
+            (cell + 0x4_0000, 0x10_0000), // holds it, lower down
+            (cell + 0xa_0000, 0x40_0000), // begins above it
+        ];
+        // In order, as the table of windows walks them.
+        there.sort_unstable();
+        // The first that begins at or below the ask and holds it all.
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, end), Some((cell + 0x4_0000, 0x10_0000)));
+        // None below `lowest`, however well it holds the ask.
+        assert_eq!(holder_below(there.iter().copied(), cell + 0x8_0000, ask, end), Some((cell + 0x8_0000, 0x4_0000)));
+        // An ask without a length must find its cell's end in the window.
+        let cell_end = cell + WINDOW;
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, cell_end), None);
+        let tail = (cell + 0x8_0000, WINDOW - 0x8_0000);
+        there.push(tail);
+        there.sort_unstable();
+        assert_eq!(holder_below(there.iter().copied(), lowest, ask, cell_end), Some(tail));
+    }
+
+    /// An ask takes no window that begins below the lowest it may take, and
+    /// none that ends in the middle of it (DexNom/VIctory PR #55).
+    #[test]
+    fn a_window_must_begin_no_lower_than_the_ask_allows() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (cell + 0x2_0000, cell + 0x3_0000);
+        let there = [(cell, 0x10_0000), (cell + 0x1_0000, 0x10_0000)];
+        assert_eq!(holder_below(there.into_iter(), cell + 0x1_0000, ask, end), Some((cell + 0x1_0000, 0x10_0000)));
+        assert_eq!(holder_below(there.into_iter(), cell + 0x2_0000, ask, end), None);
+        let short = [(cell + 0x2_0000, 0x8000)];
+        assert_eq!(holder_below(short.into_iter(), cell, ask, end), None);
+    }
+
+    /// Finer windows by default with 40 GiB of RAM or less, or on a card not
+    /// AMD's; a 24 GB AMD card with more RAM keeps the whole cells.
+    #[test]
+    fn windows_are_finer_by_default_on_less_ram_or_another_vendor() {
+        const GIB: u64 = 1 << 30;
+        assert!(fine_for(Some(32 * GIB), Some(true)));
+        assert!(fine_for(Some(40 * GIB), Some(true)));
+        assert!(!fine_for(Some(64 * GIB), Some(true)));
+        assert!(fine_for(Some(64 * GIB), Some(false)));
+        assert!(!fine_for(Some(64 * GIB), None));
+        assert!(!fine_for(None, None));
+        assert!(fine_for(None, Some(false)));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
