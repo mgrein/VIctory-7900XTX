@@ -49,11 +49,18 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
-        0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
+    let interval = match (fps(), length) {
+        (Some(n), _) if n > 0 => Duration::from_nanos(1_000_000_000 / u64::from(n)),
+        (_, 0) => SIXTIETH,
+        (_, us) => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    tracing::info!(
+        ?interval,
+        title_us = length,
+        overridden = fps().is_some_and(|n| n > 0),
+        uncapped = uncapped(),
+        "frame interval"
+    );
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +73,25 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// `VICTORY_FPS=n` (read here once; unset: the title's interval): a frame
+/// interval of 1/n s whatever the title sets; `VICTORY_FPS=0`: no pacing
+/// sleep at all, every wait ends at once on the next tick (ticks and tokens
+/// still count one by one). The frame-pacing part of Belobug fa074817 and
+/// 2b6adbb7 (beloooo) and of fxceless PR #1193 (mokillos), without a
+/// default. Tests keep the title's interval.
+fn fps() -> Option<u32> {
+    if cfg!(test) {
+        return None;
+    }
+    static FPS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FPS.get_or_init(|| std::env::var("VICTORY_FPS").ok()?.trim().parse().ok())
+}
+
+/// `VICTORY_FPS=0`: waits do not sleep.
+fn uncapped() -> bool {
+    fps() == Some(0)
 }
 
 /// Device method: events are scheduled at every tick.
@@ -114,12 +140,19 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: match fps() {
+            Some(n) if n > 0 => Duration::from_nanos(1_000_000_000 / u64::from(n)),
+            _ => SIXTIETH,
+        },
         first: 0,
     });
+    let last = last(kind);
+    if uncapped() {
+        // No sleep: the next tick, at once.
+        return (last.fetch_add(1, Ordering::Relaxed) + 1, Duration::ZERO);
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let last = last(kind);
     let taken = last.load(Ordering::Relaxed);
     let mut tick = (c.first + (elapsed / interval + 1) as u64).max(taken + 1);
     let at = u128::from(tick - c.first) * interval;
