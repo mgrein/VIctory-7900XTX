@@ -6852,10 +6852,41 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.forget_recording();
+        // SAFETY: the list is not executing.
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// What [`HostList::reset`] does but for the host list's own reset: what
+    /// the list kept for its commands goes and it stays closed, as a pooled
+    /// list waits (`crate::list::recycle`), so that taking it for a
+    /// submitted title list wants no close and the title's reset after
+    /// that is the one reset of the list. Only after the list's last
+    /// submission finished, on a closed list.
+    pub(crate) fn let_go_recording(&self) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let _resetting = crate::timeline::span("letting go of a host list's recording");
+        self.forget_recording();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// The bookkeeping of [`HostList::reset`] and [`HostList::let_go_recording`].
+    fn forget_recording(&self) {
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6875,18 +6906,7 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
-        }
         self.list.reset_count();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -10573,6 +10593,26 @@ mod list_buffer_tests {
         assert_eq!(b.take_args(100 << 10).map(|(_, cap)| cap), Some(256 << 10));
         assert_eq!(b.take_args(2 << 20).map(|(_, cap)| cap), None);
         assert_eq!(b.take_args(1).map(|(_, cap)| cap), Some(64 << 10));
+    }
+
+    /// A list that ran lets go of its recording and stays closed; the one
+    /// reset after that opens it, and it records and runs again.
+    #[test]
+    fn a_list_that_ran_waits_closed_and_resets_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().expect("a host list");
+        list.close();
+        host.execute(&[&list]);
+        list.let_go_recording();
+        // Closed: a second close would fail, a reset succeeds.
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        list.let_go_recording();
+        list.reset();
+        list.close();
     }
 }
 
