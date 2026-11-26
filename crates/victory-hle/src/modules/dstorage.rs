@@ -593,6 +593,7 @@ struct Job {
     seq: u64,
     request: Request,
     note: Note,
+    held: Held,
     staging: u64,
 }
 
@@ -783,7 +784,7 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, &job.held);
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -845,14 +846,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, note, held }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -865,6 +865,7 @@ impl Lanes {
             seq,
             request,
             note,
+            held,
             staging,
         })
     }
@@ -908,6 +909,7 @@ impl Lanes {
             match command {
                 Command::Read(mut read) => {
                     read.note.submitted(&read.request, early);
+                    read.held.submitted(&read.request);
                     lane.reads.push_back((seq, read));
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
@@ -1039,11 +1041,77 @@ enum Command {
     Status(Status),
 }
 
-/// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
+/// An enqueued request, what the trace knows of it, and what it holds of
+/// its own until it has run.
 struct Read {
     request: Request,
     note: Note,
+    held: Held,
+}
+
+/// What a read keeps from its enqueue until it has run.
+#[derive(Default)]
+struct Held {
+    /// The page list is on the enqueuing thread's stack ([`on_stack`]).
+    stack_list: bool,
+    /// That list, copied when the request was submitted, or why it could
+    /// not be read then.
+    pages: Option<Result<Box<[usize]>, HRESULT>>,
+}
+
+impl Held {
+    fn at_enqueue(request: &Request) -> Held {
+        Held { stack_list: on_stack(request), pages: None }
+    }
+
+    /// The request is submitted: a list on the stack is copied now, while
+    /// the frame that filled it is still there.
+    fn submitted(&mut self, request: &Request) {
+        if self.stack_list && self.pages.is_none() {
+            let offset = (request.page_offset & 0xffff) as usize;
+            self.pages = Some(
+                read_list(request.destination.cast(), offset, list_bytes(request))
+                    .map(Vec::into_boxed_slice)
+                    .ok_or(E_INVALIDARG),
+            );
+        }
+    }
+}
+
+/// `VICTORY_DSTORAGE_PAGE_LIST=0`: page lists on the enqueuing thread's
+/// stack are read when the request runs, as before (by then the frame that
+/// held them may be gone); unset or 1: copied when the request is
+/// submitted.
+fn own_stack_lists() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_PAGE_LIST").is_none_or(|v| v != "0"))
+}
+
+/// Bytes of destination a request's page list describes from
+/// `page_offset`: a plain copy writes its source size, a decoded request its
+/// destination size.
+fn list_bytes(request: &Request) -> usize {
+    if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size.min(request.destination_size) as usize
+    } else {
+        request.destination_size as usize
+    }
+}
+
+/// Whether a request's page list lives on the enqueuing thread's stack.
+/// Such a list can be gone once the title's frame returns, which may well
+/// be before a worker runs the request, so it is copied when the request
+/// is submitted (the title fills its lists in by its submit, after it has
+/// enqueued the batch: [`half_submits`]). Lists elsewhere (the title's
+/// page table) are read when the request runs, through [`read_list`].
+fn on_stack(request: &Request) -> bool {
+    if !own_stack_lists() || request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return false;
+    }
+    let (mut low, mut high) = (0usize, 0usize);
+    // SAFETY: both outputs are ours.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high) };
+    (low..high).contains(&(request.destination as usize))
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1102,12 +1170,13 @@ fn list_hash(request: &Request) -> u64 {
     })
 }
 
-/// The page numbers a request's list holds now.
+/// The page numbers a request's list holds now (`None` too when it cannot
+/// be read).
 fn list_of(request: &Request) -> Option<Vec<usize>> {
     (request.options & PAGE_DESTINATION != 0 && !request.destination.is_null()).then(|| {
         let (offset, len) = Traced::bytes(request);
         read_list(request.destination.cast(), offset, len)
-    })
+    })?
 }
 
 /// The trace's line for a batch: how much of it goes to pages, and how many
@@ -1270,7 +1339,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    let held = Held::at_enqueue(&request);
+    queue(this, Command::Read(Read { request, note, held }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1373,7 +1443,7 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1395,6 +1465,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    let saved = match &held.pages {
+        Some(Ok(pages)) => Some(&pages[..]),
+        Some(Err(hr)) => return Err(fail(*hr, "its page list could not be read when it was submitted")),
+        None => None,
+    };
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
@@ -1402,7 +1477,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, saved, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -1416,7 +1491,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, saved, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1593,6 +1668,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
+    saved: Option<&[usize]>,
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -1616,15 +1692,30 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
+    if let Some(pages) = saved {
+        // Copied at enqueue: what the list held then is all there is.
+        let count = (offset + len).div_ceil(PAGE).min(pages.len());
+        return into_pages(&pages[..count], offset, len, &mut fill);
+    }
     let list = request.destination.cast();
-    let mut pages = page_list(list, offset, len);
+    let Some(mut pages) = page_list(list, offset, len) else {
+        tracing::warn!(
+            list = format_args!("{list:p}"),
+            offset,
+            len,
+            "dstorage: a destination's page list could not be read (released memory); its request fails"
+        );
+        return Err(E_INVALIDARG);
+    };
     // The title sees its destination through the pages its list names: if
     // it names others by the time the data is written, they get it as well.
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
         into_pages(&pages, offset, len, &mut fill)?;
-        let now = read_list(list, offset, len);
+        let Some(now) = read_list(list, offset, len) else {
+            break;
+        };
         if now == pages || !super::xmem::pages_known(&now, offset, len) {
             break;
         }
@@ -1695,14 +1786,24 @@ fn into_pages(
     }
 }
 
-/// The page numbers `list` holds now, one per 64 KiB of destination.
-fn read_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
-    (0..(offset + len).div_ceil(PAGE))
-        // SAFETY: the title passes a page number per 64 KiB of
-        // destination, which holds at least `len` bytes from `offset`;
-        // it may be writing them.
-        .map(|i| unsafe { list.add(i).read_volatile() })
-        .collect()
+/// The page numbers `list` holds now, one per 64 KiB of destination;
+/// `None` if the title's memory there cannot be read. Read through the
+/// kernel, which reports memory the title has released (a list it replaced,
+/// or one from a stack frame that has returned) instead of faulting.
+fn read_list(list: *const usize, offset: usize, len: usize) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
+    let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
+    let bytes = std::mem::size_of_val(&pages[..]);
+    if bytes == 0 {
+        return Some(pages);
+    }
+    let mut read = 0;
+    // SAFETY: the kernel checks the title's range (which it may be writing
+    // meanwhile); the output is ours and holds `bytes`.
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), list.cast(), pages.as_mut_ptr().cast(), bytes, &mut read)
+    } != 0;
+    (ok && read == bytes).then_some(pages)
 }
 
 /// The request's page numbers. A list is the part of the title's own page
@@ -1714,10 +1815,10 @@ fn read_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
 /// one ([`half_submits`]). Page 0 does (an address never mapped yet): a list
 /// with a page the title does not own is read again for a while, up to
 /// 1.5 s; what it holds then is used as it is.
-fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
-    let mut pages = read_list(list, offset, len);
+fn page_list(list: *const usize, offset: usize, len: usize) -> Option<Vec<usize>> {
+    let mut pages = read_list(list, offset, len)?;
     if super::xmem::pages_known(&pages, offset, len) {
-        return pages;
+        return Some(pages);
     }
     // Timed from here: what took long before was the lock on the page table
     // (which the title's mapping calls hold), not the list.
@@ -1725,7 +1826,7 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
     let mut known = false;
     while !known && started.elapsed().as_millis() < 1500 {
         std::thread::sleep(std::time::Duration::from_millis(1));
-        pages = read_list(list, offset, len);
+        pages = read_list(list, offset, len)?;
         known = super::xmem::pages_known(&pages, offset, len);
     }
     tracing::warn!(
@@ -1733,7 +1834,7 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
         known,
         "dstorage: a destination's page list was not filled in yet"
     );
-    pages
+    Some(pages)
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -2076,7 +2177,7 @@ mod tests {
             let len = PAGE + 100;
             let r = request(PAGE_DESTINATION, at.cast(), len, std::ptr::null(), 0, len);
             let mut runs = 0;
-            let written = into_destination(&r, len, |out| {
+            let written = into_destination(&r, None, len, |out| {
                 runs += 1;
                 out.fill(0xa5);
                 // SAFETY: our own list.
@@ -2116,7 +2217,7 @@ mod tests {
             protect(PAGE_READWRITE)
         });
         let r = request(0, at as *mut c_void, plain.len(), file, 0, plain.len());
-        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(execute(&r, &Held::default()), Ok(()));
         assert_ne!(opener.join().unwrap(), 0);
         // SAFETY: as above, all of it readable.
         assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
@@ -2226,7 +2327,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read { request: r, note, held: Held::default() }));
     }
 
     #[test]
@@ -2392,6 +2493,52 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
+    }
+
+    #[test]
+    fn page_lists_on_the_stack_are_copied_at_submit_and_others_read_when_run() {
+        use crate::modules::xmem;
+        let mut physical = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, physical.as_mut_ptr()), 1);
+        let bytes = [17u8, 39];
+        let make = |list: *mut usize, src: &u8| {
+            request(PAGE_DESTINATION | MEMORY_SOURCE, list.cast(), 1, std::ptr::from_ref(src).cast(), 0, 1)
+        };
+        let mut stack = physical[0];
+        let mut heap = Box::new(physical[0]);
+        let from_stack = make(&mut stack, &bytes[0]);
+        let from_heap = make(&mut *heap, &bytes[1]);
+        let (mut held_stack, mut held_heap) = (Held::at_enqueue(&from_stack), Held::at_enqueue(&from_heap));
+        assert!(held_stack.stack_list && !held_heap.stack_list);
+        held_stack.submitted(&from_stack);
+        held_heap.submitted(&from_heap);
+        assert!(matches!(&held_stack.pages, Some(Ok(p)) if p[..] == [physical[0]]));
+        assert!(held_heap.pages.is_none());
+        // Both lists now name the second page: the stack one was copied.
+        stack = physical[1];
+        *heap = stack;
+        assert_eq!(execute(&from_stack, &held_stack), Ok(()));
+        assert_eq!(execute(&from_heap, &held_heap), Ok(()));
+        for (&page, expected) in physical.iter().zip(bytes) {
+            assert_eq!(xmem::page_window(&[page], 0, 1).unwrap().bytes(), &[expected]);
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(2, physical.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_released_page_list_fails_its_request_instead_of_faulting() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: a fresh allocation of ours, released before the read.
+        let list = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!list.is_null());
+        assert_eq!(read_list(list.cast(), 0, 1), Some(vec![0]));
+        // SAFETY: as above.
+        assert_ne!(unsafe { VirtualFree(list, 0, MEM_RELEASE) }, 0);
+        assert_eq!(read_list(list.cast(), 0, 1), None);
+        let byte = 5u8;
+        let r = request(PAGE_DESTINATION | MEMORY_SOURCE, list, 1, std::ptr::from_ref(&byte).cast(), 0, 1);
+        assert_eq!(execute(&r, &Held::default()), Err(E_INVALIDARG));
     }
 
     #[test]
