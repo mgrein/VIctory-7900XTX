@@ -455,3 +455,32 @@ fn an_automatic_barrier_inside_a_lane_branch_runs_on_narrow_hardware() {
     }
     eprintln!("ran automatic divergent barriers on the hardware device: 1, 10, 32, 33 and 64 lanes");
 }
+
+/// A wave64 mask copied a dword at a time into another pair across a branch (the spill pass's
+/// scalar moves) is still the mask it was copied from when both dwords come from it in order,
+/// and not when the high dword is the low one's (DexNom 76749ce5).
+#[test]
+fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+    use crate::ir::{EXEC, Reg, VCC};
+    for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE84_046A, // s_mov_b64 s[4:5], vcc
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0004, // s_cbranch_scc1 -> join at 32
+            0xBE82_036A, // s_mov_b32 s2, vcc_lo
+            high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+            0xBE84_0302, // s_mov_b32 s4, s2
+            0xBE85_0303, // s_mov_b32 s5, s3
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 256).unwrap();
+        let s = structure::structure(&p).unwrap();
+        let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+        assert_eq!(s.masks[&restored] == s.masks[&compare], intact, "high dword {high:#x}");
+    }
+}
