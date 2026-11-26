@@ -7550,9 +7550,51 @@ impl HostList {
             let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
             if args.0.len() > 1 && args.1 == 0 { args.0.split_off(1) } else { Vec::new() }
         };
+        // For the next list that needs one ([`list_buffers`]).
+        let mut extra = extra;
+        list_buffers(|b| {
+            b.give_batches(std::mem::take(&mut extra));
+            Some(())
+        });
         for buffer in extra {
             retire_resource(buffer);
         }
+    }
+
+    /// The list has run and goes (retired, or dropped): the buffers of its
+    /// own its recordings made on the translating threads go to the next
+    /// lists made instead ([`list_buffers`]). Each is in the state a new one
+    /// starts in (common: the list moves them back before it closes), and
+    /// the budget's words are zeroed.
+    pub(crate) fn give_back_buffers(&mut self) {
+        if !list_buffers_pooled() {
+            return;
+        }
+        let budget = self.budget.take().flatten();
+        let card = self.card_budget.take().flatten();
+        let batches = std::mem::take(&mut self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner()).0);
+        let args = self.indirect_args.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((_, data)) = &budget {
+            // SAFETY: the buffer's own mapped words; the list has run.
+            unsafe { std::ptr::write_bytes(*data as *mut u32, 0, 5) };
+        }
+        list_buffers(|b| {
+            if let Some(budget) = budget
+                && b.budgets.len() < LIST_BUFFERS_MOST
+            {
+                b.budgets.push(budget);
+            }
+            if let Some(card) = card
+                && b.cards.len() < LIST_BUFFERS_MOST
+            {
+                b.cards.push(card);
+            }
+            b.give_batches(batches);
+            if let Some(args) = args {
+                b.give_args(args);
+            }
+            Some(())
+        });
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -7568,6 +7610,9 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
+                if let Some(kept) = list_buffers(|b| b.budgets.pop()) {
+                    return Some(kept);
+                }
                 let (b, d) = host()?.shared_buffer(256)?;
                 Some((b, d as usize))
             })
@@ -7612,6 +7657,9 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
+        if let Some(kept) = list_buffers(|b| b.cards.pop()) {
+            return Some(kept);
+        }
         let buffer = host()?.uav_buffer(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
@@ -7693,8 +7741,15 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let kept = list_buffers(|b| b.take_args(alloc));
+        let (buffer, alloc) = match kept {
+            Some(kept) => kept,
+            None => {
+                let buffer = host()?.uav_buffer(alloc)?;
+                name(&buffer, || format!("indirect arguments {alloc:#x}"));
+                (buffer, alloc)
+            }
+        };
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
         if let Some((old_buf, _)) = old {
@@ -7715,8 +7770,14 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let made = match list_buffers(|b| b.batches.pop()) {
+                Some(kept) => kept,
+                None => {
+                    let made = host()?.uav_buffer(size)?;
+                    name(&made, || format!("indirect batches {size:#x}"));
+                    made
+                }
+            };
             args.0.push(made);
         }
         args.1 += 1;
@@ -10389,6 +10450,128 @@ impl Host {
                 None
             }
         }
+    }
+}
+
+/// Most of each kind of a list's own buffers [`list_buffers`] keeps.
+const LIST_BUFFERS_MOST: usize = 64;
+
+/// Bytes of indirect-argument buffers (of at most 1 MiB each) it keeps.
+const LIST_ARGS_BYTES: u64 = 16 << 20;
+
+/// Buffers of host lists that went ([`HostList::give_back_buffers`]), and
+/// batch buffers lists trimmed ([`HostList::trim_args`]), for the lists
+/// made after them.
+struct ListBuffers {
+    budgets: Vec<(ID3D12Resource, usize)>,
+    cards: Vec<ID3D12Resource>,
+    batches: Vec<ID3D12Resource>,
+    args: Vec<(ID3D12Resource, u64)>,
+}
+
+impl ListBuffers {
+    /// Keeps what there is room for; the rest is retired.
+    fn give_batches(&mut self, batches: Vec<ID3D12Resource>) {
+        for buffer in batches {
+            if self.batches.len() < LIST_BUFFERS_MOST {
+                self.batches.push(buffer);
+            } else {
+                retire_resource(buffer);
+            }
+        }
+    }
+
+    fn give_args(&mut self, (buffer, cap): (ID3D12Resource, u64)) {
+        let kept: u64 = self.args.iter().map(|(_, cap)| cap).sum();
+        if cap <= 1 << 20 && kept + cap <= LIST_ARGS_BYTES {
+            self.args.push((buffer, cap));
+        } else {
+            retire_resource(buffer);
+        }
+    }
+
+    /// The smallest kept of at least `cap` bytes.
+    fn take_args(&mut self, cap: u64) -> Option<(ID3D12Resource, u64)> {
+        let (i, _) = self.args.iter().enumerate().filter(|(_, (_, c))| *c >= cap).min_by_key(|(_, (_, c))| *c)?;
+        Some(self.args.swap_remove(i))
+    }
+}
+
+static LIST_BUFFERS: Mutex<ListBuffers> =
+    Mutex::new(ListBuffers { budgets: Vec::new(), cards: Vec::new(), batches: Vec::new(), args: Vec::new() });
+
+/// Whether the buffers of its own a host list makes on the threads that
+/// translate lists (the indirect budget and its copy in the card's memory,
+/// the batched clamps' and the clamped arguments' scratch) go to the lists
+/// made after it when it goes, and a trimmed list's batch buffers too
+/// (`VICTORY_LIST_BUFFERS=0`: each list makes its own and they are retired
+/// with it, as before). Lists that recorded big frames are retired at each
+/// recycling and made anew: profile x22 found 3.6 % of the translating
+/// threads' time making the budgets of new lists alone.
+fn list_buffers_pooled() -> bool {
+    crate::toggled!("VICTORY_LIST_BUFFERS")
+}
+
+/// `f` on the buffers kept; nothing when they are not ([`list_buffers_pooled`]).
+fn list_buffers<R>(f: impl FnOnce(&mut ListBuffers) -> Option<R>) -> Option<R> {
+    if !list_buffers_pooled() {
+        return None;
+    }
+    f(&mut LIST_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Under memory pressure: the buffers kept for lists go (retired).
+pub(crate) fn list_buffers_let_go() {
+    let kept = {
+        let mut b = LIST_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept: Vec<ID3D12Resource> = b.budgets.drain(..).map(|(buffer, _)| buffer).collect();
+        kept.append(&mut b.cards);
+        kept.append(&mut b.batches);
+        kept.extend(b.args.drain(..).map(|(buffer, _)| buffer));
+        kept
+    };
+    for buffer in kept {
+        retire_resource(buffer);
+    }
+}
+
+#[cfg(test)]
+mod list_buffer_tests {
+    use super::*;
+
+    /// A list that goes gives its budget back zeroed, for the next list; the
+    /// arguments' scratch kept is the smallest that fits, within its bytes.
+    #[test]
+    fn a_list_that_goes_leaves_its_buffers_to_the_next() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        if !list_buffers_pooled() {
+            return;
+        }
+        let mut list = host.new_list().expect("a host list");
+        assert!(list.budget().is_some());
+        let (buffer, data) = list.budget.get().cloned().flatten().expect("a budget");
+        // SAFETY: the budget's own mapped words.
+        unsafe { std::ptr::write_bytes(data as *mut u32, 0x5a, 5) };
+        list.give_back_buffers();
+        assert!(list.budget.get().is_none(), "given, not kept");
+        let kept = list_buffers(|b| Some(b.budgets.iter().any(|(k, _)| k.as_raw() == buffer.as_raw()))).unwrap();
+        assert!(kept, "the budget waits for the next list");
+        // SAFETY: as above.
+        let words = unsafe { std::slice::from_raw_parts(data as *const u32, 5) };
+        assert_eq!(words, [0; 5], "zeroed");
+
+        let mut b = ListBuffers { budgets: Vec::new(), cards: Vec::new(), batches: Vec::new(), args: Vec::new() };
+        let made = |cap: u64| (host.uav_buffer(cap).expect("a buffer"), cap);
+        for cap in [256 << 10, 64 << 10, 1 << 20] {
+            b.give_args(made(cap));
+        }
+        b.give_args(made(2 << 20));
+        assert_eq!(b.args.len(), 3, "none past 1 MiB");
+        assert_eq!(b.take_args(100 << 10).map(|(_, cap)| cap), Some(256 << 10));
+        assert_eq!(b.take_args(2 << 20).map(|(_, cap)| cap), None);
+        assert_eq!(b.take_args(1).map(|(_, cap)| cap), Some(64 << 10));
     }
 }
 

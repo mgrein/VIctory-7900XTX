@@ -315,12 +315,17 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { mut host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
         let most = idle_most();
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
+        if !ran.contains(&i) {
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
+            // (It has run: its buffers serve the lists made next.)
+            host.give_back_buffers();
             continue;
         }
         // A list that once recorded a big frame: its allocators keep that
@@ -328,6 +333,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let fat = list_fat();
         if fat > 0 && host.list.recorded_most() > fat {
             LISTS_FAT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            host.give_back_buffers();
             crate::host::retire(host);
             continue;
         }
@@ -341,6 +347,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         if idle.0.len() < most.0 && idle.1 + bytes <= most.1 {
             idle.0.push(Idle(host, bytes, now));
             idle.1 += bytes;
+        } else {
+            drop(idle);
+            host.give_back_buffers();
         }
     }
 }
@@ -379,8 +388,11 @@ fn idle_aged_out(stamps: &[u64], now: u64, pressed: bool) -> usize {
 /// `list::let_go_idle` (fxceless), with an age.
 #[cfg(windows)]
 pub(crate) fn let_go_idle(pressed: bool) -> usize {
+    if pressed {
+        crate::host::list_buffers_let_go();
+    }
     let now = crate::host::now_ms();
-    let gone: Vec<Idle> = {
+    let mut gone: Vec<Idle> = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let stamps: Vec<u64> = idle.0.iter().map(|Idle(_, _, at)| *at).collect();
         let n = idle_aged_out(&stamps, now, pressed);
@@ -392,6 +404,12 @@ pub(crate) fn let_go_idle(pressed: bool) -> usize {
         gone
     };
     let n = gone.len();
+    // Unless memory is short, their buffers serve the lists made next.
+    if !pressed {
+        for Idle(host, _, _) in &mut gone {
+            host.give_back_buffers();
+        }
+    }
     crate::host::trail(|| format!("sweep: {n} idle host lists let go{}", if pressed { " (memory pressure)" } else { "" }));
     crate::host::retire(gone);
     n
