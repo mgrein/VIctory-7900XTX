@@ -1113,10 +1113,28 @@ static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 static LEFT: Local<Cell<Option<(u64, u64, u64)>>> = Local::new(|| Cell::new(None));
 /// The thread's processor time when its running submission was called.
 static ENTERED: Local<Cell<(u64, u64)>> = Local::new(|| Cell::new((0, 0)));
-/// List-call nanoseconds of this thread since its last submission.
-static OURS: Local<Cell<u64>> = Local::new(|| Cell::new(0));
-/// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
-static UNSENT: Local<Cell<(u64, u64)>> = Local::new(|| Cell::new((0, 0)));
+/// This thread's list calls, in one value so that a call reaches it once:
+/// nanoseconds since its last submission, and the time not yet added to
+/// `RECORDERS` (nanoseconds, calls).
+static CALLS: Local<Cell<Calls>> = Local::new(|| Cell::new(Calls { ours: 0, unsent: 0, unsent_calls: 0 }));
+
+#[derive(Clone, Copy)]
+struct Calls {
+    ours: u64,
+    unsent: u64,
+    unsent_calls: u64,
+}
+
+/// List-call nanoseconds of this thread since its last submission, from now
+/// on 0.
+fn ours_taken() -> u64 {
+    CALLS.with(|c| {
+        let mut calls = c.get();
+        let ours = std::mem::take(&mut calls.ours);
+        c.set(calls);
+        ours
+    })
+}
 
 fn thread_id() -> u32 {
     // SAFETY: a plain query.
@@ -1165,21 +1183,25 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
-    add(C::RecordCalls, 1);
-    add(C::RecordNs, ns);
+    // One set of counters looked up for both.
+    let count = &COUNT[bank()].0;
+    count[C::RecordCalls as usize].fetch_add(1, Relaxed);
+    count[C::RecordNs as usize].fetch_add(ns, Relaxed);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
-    OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
-    // By thread, a couple of milliseconds at a time.
+    let (unsent, calls) = CALLS.with(|c| {
+        let was = c.get();
+        let (unsent, calls) = (was.unsent + ns, was.unsent_calls + 1);
+        // By thread, a couple of milliseconds at a time.
+        let (kept, kept_calls) = if unsent < 2_000_000 { (unsent, calls) } else { (0, 0) };
+        c.set(Calls { ours: was.ours + ns, unsent: kept, unsent_calls: kept_calls });
+        (unsent, calls)
+    });
     if unsent < 2_000_000 {
-        UNSENT.with(|u| u.set((unsent, calls)));
         return;
     }
-    UNSENT.with(|u| u.set((0, 0)));
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1198,7 +1220,7 @@ pub(crate) fn submission_begins() {
     }
     let (user, kernel) = thread_times();
     ENTERED.with(|e| e.set((user, kernel)));
-    let ours = OURS.with(|o| o.replace(0));
+    let ours = ours_taken();
     if let Some((left, u, k)) = LEFT.with(|l| l.get()) {
         let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
         let s = submitter(&mut all, thread_id());
@@ -1218,7 +1240,7 @@ pub(crate) fn submission_ends(lock: u64) {
     let (user, kernel) = thread_times();
     let (u, k) = ENTERED.with(|e| e.get());
     LEFT.with(|l| l.set(Some((now, user, kernel))));
-    OURS.with(|o| o.set(0));
+    ours_taken();
     let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
     let s = submitter(&mut all, thread_id());
     s.submissions += 1;
