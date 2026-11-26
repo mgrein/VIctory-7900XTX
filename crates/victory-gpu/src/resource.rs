@@ -1764,6 +1764,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        // For the sweep's drain of a block, which goes by its members.
+        crate::pool::owned_by(&host.texture, this as usize);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2238,48 +2240,60 @@ pub(crate) fn let_go_idle() {
     // (`crate::pool::draining`): every copy in such a block goes once all of
     // them are idle and held by nothing else, so that the block goes too,
     // the emptiest first and a few blocks a look. What is in a block only in
-    // part stays: letting go of some would free nothing.
+    // part stays: letting go of some would free nothing. A block is looked
+    // at by its members alone (`crate::pool::members`), up to `DRAIN_LOOK`
+    // of them a look, and no further than its first one that must stay: a
+    // walk of every texture took three locks for each idle one, once a
+    // second for good, with over 100,000 of them.
     if crate::pool::draining() {
         const DRAIN_IDLE_MS: u64 = 5_000;
         const DRAIN_BLOCKS: usize = 4;
-        let sparse = crate::pool::sparse_blocks();
-        let held: std::collections::HashMap<usize, u64> = sparse.iter().copied().collect();
-        let mut idle: std::collections::HashMap<usize, (u64, Vec<usize>)> = std::collections::HashMap::new();
-        for &at in all.iter().filter(|_| !held.is_empty()) {
-            // SAFETY: as above.
-            let r = unsafe { &*(at as *const Resource) };
-            let used = r.host.used.load(Relaxed);
-            if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, DRAIN_IDLE_MS, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-                continue;
-            }
-            let piece = {
-                let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-                // (The block first: most are in none of those looked at.)
-                made.as_ref().and_then(|(host, _)| {
-                    let (block, len) = crate::pool::piece_of(&host.texture).filter(|(block, _)| held.contains_key(block))?;
-                    (std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1).then_some((block, len))
-                })
-            };
-            if let Some((block, len)) = piece {
-                let entry = idle.entry(block).or_default();
-                entry.0 += len;
-                entry.1.push(at);
-            }
-        }
-        let mut drained = 0;
-        for &(block, block_held) in &sparse {
-            if drained == DRAIN_BLOCKS {
+        const DRAIN_LOOK: usize = PART;
+        use windows::core::Interface;
+        let (mut drained, mut members_looked) = (0, 0);
+        for (block, block_held) in crate::pool::sparse_blocks() {
+            if drained == DRAIN_BLOCKS || members_looked >= DRAIN_LOOK {
                 break;
             }
-            let Some((idle_bytes, ats)) = idle.get(&block) else {
-                continue;
-            };
-            if *idle_bytes < block_held {
+            let members = crate::pool::members(block);
+            let mut ats = Vec::with_capacity(members.len());
+            let mut idle_bytes = 0;
+            for (raw, len, owner) in members {
+                members_looked += 1;
+                // In the table, under its lock held here: alive.
+                if owner == 0 || !all.contains(&owner) {
+                    break;
+                }
+                // SAFETY: as above.
+                let r = unsafe { &*(owner as *const Resource) };
+                let used = r.host.used.load(Relaxed);
+                if used == 0
+                    || !fills(&r.desc)
+                    || !crate::host::long_ago(used, DRAIN_IDLE_MS, IDLE_FRAMES)
+                    || crate::texture::host_wrote(owner)
+                {
+                    break;
+                }
+                // Still its copy (the owner may have let go of it, or its
+                // address be another texture's now), and held by nothing
+                // else.
+                let idle = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|(host, _)| {
+                    host.texture.as_raw() as usize == raw
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if !idle {
+                    break;
+                }
+                idle_bytes += len;
+                ats.push(owner);
+            }
+            if idle_bytes < block_held {
                 continue;
             }
             drained += 1;
             let mut whole = true;
-            for &at in ats {
+            for at in ats {
                 // SAFETY: as above.
                 match unsafe { let_go_one(at, DRAIN_IDLE_MS, IDLE_FRAMES) } {
                     Some(gone) => {

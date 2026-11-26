@@ -125,16 +125,74 @@ pub(crate) fn sparse_blocks() -> Vec<(usize, u64)> {
 }
 
 /// The block a texture made in one lies in, and its piece's bytes.
+#[cfg(test)]
 pub(crate) fn piece_of(texture: &ID3D12Resource) -> Option<(usize, u64)> {
     let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
-    placed.get(&(texture.as_raw() as usize)).map(|p| (p.block, p.len))
+    placed.by_texture.get(&(texture.as_raw() as usize)).map(|(p, _)| (p.block, p.len))
 }
 
-/// Textures in blocks, by their raw pointer, and their pieces: from their
-/// making until their last reference goes. (Its lock is never held while
-/// another is taken.)
-static PLACED: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Piece>>> =
-    std::sync::LazyLock::new(Default::default);
+/// Notes that `texture`, made in a block, is the host copy of title texture
+/// `owner` (its address): [`members`] says so.
+pub(crate) fn owned_by(texture: &ID3D12Resource, owner: usize) {
+    let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, o)) = placed.by_texture.get_mut(&(texture.as_raw() as usize)) {
+        *o = owner;
+    }
+}
+
+/// The textures in `block`: their raw pointers, their pieces' bytes, and
+/// the title textures they were made the host copies of ([`owned_by`]; 0:
+/// none said). An owner may have let go of its copy since, and its address
+/// may be another's now: the caller checks that the owner's copy is the
+/// texture.
+pub(crate) fn members(block: usize) -> Vec<(usize, u64, usize)> {
+    let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    placed.by_block.get(&block).map_or_else(Vec::new, |in_block| {
+        in_block
+            .iter()
+            .filter_map(|raw| placed.by_texture.get(raw).map(|(p, owner)| (*raw, p.len, *owner)))
+            .collect()
+    })
+}
+
+/// Textures in blocks, by their raw pointer, their pieces and the title
+/// textures they are the host copies of, and by block: from their making
+/// until their last reference goes. The sweep drains a block by its
+/// members alone (`crate::resource::let_go_idle`), not by a walk of every
+/// texture: a play has over 100,000. (Its lock is never held while another
+/// is taken.)
+#[derive(Default)]
+struct Placed {
+    by_texture: std::collections::HashMap<usize, (Piece, usize)>,
+    by_block: std::collections::HashMap<usize, std::collections::HashSet<usize>>,
+}
+
+impl Placed {
+    fn insert(&mut self, raw: usize, piece: Piece) {
+        if let Some((old, _)) = self.by_texture.insert(raw, (piece, 0)) {
+            self.leave(raw, old.block);
+        }
+        self.by_block.entry(piece.block).or_default().insert(raw);
+    }
+
+    fn remove(&mut self, raw: usize) {
+        if let Some((piece, _)) = self.by_texture.remove(&raw) {
+            self.leave(raw, piece.block);
+        }
+    }
+
+    fn leave(&mut self, raw: usize, block: usize) {
+        if let Some(in_block) = self.by_block.get_mut(&block) {
+            in_block.remove(&raw);
+            if in_block.is_empty() {
+                self.by_block.remove(&block);
+            }
+        }
+    }
+}
+
+/// [`Placed`].
+static PLACED: std::sync::LazyLock<Mutex<Placed>> = std::sync::LazyLock::new(Default::default);
 
 /// Since the start: blocks drained (every copy in them let go) and the
 /// bytes of those copies.
@@ -539,7 +597,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&gone.texture);
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(gone.texture);
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
@@ -718,7 +776,7 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
-            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(&raw);
+            PLACED.lock().unwrap_or_else(|e| e.into_inner()).remove(raw);
         }
     }
 }
@@ -1011,12 +1069,16 @@ mod tests {
         let held = || lock(&TEXTURES).blocks[block].as_ref().map_or(0, |b| b.held);
         assert!(held() >= len);
         let raw = t.as_raw() as usize;
+        assert!(members(block).contains(&(raw, len, 0)), "a texture in a block is among its block's");
+        owned_by(&t, 0x1234);
+        assert!(members(block).contains(&(raw, len, 0x1234)), "with its owner once said");
         let other = t.clone();
         drop(t);
         assert_eq!(resting(), before);
         drop(other);
         assert_eq!(resting(), before + 1);
-        assert!(!PLACED.lock().unwrap().contains_key(&raw), "a texture gone is not known any more");
+        assert!(!PLACED.lock().unwrap().by_texture.contains_key(&raw), "a texture gone is not known any more");
+        assert!(members(block).iter().all(|&(r, ..)| r != raw), "nor among its block's");
         // SAFETY: the piece's mapping, 4096 bytes of it ours.
         unsafe {
             let (piece, _, at, data) = staging(host, 4096).unwrap();
