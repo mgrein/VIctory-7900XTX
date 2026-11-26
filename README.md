@@ -105,6 +105,8 @@ per run (median of the last 15 five-second lines):
 | Peak private memory | 29.5 GB | 25-26 GB |
 | Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.0-8.5 fps, 28-29 GB peak, no device loss in 10 min |
 | Device losses in 10-minute runs | none | none |
+| Heavier area (later save, ~4,000 draws), `play.ps1` NVIDIA profile | — | 67 ms (14.9 fps) |
+| Same area, ray tracing: emulated walk / DXR 1.1 ray queries | — | 153 ms (6.5 fps) / 108 ms (9.3 fps) |
 | Render queue (`VICTORY_REFLEX=1`, driver-measured) | not available | 0.2 ms |
 
 What made the difference on NVIDIA (each behind a `VICTORY_...` switch
@@ -141,7 +143,17 @@ described where it is read):
   title buffers' copies in the card's memory, the submission's list resets on
   a thread of ours.
 
-Known: with ray tracing on, the card's 11 GB fill and about 7 GB of the PC's
+**Ray tracing on the card's own units** (from maren-halv/VIctory-DXR,
+`VICTORY_NATIVE_RT=1`, what `play.ps1 -RayTracing` uses on NVIDIA): 47 of the
+title's 64 ray-walking programs become DXR 1.1 ray queries against
+acceleration structures the host builds; the other 17 keep the emulated
+walk. **Renderer ports 1 and 5** (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_CBV`,
+as DoubleGhosty/cool_fox's launcher) are on in the NVIDIA profile.
+
+Known: the frame is still bound by the processor (the card about 35-50 % busy
+without ray tracing): the four threads that translate list calls and the
+submitting thread. Areas with 6,000-8,000 draws a frame still run at 3-5 fps.
+With ray tracing on, the card's 11 GB fill and about 7 GB of the PC's
 memory is used as the card's, so 32 GB is tight. Whether interiors are lit
 correctly with the builder running was not checked by eye.
 
