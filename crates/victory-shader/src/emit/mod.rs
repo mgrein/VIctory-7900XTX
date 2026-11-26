@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod builder32_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -355,6 +357,12 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Translated in one of the approximate forms of a console wave64
+    /// program on a host of 32-lane waves ([`emit`]: each host wave's own
+    /// results where the console wave gives one): it runs, but not quite as
+    /// on the console. The structure builder is kept off while one of its
+    /// programs is ([`approximate_allowed`]).
+    pub approximate: bool,
 }
 
 impl HostShader {
@@ -440,6 +448,33 @@ fn box_rehydration(c: &Container, native: &NativeProgram) -> bool {
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1])
 }
 
+thread_local! {
+    /// See [`take_form`].
+    static FORM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// The form in which [`emit`] last translated a program on this thread
+/// (`exact`, or the retry that took it: `deep skips`, `local idiom`,
+/// `APPROXIMATE local`, ...; `still wave64` when a console wave64 program
+/// kept 64 lanes on a host of 32-lane waves); "" once taken. For
+/// `victory translate`'s summary.
+pub fn take_form() -> &'static str {
+    FORM.replace("")
+}
+
+/// `VICTORY_BVH_APPROXIMATE=1`: the structure builder's programs (those with
+/// a spilled user-data table) may take the approximate forms of a console
+/// wave64 program on a host of 32-lane waves, and the builder runs with such
+/// a program. Off by default: the builder's stages feed each other through
+/// memory, an approximate stage computes wrong offsets for the next, and
+/// per-half-wave builder programs lost the device (0x887A0006) within two
+/// minutes on an RTX 4070 SUPER (Marvisak #2711). Changes translations: in
+/// the shader cache's key.
+pub fn approximate_allowed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_APPROXIMATE").is_some_and(|v| v == "1"))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -451,6 +486,23 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    FORM.set("exact");
+    // The structure builder's programs on a host of 32-lane waves stop before the approximate
+    // forms ([`approximate_allowed`]); `held`: one was left out.
+    let approx_ok = !(crate::spill::is_spilled(native) && lower::host_max_wave() == 32) || approximate_allowed();
+    let mut held = false;
+    // A translation in one of the approximate forms, marked as such.
+    let approximate = |r: Result<(HostShader, Option<u32>), ShaderError>, form: &'static str| {
+        FORM.set(form);
+        r.map(|(mut shader, _)| {
+            shader.approximate = true;
+            shader
+        })
+    };
+    let exact_form = |r: Result<(HostShader, Option<u32>), ShaderError>, form: &'static str| {
+        FORM.set(form);
+        r.map(|(shader, _)| shader)
+    };
     // A program whose last group can be short, on a host of 32-lane waves: its threads past the
     // count kept in the program with EXEC holding only the started lanes, as on the console
     // ([`lower::with_live_entry`]), so that the two host waves of a console wave can meet.
@@ -474,6 +526,7 @@ pub fn emit(
         if let Ok((shader, wave)) = live
             && wave != Some(64)
         {
+            FORM.set("live entry");
             return Ok(shader);
         }
         lower::take_needs();
@@ -540,7 +593,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return exact_form(again, name);
                 }
             }
         }
@@ -565,7 +618,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return exact_form(again, "deep skips");
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -582,7 +635,7 @@ pub fn emit(
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return exact_form(again, "wide");
                         }
                     }
                 }
@@ -593,6 +646,11 @@ pub fn emit(
             if !local_on || exact_only {
                 continue;
             }
+            if !exact && !approx_ok {
+                held = true;
+                continue;
+            }
+            let local_form = if exact { "local idiom" } else { "APPROXIMATE local" };
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
@@ -600,7 +658,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return if exact { exact_form(local, local_form) } else { approximate(local, local_form) };
                     }
                 }
             }
@@ -608,11 +666,13 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return if exact { exact_form(local, local_form) } else { approximate(local, local_form) };
                 }
             }
         }
-        if local_on && !exact_only {
+        if local_on && !exact_only && !strict && !approx_ok {
+            held = true;
+        } else if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
                 for (name, f) in &forms {
@@ -620,14 +680,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return approximate(local, "APPROXIMATE any mask");
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return approximate(local, "APPROXIMATE any mask");
                 }
             }
         }
@@ -643,12 +703,21 @@ pub fn emit(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
-                Ok(_) => again,
+                Ok(_) => {
+                    FORM.set("wide (lane mask)");
+                    again
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
         other => other,
     };
+    if held && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("WAVE64-RETRY approximate forms not tried for a structure-builder program (VICTORY_BVH_APPROXIMATE=1 allows them)");
+    }
+    if matches!(&original, Ok((_, Some(64)))) && native.wave64 && lower::host_max_wave() == 32 {
+        FORM.set("still wave64");
+    }
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -663,6 +732,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    FORM.set("threaded");
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
 }
 
@@ -834,6 +904,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        approximate: false,
     };
     Ok((shader, wave_size))
 }
@@ -1616,6 +1687,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            approximate: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1628,6 +1700,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                approximate: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2237,6 +2310,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            approximate: false,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2390,6 +2464,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                approximate: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2806,6 +2881,7 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            approximate: false,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
