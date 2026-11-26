@@ -3448,7 +3448,8 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    static PLACES: MapHint = MapHint::new();
+    let mut places: ByCopy<Option<usize>> = PLACES.map();
     let scanning = std::time::Instant::now();
     for list in runs {
         for step in &list.deferred().copies {
@@ -3466,6 +3467,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    PLACES.held(places.len());
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -8506,7 +8508,8 @@ enum Touch {
 /// shaders, each with the range its refreshes before that cover.
 fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
     // (From, to, given to shaders.)
-    let mut spans: ByCopy<(usize, usize, bool)> = ByCopy::default();
+    static SPANS: MapHint = MapHint::new();
+    let mut spans: ByCopy<(usize, usize, bool)> = SPANS.map();
     for step in steps {
         match step {
             Touch::Refresh(copy, from, to) => {
@@ -8525,6 +8528,7 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
             Touch::Nothing | Touch::Part => {}
         }
     }
+    SPANS.held(spans.len());
     spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
 }
 
@@ -8818,7 +8822,8 @@ impl Batch {
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
     /// that `taken` names are not done on the CPU.
     fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        static COPIES: MapHint = MapHint::new();
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = COPIES.map();
         let mut touches = Vec::new();
         'steps: for list in runs {
             for (i, step) in list.deferred().copies.iter().enumerate() {
@@ -8835,6 +8840,7 @@ impl Batch {
                 });
             }
         }
+        COPIES.held(copies.len());
         let due: Vec<_> = written_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
