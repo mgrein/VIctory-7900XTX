@@ -13,6 +13,13 @@
 
 use std::sync::OnceLock;
 
+// Each routine's entry is marked a function in the symbol table (`.def`
+// ... `.type 32`, as the compiler marks its own): a profiler that names
+// addresses by the functions there gave their time to the function before
+// them (`replay::hook::noted<11>`, a few bytes of a method hook that only
+// a frame recording uses: 4.7% of the submitting thread in run x28 was
+// `rep movsb` here). The labels inside stay plain, and go with their
+// routine.
 std::arch::global_asm!(
     ".globl victory_safe_copy",
     ".globl victory_safe_copy_at",
@@ -21,6 +28,7 @@ std::arch::global_asm!(
     // rcx destination, rdx source, r8 bytes; eax: whether all were copied.
     // A leaf that leaves the stack alone (the two registers it must give
     // back are kept in volatile ones), so a stack walk through it works.
+    ".def victory_safe_copy", ".scl 2", ".type 32", ".endef",
     "victory_safe_copy:",
     "mov r10, rsi",
     "mov r11, rdi",
@@ -46,6 +54,7 @@ std::arch::global_asm!(
     // rcx destination, rdx what was there, r8 what is to be there, r9 blocks
     // of eight dwords: stores the dwords in which the two differ, and no
     // other byte. eax: whether all could be stored.
+    ".def victory_safe_put", ".scl 2", ".type 32", ".endef",
     "victory_safe_put:",
     "test r9, r9",
     "jz 4f",
@@ -87,6 +96,7 @@ std::arch::global_asm!(
     // is written. rax: the blocks left when a page of title memory could not
     // be read or written (0: all done). The counts: blocks in which the
     // second and third differed, dwords stored in title memory.
+    ".def victory_safe_merge", ".scl 2", ".type 32", ".endef",
     "victory_safe_merge:",
     "xor r10d, r10d",
     "xor r11d, r11d",
@@ -143,6 +153,7 @@ std::arch::global_asm!(
     // title memory is read once; where it differs from the one last seen it
     // goes over that one, and then its bit is set. eax: whether all could
     // be read (where one could not, those before it are done).
+    ".def victory_safe_changed", ".scl 2", ".type 32", ".endef",
     "victory_safe_changed:",
     "xor r10d, r10d",
     "test r8, r8",
