@@ -129,11 +129,48 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
+    pub const RAYTRACING_TIER_1_1: u64 = 1 << 25;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+}
+
+/// DXIL SM 6.6 `RayQuery` state query opcodes (`dx.op.rayQuery_State*`).
+#[allow(dead_code)]
+pub(crate) mod rq_op {
+    pub const COMMITTED_STATUS: u32 = 184;
+    pub const CANDIDATE_TYPE: u32 = 185;
+    pub const CANDIDATE_OBJECT_TO_WORLD_3X4: u32 = 186;
+    pub const CANDIDATE_WORLD_TO_OBJECT_3X4: u32 = 187;
+    pub const COMMITTED_OBJECT_TO_WORLD_3X4: u32 = 188;
+    pub const COMMITTED_WORLD_TO_OBJECT_3X4: u32 = 189;
+    pub const CANDIDATE_PROCEDURAL_PRIMITIVE_NON_OPAQUE: u32 = 190;
+    pub const CANDIDATE_TRIANGLE_FRONT_FACE: u32 = 191;
+    pub const COMMITTED_TRIANGLE_FRONT_FACE: u32 = 192;
+    pub const CANDIDATE_TRIANGLE_BARYCENTRICS: u32 = 193;
+    pub const COMMITTED_TRIANGLE_BARYCENTRICS: u32 = 194;
+    pub const RAY_FLAGS: u32 = 195;
+    pub const WORLD_RAY_ORIGIN: u32 = 196;
+    pub const WORLD_RAY_DIRECTION: u32 = 197;
+    pub const RAY_T_MIN: u32 = 198;
+    pub const CANDIDATE_TRIANGLE_RAY_T: u32 = 199;
+    pub const COMMITTED_RAY_T: u32 = 200;
+    pub const CANDIDATE_INSTANCE_INDEX: u32 = 201;
+    pub const CANDIDATE_INSTANCE_ID: u32 = 202;
+    pub const CANDIDATE_GEOMETRY_INDEX: u32 = 203;
+    pub const CANDIDATE_PRIMITIVE_INDEX: u32 = 204;
+    pub const CANDIDATE_OBJECT_RAY_ORIGIN: u32 = 205;
+    pub const CANDIDATE_OBJECT_RAY_DIRECTION: u32 = 206;
+    pub const COMMITTED_INSTANCE_INDEX: u32 = 207;
+    pub const COMMITTED_INSTANCE_ID: u32 = 208;
+    pub const COMMITTED_GEOMETRY_INDEX: u32 = 209;
+    pub const COMMITTED_PRIMITIVE_INDEX: u32 = 210;
+    pub const COMMITTED_OBJECT_RAY_ORIGIN: u32 = 211;
+    pub const COMMITTED_OBJECT_RAY_DIRECTION: u32 = 212;
+    pub const CANDIDATE_INSTANCE_CONTRIBUTION: u32 = 214;
+    pub const COMMITTED_INSTANCE_CONTRIBUTION: u32 = 215;
 }
 
 pub(crate) struct Types {
@@ -257,8 +294,10 @@ pub(crate) struct Shader {
     pub cmp_samplers: u64,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
-    /// Root SRVs (raw buffers) read, likewise.
+    /// Root SRVs (raw buffers or acceleration structures) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root SRV slots declared as `RaytracingAccelerationStructure` (kind 16).
+    rtas_root_srvs: Vec<u8>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -321,6 +360,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            rtas_root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -418,6 +458,10 @@ impl Shader {
     /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
     pub fn root_srv_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+            debug_assert!(
+                !self.rtas_root_srvs.contains(&slot),
+                "root SRV slot {slot} already bound as an acceleration structure"
+            );
             return h;
         }
         let r = self.m.i32(u32::from(slot));
@@ -436,6 +480,37 @@ impl Shader {
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_srvs.push((slot, h));
+        h
+    }
+
+    /// The handle of a bound `RaytracingAccelerationStructure` root SRV at
+    /// `t<slot>` in [`ROOT_CBV_SPACE`], emitted in the entry block so it
+    /// dominates every use.
+    #[allow(dead_code)]
+    pub(crate) fn rtas_root_srv_handle(&mut self, _block: usize, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+            debug_assert!(
+                self.rtas_root_srvs.contains(&slot),
+                "root SRV slot {slot} already bound as a raw buffer"
+            );
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 16, 0);
+        self.root_srvs.push((slot, h));
+        self.rtas_root_srvs.push(slot);
         h
     }
 
@@ -492,6 +567,9 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        if props0 & 0xff == 16 {
+            self.flags |= flags::RAYTRACING_TIER_1_1;
+        }
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -501,6 +579,158 @@ impl Shader {
             self.t.handle,
             216,
             &[h, p],
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn allocate_ray_query(&mut self, block: usize, const_ray_flags: u32) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let flags = self.m.i32(const_ray_flags);
+        let i32t = self.t.i32;
+        self.op(block, "allocateRayQuery", Attr::NoUnwind, i32t, 178, &[flags])
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn ray_query_trace_inline(
+        &mut self,
+        block: usize,
+        rq: V,
+        tlas: V,
+        ray_flags: V,
+        instance_mask: V,
+        origin: [V; 3],
+        t_min: V,
+        dir: [V; 3],
+        t_max: V,
+    ) {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let void = self.t.void;
+        self.op(
+            block,
+            "rayQuery_TraceRayInline",
+            Attr::NoUnwind,
+            void,
+            179,
+            &[
+                rq,
+                tlas,
+                ray_flags,
+                instance_mask,
+                origin[0],
+                origin[1],
+                origin[2],
+                t_min,
+                dir[0],
+                dir[1],
+                dir[2],
+                t_max,
+            ],
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_proceed(&mut self, block: usize, rq: V) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let i1 = self.t.i1;
+        self.op(block, "rayQuery_Proceed.i1", Attr::NoUnwind, i1, 180, &[rq])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_abort(&mut self, block: usize, rq: V) {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let void = self.t.void;
+        self.op(block, "rayQuery_Abort", Attr::NoUnwind, void, 181, &[rq]);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_commit_non_opaque_triangle_hit(&mut self, block: usize, rq: V) {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let void = self.t.void;
+        self.op(
+            block,
+            "rayQuery_CommitNonOpaqueTriangleHit",
+            Attr::NoUnwind,
+            void,
+            182,
+            &[rq],
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_commit_procedural_primitive_hit(
+        &mut self,
+        block: usize,
+        rq: V,
+        t_hit: V,
+    ) {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let void = self.t.void;
+        self.op(
+            block,
+            "rayQuery_CommitProceduralPrimitiveHit",
+            Attr::NoUnwind,
+            void,
+            183,
+            &[rq, t_hit],
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_state_i32(&mut self, block: usize, op: u32, rq: V) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let i32t = self.t.i32;
+        self.op(block, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, op, &[rq])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_state_i1(&mut self, block: usize, op: u32, rq: V) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let i1 = self.t.i1;
+        self.op(block, "rayQuery_StateScalar.i1", Attr::ReadOnly, i1, op, &[rq])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_state_f32(&mut self, block: usize, op: u32, rq: V) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let f32t = self.t.f32;
+        self.op(block, "rayQuery_StateScalar.f32", Attr::ReadOnly, f32t, op, &[rq])
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_state_vec_f32(&mut self, block: usize, op: u32, rq: V, comp: u8) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let c = self.m.i8(comp);
+        let f32t = self.t.f32;
+        self.op(
+            block,
+            "rayQuery_StateVector.f32",
+            Attr::ReadOnly,
+            f32t,
+            op,
+            &[rq, c],
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ray_query_state_mat_f32(
+        &mut self,
+        block: usize,
+        op: u32,
+        rq: V,
+        row: u32,
+        col: u8,
+    ) -> V {
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        let r = self.m.i32(row);
+        let c = self.m.i8(col);
+        let f32t = self.t.f32;
+        self.op(
+            block,
+            "rayQuery_StateMatrix.f32",
+            Attr::ReadOnly,
+            f32t,
+            op,
+            &[rq, r, c],
         )
     }
 
@@ -612,6 +842,7 @@ impl Shader {
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+                (flags::RAYTRACING_TIER_1_1, used.raytracing_tier_1_1),
             ] {
                 if !used {
                     self.flags &= !flag;
@@ -691,31 +922,71 @@ impl Shader {
             }
             let mut srvs = None;
             if !self.root_srvs.is_empty() {
-                let ty = self
-                    .m
-                    .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
+                let mut raw_u = None;
+                let mut rtas_u = None;
+                let mut rtas_extra = None;
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
-                    let ops = vec![
-                        Some(i32c(&mut self, n as u32)),
-                        Some(self.m.md_value(u)),
-                        Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
-                        Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
-                        Some(i32c(&mut self, 0)),
-                        None,
-                    ];
-                    list.push(Some(self.m.md_node(ops)));
-                    bindings.push(Binding {
-                        kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
-                        dxil_kind: 11,
-                    });
+                    if self.rtas_root_srvs.contains(&slot) {
+                        let u = *rtas_u.get_or_insert_with(|| {
+                            let ty = self.m.named_struct(
+                                "struct.RaytracingAccelerationStructure",
+                                vec![self.t.i32],
+                            );
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        });
+                        // Extra properties (tag 0 = ElementType, 4 = I32): required by DXIL validator.
+                        let extra = *rtas_extra.get_or_insert_with(|| {
+                            let t = i32c(&mut self, 0);
+                            let v = i32c(&mut self, 4);
+                            self.m.md_node(vec![Some(t), Some(v)])
+                        });
+                        let ops = vec![
+                            Some(i32c(&mut self, n as u32)),
+                            Some(self.m.md_value(u)),
+                            Some(empty),
+                            Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                            Some(i32c(&mut self, u32::from(slot))),
+                            Some(i32c(&mut self, 1)),
+                            Some(i32c(&mut self, 16)),
+                            Some(i32c(&mut self, 0)),
+                            Some(extra),
+                        ];
+                        list.push(Some(self.m.md_node(ops)));
+                        bindings.push(Binding {
+                            kind: 4,
+                            space: ROOT_CBV_SPACE,
+                            register: u32::from(slot),
+                            dxil_kind: 16,
+                        });
+                    } else {
+                        let u = *raw_u.get_or_insert_with(|| {
+                            let ty = self
+                                .m
+                                .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        });
+                        let ops = vec![
+                            Some(i32c(&mut self, n as u32)),
+                            Some(self.m.md_value(u)),
+                            Some(empty),
+                            Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                            Some(i32c(&mut self, u32::from(slot))),
+                            Some(i32c(&mut self, 1)),
+                            Some(i32c(&mut self, 11)),
+                            Some(i32c(&mut self, 0)),
+                            None,
+                        ];
+                        list.push(Some(self.m.md_node(ops)));
+                        bindings.push(Binding {
+                            kind: 4,
+                            space: ROOT_CBV_SPACE,
+                            register: u32::from(slot),
+                            dxil_kind: 11,
+                        });
+                    }
                 }
                 srvs = Some(self.m.md_node(list));
             }
@@ -964,6 +1235,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::RAYTRACING_TIER_1_1 != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

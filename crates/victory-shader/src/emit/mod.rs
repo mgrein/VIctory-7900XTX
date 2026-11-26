@@ -98,6 +98,8 @@ mod nv_fixes_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+#[cfg(all(test, windows))]
+mod rayquery_tests;
 mod rect;
 mod sampler;
 mod shader;
