@@ -1559,18 +1559,26 @@ fn published(start: usize, end: usize) -> bool {
 /// nanoseconds of changing protections (all threads); questions to Windows
 /// about holes; kernel askings refused; nanoseconds in kernel askings; the
 /// 4 KiB pages they found written; KiB of the submissions' joined askings
-/// that lay between their ranges.
+/// that lay between their ranges; KiB of the copies' spans a submission asks
+/// about that lay between their refreshed ranges ([`span_slack`]).
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+static ASKS: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
     ASKS[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A submission asks about the span of a copy's refreshed ranges, `kib` of
+/// which lie in none of them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn span_slack(kib: u64) {
+    tally(14, kib);
+}
+
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 14] {
+pub(crate) fn asks() -> [u64; 15] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
