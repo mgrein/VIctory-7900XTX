@@ -211,7 +211,10 @@ fn ram_trim_for(asked_mb: Option<u64>, total: Option<u64>) -> u64 {
     const GIB: u64 = 1 << 30;
     match asked_mb {
         Some(mb) => mb << 20,
-        None if total.is_some_and(|t| t <= 32 * GIB) => 4 * GIB,
+        // (4 GiB at first: on a 32 GB PC running the world the headroom sits
+        // near 2.2 GiB, so the trim never stopped and kept the list pools and
+        // the warm thread empty, run x30.)
+        None if total.is_some_and(|t| t <= 32 * GIB) => GIB,
         None => 2 * GIB,
     }
 }
@@ -12156,7 +12159,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(super::keep_freed_for(0x10de, Some(64 * GIB)));
         assert!(super::keep_freed_for(0x10de, None));
         // The pressure line: 4 GiB of commit headroom on 32 GiB and below.
-        assert_eq!(super::ram_trim_for(None, Some(32 * GIB - 1)), 4 * GIB);
+        assert_eq!(super::ram_trim_for(None, Some(32 * GIB - 1)), GIB);
         assert_eq!(super::ram_trim_for(None, Some(64 * GIB)), 2 * GIB);
         assert_eq!(super::ram_trim_for(None, None), 2 * GIB);
         assert_eq!(super::ram_trim_for(Some(0), Some(16 * GIB)), 0);

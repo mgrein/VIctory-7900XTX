@@ -253,12 +253,15 @@ fn idle_most() -> (usize, u64) {
     (count, 256 << 20)
 }
 
-/// [`idle_most`]'s count for `total` bytes of physical RAM: 512 from
-/// 48 GiB on, 160 at 32 GiB and below, in a line between (512 if the RAM
-/// is not known, as before).
+/// [`idle_most`]'s count for `total` bytes of physical RAM: 512 whatever
+/// the RAM. It was 160 at 32 GiB and below; with fat lists moved to a new
+/// allocator (`VICTORY_LIST_FAT_SWAP`) an idle list is small, and at 160 an
+/// RTX 4070 / 32 GB run dropped ~36 lists a frame for a full pool and made
+/// ~38 for an empty one (8.8 ms a frame of list making, run x30; 512: 0.3 ms,
+/// run x31).
 fn idle_cap_for(total: Option<u64>) -> usize {
     const GIB: u64 = 1 << 30;
-    const LOW: (u64, usize) = (32 * GIB, 160);
+    const LOW: (u64, usize) = (32 * GIB, 512);
     const HIGH: (u64, usize) = (48 * GIB, 512);
     let Some(total) = total else {
         return HIGH.1;
@@ -2597,11 +2600,11 @@ mod tests {
         use super::idle_cap_for;
         const GIB: u64 = 1 << 30;
         assert_eq!(idle_cap_for(None), 512);
-        assert_eq!(idle_cap_for(Some(16 * GIB)), 160);
-        assert_eq!(idle_cap_for(Some(32 * GIB)), 160);
+        assert_eq!(idle_cap_for(Some(16 * GIB)), 512);
+        assert_eq!(idle_cap_for(Some(32 * GIB)), 512);
         // A "32 GB" PC reports a little less than 32 GiB.
-        assert_eq!(idle_cap_for(Some(31 * GIB + 900 * (1 << 20))), 160);
-        assert_eq!(idle_cap_for(Some(40 * GIB)), 336);
+        assert_eq!(idle_cap_for(Some(31 * GIB + 900 * (1 << 20))), 512);
+        assert_eq!(idle_cap_for(Some(40 * GIB)), 512);
         assert_eq!(idle_cap_for(Some(48 * GIB)), 512);
         assert_eq!(idle_cap_for(Some(64 * GIB)), 512);
     }
