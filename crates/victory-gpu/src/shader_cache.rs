@@ -149,6 +149,25 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Native ray tracing (`VICTORY_NATIVE_RT=1`): traversal loops lifted
+        // to `RayQuery`, and the switches that pick which and how. Only when
+        // one is set, so the translations cached without them keep their key.
+        let native_rt = [
+            "VICTORY_NATIVE_RT",
+            "VICTORY_NATIVE_RT_ANYHIT",
+            "VICTORY_NATIVE_RT_TWO_PASS",
+            "VICTORY_NATIVE_RT_FILTER",
+        ];
+        if native_rt.iter().any(|name| std::env::var_os(name).is_some()) {
+            for name in native_rt {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                if let Some(value) = std::env::var_os(name) {
+                    bytes.extend_from_slice(value.as_encoded_bytes());
+                }
+                bytes.push(0);
+            }
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -171,7 +190,7 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| translate_tagged(c);
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,
@@ -180,10 +199,21 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// The translation of `container`, tagged with the first 16 hex digits of its
+/// BLAKE3 hash for `VICTORY_NATIVE_RT_FILTER` (only looked at with
+/// `VICTORY_NATIVE_RT=1`).
+fn translate_tagged(container: &[u8]) -> Result<HostShader, String> {
+    if !victory_shader::emit::native_rt() {
+        return victory_shader::emit::translate(container).map_err(|e| e.to_string());
+    }
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    victory_shader::emit::with_shader_id(&hash, || victory_shader::emit::translate(container)).map_err(|e| e.to_string())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| translate_tagged(c);
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),

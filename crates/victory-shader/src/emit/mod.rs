@@ -98,6 +98,7 @@ mod nv_fixes_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+mod rayquery_lift;
 #[cfg(all(test, windows))]
 mod rayquery_tests;
 mod rect;
@@ -229,6 +230,109 @@ pub fn builder_fences() -> bool {
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+/// Whether ray-tracing traversal shaders lower to native DXIL SM 6.6
+/// `RayQuery` (`VICTORY_NATIVE_RT=1`, off by default). Part of the
+/// translation: the shader cache keys on it.
+pub fn native_rt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_NATIVE_RT").ok().as_deref().map(str::trim) == Some("1"))
+}
+
+/// Whether closest-hit (`accept_first_hit == false`) `AnyHit` traversal loops
+/// also lift to SM 6.6 `RayQuery::Proceed()` (`VICTORY_NATIVE_RT_ANYHIT=1`,
+/// off by default; `OpaqueOnly`, `FrontBackTrack`, and `accept_first_hit`
+/// `AnyHit` loops always lift under `VICTORY_NATIVE_RT=1`). Part of the
+/// translation: the shader cache keys on it.
+pub fn native_rt_anyhit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_NATIVE_RT_ANYHIT").ok().as_deref().map(str::trim) == Some("1"))
+}
+
+/// Whether eligible `RAY_FLAG_NONE` closest-hit `AnyHit` loops split into a
+/// Pass 1 (`CULL_NON_OPAQUE`) `tMax` pre-shrink followed by Pass 2 (`CULL_OPAQUE`)
+/// `AnyHit` (`VICTORY_NATIVE_RT_TWO_PASS=0` disables; on by default, only
+/// reached with `VICTORY_NATIVE_RT_ANYHIT=1`). Part of the translation.
+pub fn native_rt_two_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_RT_TWO_PASS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a shader identified by `hash_hex` is selected by
+/// `VICTORY_NATIVE_RT_FILTER`: when unset or empty, matches every shader;
+/// otherwise matches comma-separated substrings case-insensitively.
+pub fn native_rt_matches(hash_hex: &str) -> bool {
+    static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let needles = FILTER.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_RT_FILTER")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if needles.is_empty() {
+        return true;
+    }
+    let hay = hash_hex.to_ascii_lowercase();
+    needles.iter().any(|n| hay.contains(n.as_str()))
+}
+
+thread_local! {
+    static CURRENT_SHADER_ID: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_NATIVE_RT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tags translations run inside `f` with an external shader identifier (e.g.
+/// the 16-char BLAKE3 container hash) for `VICTORY_NATIVE_RT_FILTER` matching.
+pub fn with_shader_id<T>(id: &str, f: impl FnOnce() -> T) -> T {
+    struct Guard(Option<String>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT_SHADER_ID.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = CURRENT_SHADER_ID.with(|cell| cell.borrow_mut().replace(id.to_owned()));
+    let _guard = Guard(prev);
+    f()
+}
+
+/// Whether the program being lowered on this thread lifts its traversal
+/// loops to `RayQuery` ([`native_rt`] and [`native_rt_matches`]).
+pub(super) fn native_rt_active() -> bool {
+    CURRENT_NATIVE_RT.with(std::cell::Cell::get)
+}
+
+fn with_native_rt_active<T>(active: bool, f: impl FnOnce() -> T) -> T {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT_NATIVE_RT.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = CURRENT_NATIVE_RT.with(|cell| cell.replace(active));
+    let _guard = Guard(prev);
+    f()
+}
+
+fn native_rt_selected(digest: &[u8; 16]) -> bool {
+    if !native_rt() {
+        return false;
+    }
+    let ext_match = CURRENT_SHADER_ID.with(|cell| cell.borrow().as_deref().is_some_and(native_rt_matches));
+    if ext_match {
+        return true;
+    }
+    let mut hex = String::with_capacity(32);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    native_rt_matches(&hex)
 }
 
 #[cfg(test)]
@@ -1028,16 +1132,18 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
+    let l = with_native_rt_active(native_rt_selected(&c.digest), || {
+        lower::lower(&lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        })
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {

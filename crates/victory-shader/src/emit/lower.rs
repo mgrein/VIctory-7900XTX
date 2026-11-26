@@ -319,6 +319,8 @@ struct Lower<'a> {
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
+    /// Immediate dominator per IR block (`usize::MAX` if unreachable).
+    idom: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
@@ -412,6 +414,24 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Pre-loop `TLAS + 48` root-pointer loads folded to `1` for lifted `RayQuery` loops.
+    tlas_root_loads: HashSet<Site>,
+    /// Replaced BVH metadata `global_load_*` / `s_load_*` sites (`CANDIDATE_*` / `COMMITTED_*`).
+    ray_meta_loads: HashMap<Site, super::rayquery_lift::RayMetaLoad>,
+    /// Lifted `RayLoop`s discovered in `Lower::new` and consumed in `Lower::run`.
+    ray_loops: Vec<super::rayquery_lift::RayLoop>,
+    /// IR entry blocks of lifted `RayLoop`s (replaced by `emit_ray_loop`).
+    ray_entries: HashSet<usize>,
+    /// IR blocks skipped during lowering (deleted BVH scaffolding).
+    ray_skipped: HashSet<usize>,
+    /// Pre-allocated `RayQuery` handles indexed by lifted `rq_group`.
+    ray_queries: Vec<V>,
+    /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle per `rq_group`.
+    ray_queries_opaque: Vec<Option<V>>,
+    /// Lazy candidate triangle queries (`RayT`, `Bary`, `FrontFace`) materialized on demand.
+    cand_inputs: HashMap<Value, (V, super::rayquery_lift::CandidateInput)>,
+    /// Per-DXIL-block cache of materialized lazy candidate queries.
+    cand_cache: HashMap<(usize, V, super::rayquery_lift::CandidateInput), V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1919,7 +1939,25 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let ray_loops = if super::native_rt_active() {
+            super::rayquery_lift::find_ray_loops(p, x.st, x.res, &scalar)
+        } else {
+            Vec::new()
+        };
+        let ray_entries: HashSet<usize> = ray_loops.iter().map(|rl| rl.entry_block).collect();
+        let ray_skipped: HashSet<usize> = ray_loops
+            .iter()
+            .flat_map(|rl| rl.skipped_blocks.iter().copied())
+            .collect();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        let live_insts = || {
+            p.blocks
+                .iter()
+                .enumerate()
+                .filter(|(b, _)| !ray_entries.contains(b) && !ray_skipped.contains(b))
+                .flat_map(|(_, blk)| &blk.insts)
+        };
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1941,7 +1979,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            console_lanes = live_insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -1966,7 +2004,7 @@ impl<'a> Lower<'a> {
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                let crosses = live_insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -2022,7 +2060,7 @@ impl<'a> Lower<'a> {
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
                 if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                     let mut why: Vec<&str> = Vec::new();
-                    for i in insts() {
+                    for i in live_insts() {
                         let n = i.name();
                         let r = if n.starts_with("v_mbcnt") {
                             "v_mbcnt"
@@ -2191,7 +2229,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: {
                 let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
@@ -2217,6 +2255,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            idom: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -2275,6 +2314,15 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            tlas_root_loads: HashSet::new(),
+            ray_meta_loads: HashMap::new(),
+            ray_loops,
+            ray_entries,
+            ray_skipped,
+            ray_queries: Vec::new(),
+            ray_queries_opaque: Vec::new(),
+            cand_inputs: HashMap::new(),
+            cand_cache: HashMap::new(),
         }
     }
 
@@ -2902,11 +2950,56 @@ impl<'a> Lower<'a> {
             }
         }
         self.find_coherent();
+        let ray_loops = std::mem::take(&mut self.ray_loops);
+        let ray_by_entry: HashMap<usize, usize> = ray_loops
+            .iter()
+            .enumerate()
+            .map(|(idx, rl)| (rl.entry_block, idx))
+            .collect();
+        self.tlas_root_loads = ray_loops
+            .iter()
+            .filter_map(|rl| rl.tlas_root_load)
+            .collect();
+        self.ray_meta_loads.clear();
+        let mut ray_skipped_insts: HashSet<Site> = HashSet::new();
+        let mut ray_anyhit_tail: HashMap<usize, usize> = HashMap::new();
+        for (idx, rl) in ray_loops.iter().enumerate() {
+            for &(site, kind) in &rl.committed_meta_loads {
+                self.ray_meta_loads.insert(
+                    site,
+                    super::rayquery_lift::RayMetaLoad {
+                        loop_idx: rl.rq_group,
+                        candidate: false,
+                        kind,
+                    },
+                );
+            }
+            if let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &rl.kind {
+                for &(site, kind) in &ah.cand_meta_loads {
+                    self.ray_meta_loads.insert(
+                        site,
+                        super::rayquery_lift::RayMetaLoad {
+                            loop_idx: rl.rq_group,
+                            candidate: true,
+                            kind,
+                        },
+                    );
+                }
+                for &ti in &ah.skipped_tail_insts {
+                    ray_skipped_insts.insert((ah.tail_block, ti));
+                }
+                ray_anyhit_tail.insert(ah.tail_block, idx);
+            }
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        self.idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
         for (n, &b) in order.iter().enumerate() {
+            if self.ray_skipped.contains(&b) {
+                continue;
+            }
             self.block[b] = Some(if n == 0 {
                 self.s.entry
             } else {
@@ -2915,6 +3008,9 @@ impl<'a> Lower<'a> {
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
+            if self.ray_skipped.contains(&b) || ray_by_entry.contains_key(&b) {
+                continue;
+            }
             let header = p.blocks[b]
                 .preds
                 .iter()
@@ -2932,9 +3028,208 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        // Pre-allocate one `RayQuery` handle per `rq_group` in the function entry block so every
+        // handle strictly dominates both in-loop any-hit blocks and shared post-loop metadata queries.
+        // Eligible closest-hit `AnyHit` groups also allocate a Pass 1 `CULL_NON_OPAQUE` handle.
+        self.ray_queries.clear();
+        self.ray_queries_opaque.clear();
+        let entry_dxil_blk = self.block[order[0]].expect("entry block");
+        let num_groups = ray_loops
+            .iter()
+            .map(|rl| rl.rq_group + 1)
+            .max()
+            .unwrap_or(0);
+        let mut group_flags: Vec<Option<u32>> = vec![None; num_groups];
+        let mut group_two_pass: Vec<bool> = vec![super::native_rt_two_pass(); num_groups];
+        for rl in &ray_loops {
+            let f = match rl.ray_flags {
+                super::rayquery_lift::RayInput::Const(f) => f,
+                _ => 0,
+            };
+            group_flags[rl.rq_group] = Some(match group_flags[rl.rq_group] {
+                Some(prev) => prev & f,
+                None => f,
+            });
+            group_two_pass[rl.rq_group] &= super::rayquery_lift::is_two_pass_eligible(rl);
+        }
+        let mut group_q2_flags: Vec<u32> = Vec::with_capacity(num_groups);
+        let mut group_q1_flags: Vec<u32> = Vec::with_capacity(num_groups);
+        for g in 0..num_groups {
+            let base_fl = group_flags[g].unwrap_or(0);
+            if group_flags[g].is_some() && group_two_pass[g] {
+                let q1_fl = base_fl | super::rayquery_lift::ray_flag::CULL_NON_OPAQUE;
+                let q2_fl = base_fl | super::rayquery_lift::ray_flag::CULL_OPAQUE;
+                self.ray_queries
+                    .push(self.s.allocate_ray_query(entry_dxil_blk, q2_fl));
+                self.ray_queries_opaque
+                    .push(Some(self.s.allocate_ray_query(entry_dxil_blk, q1_fl)));
+                group_q2_flags.push(q2_fl);
+                group_q1_flags.push(q1_fl);
+            } else {
+                self.ray_queries
+                    .push(self.s.allocate_ray_query(entry_dxil_blk, base_fl));
+                self.ray_queries_opaque.push(None);
+                group_q2_flags.push(base_fl);
+                group_q1_flags.push(0);
+            }
+        }
+        let mut pending_anyhits: HashMap<usize, super::rayquery_lift::PendingAnyHit> =
+            HashMap::new();
         for &b in &order {
+            if self.ray_skipped.contains(&b) {
+                continue;
+            }
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if let Some(&idx) = ray_by_entry.get(&b) {
+                let rl = &ray_loops[idx];
+                let offset = p.blocks[b].offset;
+                let resolve_ray_input =
+                    |this: &mut Self, inp: super::rayquery_lift::RayInput| -> Result<V, Stop> {
+                        match inp {
+                            super::rayquery_lift::RayInput::Const(k) => Ok(this.s.m.i32(k)),
+                            super::rayquery_lift::RayInput::Val(v)
+                            | super::rayquery_lift::RayInput::ShiftedMask(v) => {
+                                this.i32_of(v).map_err(|w| unsupported(offset, w))
+                            }
+                        }
+                    };
+                let tlas_src = Source::Loaded {
+                    load: rl.tlas_load,
+                    first: 0,
+                };
+                let tlas = self
+                    .handle(rl.tlas_load, &tlas_src, false, (16, 0))
+                    .map_err(|w| unsupported(offset, w))?;
+                let active_ray = if let Some(mask_val) = rl.active_ray_mask {
+                    match self.x.st.masks.get(&mask_val).copied() {
+                        Some(bm) if bm != Bool::TRUE => {
+                            Some(self.boolean(bm, self.cur).map_err(|w| unsupported(offset, w))?)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let origin = [
+                    resolve_ray_input(&mut self, rl.origin[0])?,
+                    resolve_ray_input(&mut self, rl.origin[1])?,
+                    resolve_ray_input(&mut self, rl.origin[2])?,
+                ];
+                let t_min = match rl.t_min {
+                    Some(inp) => Some(resolve_ray_input(&mut self, inp)?),
+                    None => None,
+                };
+                let dir = [
+                    resolve_ray_input(&mut self, rl.dir[0])?,
+                    resolve_ray_input(&mut self, rl.dir[1])?,
+                    resolve_ray_input(&mut self, rl.dir[2])?,
+                ];
+                let t_max = resolve_ray_input(&mut self, rl.t_max)?;
+                let instance_mask = match rl.instance_mask {
+                    super::rayquery_lift::RayInput::Const(_) => None,
+                    super::rayquery_lift::RayInput::Val(v)
+                    | super::rayquery_lift::RayInput::ShiftedMask(v) => {
+                        Some(self.i32_of(v).map_err(|w| unsupported(offset, w))?)
+                    }
+                };
+                let ray_flags = match rl.ray_flags {
+                    super::rayquery_lift::RayInput::Const(_) => None,
+                    super::rayquery_lift::RayInput::Val(v)
+                    | super::rayquery_lift::RayInput::ShiftedMask(v) => {
+                        Some(self.i32_of(v).map_err(|w| unsupported(offset, w))?)
+                    }
+                };
+                let init_min_front_t = match rl.kind {
+                    super::rayquery_lift::RayLoopKind::FrontBackTrack { init_min_front_t } => {
+                        Some(resolve_ray_input(&mut self, init_min_front_t)?)
+                    }
+                    _ => None,
+                };
+                let mut anyhit_inits = Vec::new();
+                let mut anyhit_entry_dxil = None;
+                let mut fallbacks = HashMap::new();
+                if let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &rl.kind {
+                    for sv in &ah.state_vars {
+                        anyhit_inits.push(resolve_ray_input(&mut self, sv.init)?);
+                    }
+                    anyhit_entry_dxil = Some(self.block[ah.entry_block].expect("anyhit entry"));
+                    for &(_, ci) in &ah.inputs {
+                        if let super::rayquery_lift::CandidateInput::CopyOf(pre) = ci
+                            && !fallbacks.contains_key(&pre)
+                            && let Ok(v) = self.i32_of(pre)
+                        {
+                            fallbacks.insert(pre, v);
+                        }
+                    }
+                }
+                for out in &rl.outputs {
+                    if let Some(fb) = out.fallback
+                        && !fallbacks.contains_key(&fb)
+                        && let Ok(v) = self.i32_of(fb)
+                    {
+                        fallbacks.insert(fb, v);
+                    }
+                    if let super::rayquery_lift::RayOutput::CopyOf(pre) = out.output
+                        && !fallbacks.contains_key(&pre)
+                        && let Ok(v) = self.i32_of(pre)
+                    {
+                        fallbacks.insert(pre, v);
+                    }
+                }
+                let inputs = super::rayquery_lift::ResolvedRayInputs {
+                    rq: self.ray_queries[rl.rq_group],
+                    rq_opaque: self.ray_queries_opaque[rl.rq_group],
+                    tlas,
+                    active_ray,
+                    origin,
+                    t_min,
+                    dir,
+                    t_max,
+                    instance_mask,
+                    ray_flags,
+                    group_const_flags: group_q2_flags[rl.rq_group],
+                    group_opaque_const_flags: group_q1_flags[rl.rq_group],
+                    init_min_front_t,
+                    anyhit_inits,
+                    anyhit_entry_dxil,
+                    fallbacks,
+                };
+                let exit_dxil = self.block[rl.exit_block].expect("lifted ray loop exit");
+                let emitted = super::rayquery_lift::emit_ray_loop(
+                    &mut self.s,
+                    self.cur,
+                    exit_dxil,
+                    rl,
+                    &inputs,
+                );
+                for (val, dxil_v) in emitted.outs {
+                    self.vals.insert(val, Val::I32(dxil_v));
+                }
+                self.tail[rl.exit_pred] = Some(emitted.tail);
+                if let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &rl.kind
+                    && let Some(pending) = emitted.pending_anyhit
+                {
+                    let rq = self.ray_queries[rl.rq_group];
+                    for &(val_id, ci) in &ah.inputs {
+                        if matches!(
+                            ci,
+                            super::rayquery_lift::CandidateInput::RayT
+                                | super::rayquery_lift::CandidateInput::Bary(_)
+                                | super::rayquery_lift::CandidateInput::FrontFace
+                        ) {
+                            self.cand_inputs.insert(val_id, (rq, ci));
+                        }
+                    }
+                    for &(atom_v, const_b) in &ah.const_lane_atoms {
+                        let bv = self.s.m.bool(const_b);
+                        self.lane_bits.insert(atom_v, bv);
+                    }
+                    self.tail[ah.opacity_block] = Some(pending.anyhit_bridge_blk);
+                    pending_anyhits.insert(idx, pending);
+                }
+                continue;
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -2964,6 +3259,10 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if ray_skipped_insts.contains(&(b, i)) {
+                    i += 1;
+                    continue;
+                }
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -2979,6 +3278,59 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.tail[b] = Some(self.cur);
+            if let Some(&loop_idx) = ray_anyhit_tail.get(&b) {
+                let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &ray_loops[loop_idx].kind
+                else {
+                    unreachable!()
+                };
+                let pending = pending_anyhits
+                    .remove(&loop_idx)
+                    .expect("pending anyhit for tail");
+                let offset = p.blocks[b].offset;
+                let mut accept = match self.x.st.masks.get(&ah.accept_mask).copied() {
+                    Some(bm) => self.boolean(bm, self.cur).map_err(|w| unsupported(offset, w))?,
+                    None => self
+                        .lane_bits
+                        .get(&ah.accept_mask)
+                        .copied()
+                        .ok_or_else(|| unsupported(offset, "any-hit accept mask"))?,
+                };
+                if ah.accept_invert {
+                    let t = self.s.m.bool(true);
+                    accept = self.s.m.bin(self.cur, Bin::Xor, accept, t);
+                }
+                let mut next_vals = Vec::with_capacity(ah.state_vars.len());
+                for sv in &ah.state_vars {
+                    next_vals.push(self.i32_of(sv.next).map_err(|w| unsupported(offset, w))?);
+                }
+                let tail_blk = self.cur;
+                self.s
+                    .m
+                    .terminate(tail_blk, Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk));
+                for k in 0..ah.state_vars.len() {
+                    let back_val = if let Some(cb) = pending.cand_check_blk {
+                        self.s.m.set_phi(
+                            pending.latch_phis[k],
+                            vec![
+                                (pending.state_phis[k], cb),
+                                (next_vals[k], tail_blk),
+                                (next_vals[k], pending.do_commit_blk),
+                            ],
+                        );
+                        pending.latch_phis[k]
+                    } else {
+                        next_vals[k]
+                    };
+                    self.s.m.set_phi(
+                        pending.state_phis[k],
+                        vec![
+                            (pending.init_vals[k], pending.start_blk),
+                            (back_val, pending.latch_blk),
+                        ],
+                    );
+                }
+                continue;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -3293,6 +3645,10 @@ impl<'a> Lower<'a> {
             Some(&val) => return Ok(val),
             None => {}
         }
+        if let Some(&(rq, ci)) = self.cand_inputs.get(&v) {
+            let x = self.materialize_cand_input(self.cur, rq, ci);
+            return Ok(Val::I32(x));
+        }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
             self.vals.insert(v, val);
@@ -3304,6 +3660,21 @@ impl<'a> Lower<'a> {
         }
         Err("a value defined after its use")
     }
+
+    fn materialize_cand_input(
+        &mut self,
+        block: usize,
+        rq: V,
+        ci: super::rayquery_lift::CandidateInput,
+    ) -> V {
+        if let Some(&x) = self.cand_cache.get(&(block, rq, ci)) {
+            return x;
+        }
+        let x = super::rayquery_lift::emit_cand_input(&mut self.s, block, rq, ci);
+        self.cand_cache.insert((block, rq, ci), x);
+        x
+    }
+
 
     /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
     /// `inputs`): `None` if it is not one.
@@ -6185,6 +6556,105 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        if self.tlas_root_loads.contains(&(b, i)) {
+            let one = self.s.m.i32(1);
+            for &(_, v) in &inst.writes {
+                self.vals.insert(v, Val::I32(one));
+            }
+            return Ok(());
+        }
+        if let Some(&meta) = self.ray_meta_loads.get(&(b, i)) {
+            let guard = self.guard(b, i).map_err(|w| unsupported(offset, w))?;
+            let rq = self.ray_queries[meta.loop_idx];
+            let vals = if !meta.candidate
+                && meta.kind != super::rayquery_lift::RayMetaKind::BlasBaseZero
+                && let Some(q1) = self.ray_queries_opaque[meta.loop_idx]
+            {
+                let i32t = self.s.t.i32;
+                let n = inst.writes.len();
+                let orig = self.cur;
+                let b_q2 = self.s.m.new_block();
+                let b_q1_check = self.s.m.new_block();
+                let b_q1 = self.s.m.new_block();
+                let b_join = self.s.m.new_block();
+                let mut zero_edge: Option<usize> = None;
+                let check_blk = if let Some(g) = guard {
+                    let b_check = self.s.m.new_block();
+                    self.s.m.terminate(orig, Term::CondBr(g, b_check, b_join));
+                    zero_edge = Some(orig);
+                    b_check
+                } else {
+                    orig
+                };
+                let one = self.s.m.i32(1);
+                let s2 = self.s.ray_query_state_i32(
+                    check_blk,
+                    super::shader::rq_op::COMMITTED_STATUS,
+                    rq,
+                );
+                let use_q2 = self.s.m.cmp(check_blk, pred::EQ, s2, one);
+                self.s
+                    .m
+                    .terminate(check_blk, Term::CondBr(use_q2, b_q2, b_q1_check));
+
+                let v2 = super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    b_q2,
+                    rq,
+                    false,
+                    meta.kind,
+                    n,
+                );
+                self.s.m.terminate(b_q2, Term::Br(b_join));
+
+                let s1 = self.s.ray_query_state_i32(
+                    b_q1_check,
+                    super::shader::rq_op::COMMITTED_STATUS,
+                    q1,
+                );
+                let use_q1 = self.s.m.cmp(b_q1_check, pred::EQ, s1, one);
+                self.s
+                    .m
+                    .terminate(b_q1_check, Term::CondBr(use_q1, b_q1, b_join));
+
+                let v1 = super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    b_q1,
+                    q1,
+                    false,
+                    meta.kind,
+                    n,
+                );
+                self.s.m.terminate(b_q1, Term::Br(b_join));
+
+                let zero = self.s.m.i32(0);
+                let mut merged = Vec::with_capacity(n);
+                for k in 0..n {
+                    let phi = self.s.m.phi(b_join, i32t);
+                    let mut inc = vec![(v2[k], b_q2), (v1[k], b_q1), (zero, b_q1_check)];
+                    if let Some(ze) = zero_edge {
+                        inc.push((zero, ze));
+                    }
+                    self.s.m.set_phi(phi, inc);
+                    merged.push(phi);
+                }
+                self.cur = b_join;
+                merged
+            } else {
+                super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    self.cur,
+                    rq,
+                    meta.candidate,
+                    meta.kind,
+                    inst.writes.len(),
+                )
+            };
+            for (&(reg, _), x) in inst.writes.iter().zip(vals) {
+                self.write(inst, reg, x, guard);
+            }
+            return Ok(());
+        }
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
@@ -8185,6 +8655,76 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    fn dominates(&self, a: usize, mut b: usize) -> bool {
+        if self.idom.get(a).copied().unwrap_or(usize::MAX) == usize::MAX
+            || self.idom.get(b).copied().unwrap_or(usize::MAX) == usize::MAX
+        {
+            return false;
+        }
+        while b != a {
+            let p = self.idom[b];
+            if p == b || p == usize::MAX {
+                return false;
+            }
+            b = p;
+        }
+        true
+    }
+
+    fn can_hoist_heap_index(&self, load: Site) -> bool {
+        if !self.scalar.contains_key(&load) {
+            return false;
+        }
+        let Some(li) = self
+            .x
+            .p
+            .blocks
+            .get(load.0)
+            .and_then(|b| b.insts.get(load.1))
+        else {
+            return false;
+        };
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            soffset,
+            ..
+        } = &li.fields
+        else {
+            return false;
+        };
+        let val_ready = |v: Value| -> bool {
+            if self.cand_inputs.contains_key(&v) {
+                return false;
+            }
+            if self.params.contains_key(&v) {
+                return true;
+            }
+            match self.vals.get(&v) {
+                Some(Val::I32(V::Const(_)) | Val::Bit(V::Const(_))) => true,
+                Some(Val::I32(_) | Val::Bit(_)) => self.def_block.get(&v).is_none_or(|&db| {
+                    !self.ray_entries.contains(&db)
+                        && !self.ray_skipped.contains(&db)
+                        && self.dominates(db, load.0)
+                }),
+                _ => false,
+            }
+        };
+        let Some(base_v) = li.read(Reg::S(*code)) else {
+            return false;
+        };
+        if !val_ready(base_v) {
+            return false;
+        }
+        match *soffset {
+            Operand::Scalar { code: NULL, .. } | Operand::Literal(_) => true,
+            Operand::Const(253) => li.read(Reg::Scc).is_some_and(val_ready),
+            Operand::Const(_) => true,
+            Operand::Scalar { code, .. } => li.read(Reg::S(code)).is_some_and(val_ready),
+            Operand::Vector { reg, .. } => li.read(Reg::V(reg)).is_some_and(val_ready),
+            _ => false,
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -8195,18 +8735,44 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props);
-                if let Some(&h) = self.handles.get(&key) {
-                    return Ok(h);
-                }
-                let index = self.heap_index(*load, *first, sampler)?;
-                let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle_at(self.cur, index, sampler, per_lane, props, bounded);
+                // In a program with lifted `RayQuery` loops (`VICTORY_NATIVE_RT`), a
+                // wave-uniform descriptor handle is made in the DXIL tail block of
+                // `load.0` (before its terminator) when `load.0` strictly dominates
+                // `self.cur_ir`, out of inner loops such as `RayQuery::Proceed`.
+                // Other programs make it where it is used, as before.
+                let target_blk = if !self.ray_entries.is_empty()
+                    && !per_lane
+                    && load.0 != self.cur_ir
+                    && !self.ray_entries.contains(&load.0)
+                    && !self.ray_skipped.contains(&load.0)
+                    && self.dominates(load.0, self.cur_ir)
+                    && let Some(dst_blk) = self.tail[load.0]
+                    && self.can_hoist_heap_index(*load)
+                {
+                    dst_blk
+                } else {
+                    self.cur
+                };
+                let key = (target_blk, *load, *first, sampler, props);
+                if let Some(&h) = self.handles.get(&key) {
+                    return Ok(h);
+                }
+                let saved_cur = std::mem::replace(&mut self.cur, target_blk);
+                let next_ir = if target_blk == saved_cur { self.cur_ir } else { load.0 };
+                let saved_ir = std::mem::replace(&mut self.cur_ir, next_ir);
+                let res = (|| -> Result<V, Why> {
+                    let index = self.heap_index(*load, *first, sampler)?;
+                    let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                    Ok(self
+                        .s
+                        .heap_handle_at(target_blk, index, sampler, per_lane, props, bounded))
+                })();
+                self.cur = saved_cur;
+                self.cur_ir = saved_ir;
+                let h = res?;
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -13647,12 +14213,17 @@ impl<'a> Lower<'a> {
                 && phi
                     .args
                     .iter()
-                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
+                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))) || self.cand_inputs.contains_key(a));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if !bit && let Some(&(rq, ci)) = self.cand_inputs.get(&arg) {
+                    let x = self.materialize_cand_input(qb, rq, ci);
+                    incoming.push((x, qb));
+                    continue;
+                }
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                     // A root parameter nothing read before the join (user
