@@ -44,11 +44,31 @@ pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Whether work that can write buffers (a dispatch, a draw whose
+    /// shaders store, a copy into a title buffer, our own clamp pass that
+    /// ends with no wait, a title barrier) may have been recorded since the
+    /// last barrier on every unordered access, ours or the title's
+    /// ([`Rec::barriers`]). Starts set; read by the argument clamp under
+    /// `VICTORY_CLAMP_BEFORE_UAV=0` (`crate::indirect`), which leaves its
+    /// own leading wait out when nothing is left to wait for.
+    uav_work: AtomicBool,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())), uav_work: AtomicBool::new(true) }
+    }
+
+    /// Whether work that may write buffers was recorded since the last
+    /// barrier on every unordered access ([`Rec::uav_work`]'s field).
+    pub(crate) fn uav_work(&self) -> bool {
+        self.uav_work.load(Relaxed)
+    }
+
+    /// Work that may write buffers was recorded (or, `false`, a barrier on
+    /// every unordered access was).
+    pub(crate) fn note_uav_work(&self, recorded: bool) {
+        self.uav_work.store(recorded, Relaxed);
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -58,6 +78,11 @@ impl Rec {
     pub(crate) unsafe fn barriers(&self, barriers: &[D3D12_RESOURCE_BARRIER]) {
         if barriers.is_empty() {
             return;
+        }
+        // A barrier on every unordered access orders all shader writes
+        // before what follows (held ones go before the next use too).
+        if barriers.iter().any(every_uav) {
+            self.uav_work.store(false, Relaxed);
         }
         if !on() {
             // (What was held while it was on goes first.)
@@ -97,6 +122,12 @@ impl Rec {
         held.0.clear();
         STATS[1].fetch_add(1, Relaxed);
     }
+}
+
+/// Whether `b` is an unordered access barrier on every resource.
+fn every_uav(b: &D3D12_RESOURCE_BARRIER) -> bool {
+    // SAFETY: the union's member is the one `Type` says; a pointer read.
+    b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && unsafe { b.Anonymous.UAV.pResource.is_none() }
 }
 
 /// The resource a state change or aliasing names (its interface pointer).

@@ -483,9 +483,13 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let wait = waits_before(list);
+    let recorded = record_clamp_waiting(c, &list.list, (dst, before), budget, src, count, spec, ahead, wait);
     if recorded {
         list.indirect_readable(dst);
+        // The pass wrote the budget; with no wait after it the next pass
+        // must wait for it.
+        list.list.note_uav_work(!clamp_after_uav() || !barrier_waits());
     }
     recorded
 }
@@ -495,12 +499,48 @@ fn clamp_into(
 /// buffer to indirect arguments alone, without the wait for every shader
 /// write before it. That move already orders the pass's writes of the
 /// scratch buffer before the executions read them; the only other buffer
-/// it writes is the list's budget, read by the next clamp alone, which
-/// begins with a wait for every shader write of its own. The batched pass
-/// has always ended so (`batch::record`).
+/// it writes is the list's budget, read by the next clamp alone, and that
+/// one then waits ([`waits_before`] knows the pass left writes behind).
+/// The batched pass has always ended so (`batch::record`).
 fn clamp_after_uav() -> bool {
+    #[cfg(test)]
+    if let Some((after, _)) = tests::FORCE_CLAMP_UAV.get() {
+        return after;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_AFTER_UAV").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_CLAMP_BEFORE_UAV=0` (experiment, off by default): a clamp pass
+/// leaves out its leading wait for every shader write when the list has
+/// recorded nothing that can write buffers since its last such wait
+/// (`Rec::uav_work`: dispatches, draws whose shaders store, copies into
+/// title buffers and title barriers set it, as do clamp passes that end
+/// with no wait; a barrier on every unordered access clears it). The first
+/// clamp of a recording always waits. Work recorded in the list by other
+/// paths than those is not seen, hence off by default: a missing wait
+/// lets a pass read arguments before they are written, which can hang the
+/// card.
+fn clamp_before_tracked() -> bool {
+    #[cfg(test)]
+    if let Some((_, tracked)) = tests::FORCE_CLAMP_UAV.get() {
+        return tracked;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_BEFORE_UAV").is_some_and(|v| v == "0"))
+}
+
+/// Whether a clamp pass recorded now in `list` begins with a wait for
+/// every shader write ([`clamp_before_tracked`]).
+fn waits_before(list: &HostList) -> bool {
+    /// A key of `HostList::first_use`: the first clamp since the reset.
+    const CLAMP_USE: usize = usize::MAX - 0x79;
+    if !clamp_before_tracked() {
+        return true;
+    }
+    // (Both asked: the first use is noted either way.)
+    let first = list.first_use(CLAMP_USE);
+    first || list.list.uav_work()
 }
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
@@ -512,12 +552,30 @@ fn clamp_after_uav() -> bool {
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_waiting(c, l, dst, budget, src, count, spec, ahead, true)
+}
+
+/// [`record_clamp_as`], beginning with a wait for every shader write only
+/// if `wait` ([`waits_before`]); it ends with one unless
+/// `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_waiting(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    wait: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -573,10 +631,7 @@ fn record_clamp_as(
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = barrier_waits();
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
@@ -589,13 +644,12 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
-    // `VICTORY_CLAMP_AFTER_UAV=0`: the trailing wait left out
-    // ([`clamp_after_uav`]).
-    let skip_second = usize::from(!waits || !clamp_after_uav());
+    // `wait`: the leading wait ([`waits_before`]); the trailing one unless
+    // `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]).
+    let (skip_first, skip_second) = (usize::from(!waits || !wait), usize::from(!waits || !clamp_after_uav()));
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -608,6 +662,15 @@ fn record_clamp_as(
         }
         l.ResourceBarrier(&second[skip_second..]);
     }
+    true
+}
+
+/// Whether clamps of one execution wait for every shader write at all
+/// (diagnostics: `VICTORY_BARRIER_TEST=indirect` leaves both waits out).
+fn barrier_waits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    return crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
     true
 }
 
@@ -662,7 +725,9 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    batch::record_waiting(c, &list.list, (&dst, before), budget, sources, jobs, waits_before(list));
+    // The pass ends with no wait for what it wrote (the budget).
+    list.list.note_uav_work(true);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -696,6 +761,13 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    thread_local! {
+        /// For this test's thread alone: `VICTORY_CLAMP_AFTER_UAV` (the
+        /// trailing wait kept) and `VICTORY_CLAMP_BEFORE_UAV=0` (the
+        /// leading one tracked), whatever the environment says.
+        pub(crate) static FORCE_CLAMP_UAV: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
@@ -3341,6 +3413,116 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every execution runs what it asked for");
         }
+    }
+
+    /// Batches and clamps of one execution through a host list with
+    /// `VICTORY_CLAMP_AFTER_UAV=0` and `VICTORY_CLAMP_BEFORE_UAV=0`: a pass
+    /// leaves its leading wait out only when the list recorded nothing
+    /// since the last wait for every shader write, and every execution
+    /// still runs the record it asked for, including one a dispatch of the
+    /// list wrote just before, twice (the second recording after a reset).
+    #[test]
+    fn host_list_clamps_with_fewer_waits() {
+        const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer records : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    records.Store3(0, uint3(7, 1, 1));
+}
+"#;
+        FORCE_CLAMP_UAV.set(Some((false, true)));
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let writer = compile_cs(&host.device, WRITER_CS).expect("writer shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let Some((source, ptr)) = host.shared_buffer(1024) else {
+            return;
+        };
+        for i in 0..16u32 {
+            for (w, word) in [1 + i, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+            }
+        }
+        let Some(written) = host.uav_buffer(256) else {
+            return;
+        };
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: live buffers.
+        let (hits_gpu, written_gpu) = unsafe { (hits_buf.GetGPUVirtualAddress(), written.GetGPUVirtualAddress()) };
+        let execute = |scratch: &ID3D12Resource, at: u64| {
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, at, None, 0);
+            }
+        };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            let mut expected = 0;
+            // The first pass of a recording waits; a batch leaves the budget
+            // written, so the passes after it wait too.
+            for k in 0..3u32 {
+                let (mut table, scratch) = open_batch(&list, (1, &source), &[(1, source.clone())]).unwrap();
+                assert!(list.list.uav_work(), "a batch ends with no wait");
+                for record in [k, 4 + k, k] {
+                    execute(&scratch, table.place(1, u64::from(record) * 32, 2).unwrap());
+                    expected += 1 + record;
+                }
+            }
+            // Clamps of one execution, ending with no wait of their own.
+            for record in [2u32, 9] {
+                let scratch = bound(&list, (&source, u64::from(record) * 32), None, (2, 12, 1)).unwrap();
+                assert!(list.list.uav_work(), "with VICTORY_CLAMP_AFTER_UAV=0 a clamp leaves its budget write behind");
+                execute(&scratch, 0);
+                expected += 1 + record;
+            }
+            // After a wait for every shader write: the next pass waits for
+            // nothing.
+            // SAFETY: an open list.
+            unsafe { list.list.barriers(&[uav_barrier()]) };
+            assert!(!list.list.uav_work());
+            let scratch = bound(&list, (&source, 32), None, (2, 12, 1)).unwrap();
+            execute(&scratch, 0);
+            expected += 2;
+            // Arguments a dispatch of the list writes, as the title's do:
+            // the dispatch is noted (`crate::draw`), the pass waits for it.
+            // SAFETY: an open list; the writer's root signature and
+            // pipeline; a buffer the test holds.
+            unsafe {
+                list.list.barriers(&[uav_barrier()]);
+                list.list.SetComputeRootSignature(&writer.root);
+                list.list.SetPipelineState(&writer.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, written_gpu);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.list.note_uav_work(true);
+            let (mut table, scratch) = open_batch(&list, (2, &written), &[(2, written.clone())]).unwrap();
+            execute(&scratch, table.place(2, 0, 2).unwrap());
+            expected += 7;
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every execution runs what it asked for");
+        }
+        FORCE_CLAMP_UAV.set(None);
     }
 
     /// What clamps of a frame cost on the card one by one and in batches

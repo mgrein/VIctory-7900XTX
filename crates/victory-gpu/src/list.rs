@@ -777,6 +777,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         if count > 0 {
             with_state(this, |_, state| state.synced());
+            // (`VICTORY_CLAMP_BEFORE_UAV=0`: a title barrier counts as work
+            // that may write buffers unless it waits for every shader
+            // write, which `Rec::barriers` notes.)
+            list.list.note_uav_work(true);
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
@@ -850,7 +854,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
         return;
     }
     if list.place_copy(to as usize, from as usize, len) {
-        with_state(this, |_, state| state.copied());
+        with_state(this, |_, state| state.copied(list));
     } else {
         list.defer_copy(to, from, len);
     }
@@ -1442,7 +1446,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
-            with_state(this, |_, state| state.copied());
+            with_state(this, |_, state| state.copied(list));
             return;
         }
         list.defer(move || {
