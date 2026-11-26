@@ -973,6 +973,9 @@ extern "system" fn present(
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
+    // How far the title runs ahead of the card (`crate::host::latency`).
+    #[cfg(windows)]
+    crate::host::latency::title_presented(frame);
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();

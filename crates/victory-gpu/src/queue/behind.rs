@@ -819,6 +819,8 @@ pub(super) fn present(this: This, texture: Option<(std::sync::Arc<crate::resourc
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    // How far the title runs ahead of the card (`crate::host::latency`).
+    crate::host::latency::title_presented(shown.frame);
 }
 
 /// For the frame-rate line.

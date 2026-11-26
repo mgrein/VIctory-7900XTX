@@ -3688,6 +3688,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+pub(crate) mod latency;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
@@ -5254,10 +5255,18 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
+    // (The present uses [`Host::execute_own_fenced`]; tests and diagnostics this.)
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     fn execute_own(&self, list: &HostList) -> u64 {
+        self.execute_own_fenced(list).0
+    }
+
+    /// [`Host::execute_own`], and the host fence value the flight signals
+    /// (0 with the number).
+    fn execute_own_fenced(&self, list: &HostList) -> (u64, u64) {
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
-            return 0;
+            return (0, 0);
         };
         let number = sent.number;
         {
@@ -5287,8 +5296,9 @@ impl Host {
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         LINE_MOVED.notify_one();
         RELAY_MOVED.notify_one();
+        let fence = *submitted;
         drop(submitted);
-        number
+        (number, fence)
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -9057,8 +9067,10 @@ impl Host {
             copy.close();
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let (flown, fence) = self.execute_own_fenced(copy);
                     p.ahead[i].1 = flown;
+                    // For the title's wait for the card (`VICTORY_FRAMES_AHEAD`).
+                    latency::note_flight(frame, fence);
                     flown
                 }
                 None => {
