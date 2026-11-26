@@ -145,7 +145,7 @@ per run (median of the last 15 five-second lines):
 | Peak private memory | 29.5 GB | 25-26 GB |
 | Ray tracing (`-RayTracing`) | builder off: 5 of 52 programs refused | builder runs whole (53 pipelines), 8.0-8.5 fps, 28-29 GB peak, no device loss in 10 min |
 | Device losses in 10-minute runs | none | none |
-| Heavier area (later save, ~4,000 draws), `play.ps1` NVIDIA profile | — | 67 ms (14.9 fps) |
+| Heavier area (later save, ~4,000 draws), `play.ps1` NVIDIA profile | 80 ms (12.5 fps) | 64 ms (15.7 fps) |
 | Same area, ray tracing: emulated walk / DXR 1.1 ray queries | — | 153 ms (6.5 fps) / 108 ms (9.3 fps) |
 | Render queue (`VICTORY_REFLEX=1`, driver-measured) | not available | 0.2 ms |
 
