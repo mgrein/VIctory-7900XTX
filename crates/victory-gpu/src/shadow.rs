@@ -5777,3 +5777,10 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// Under memory pressure (`crate::host::ram_pressure`): the snapshot
+/// buffers kept for reuse ([`POOL`]) go. Their count and bytes.
+pub(crate) fn drain_pool() -> (usize, u64) {
+    let gone = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+    (gone.len(), gone.iter().map(|v| v.capacity() as u64).sum())
+}
