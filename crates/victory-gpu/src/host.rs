@@ -3065,9 +3065,71 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     pieces
 }
 
+/// Whether a fetch with [`relay`] copies pieces that follow each other in
+/// the same copy and in the fetch buffer with one `CopyBufferRegion`
+/// (`VICTORY_RELAY_COPY_RUNS=0`: one copy per piece, as before). The bytes
+/// copied are the same; a fetch of a few thousand pieces records far fewer
+/// copies.
+fn relay_copy_runs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// The copies to record for the fetch of `pieces` ((copy, start, end, where
+/// in the fetch buffer)), in order: with `join`, a run of pieces that
+/// follow each other in the same copy and land one after the other in the
+/// buffer is one copy (copy, start of the first, end of the last, where
+/// the first lands); without, one per piece. The pieces themselves stay as
+/// they are for what is done with them after the fetch.
+fn relay_copy_runs<T>(pieces: &[(std::sync::Arc<T>, usize, usize, u64)], join: bool) -> impl Iterator<Item = (&T, usize, usize, u64)> {
+    pieces
+        .chunk_by(move |left, right| {
+            join && std::sync::Arc::ptr_eq(&left.0, &right.0)
+                && left.2 == right.1
+                && left.3.checked_add((left.2 - left.1) as u64) == Some(right.3)
+        })
+        .map(|run| {
+            let (copy, start, _, at) = &run[0];
+            (copy.as_ref(), *start, run[run.len() - 1].2, *at)
+        })
+}
+
 #[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
+
+    /// Joined runs copy the same bytes to the same places as one copy per
+    /// piece; pieces of other copies, out of order in the copy or in the
+    /// buffer, or whose place would overflow, stay apart.
+    #[test]
+    fn joined_fetch_copies_keep_bytes_order_and_copies() {
+        use std::sync::Arc;
+        let first = Arc::new([1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let second = Arc::new([11u8, 12, 13, 14, 15, 16, 17, 18]);
+        let pieces = [
+            (first.clone(), 0, 2, 0),
+            (first.clone(), 2, 4, 2),
+            (second.clone(), 4, 6, 4),
+            (second.clone(), 6, 7, 8),
+            (second.clone(), 0, 2, 9),
+            (first.clone(), 3, 5, 0),
+        ];
+        for (join, calls) in [(false, 6), (true, 5)] {
+            let mut bytes = [0xff; 11];
+            let mut count = 0;
+            for (source, lo, hi, at) in super::relay_copy_runs(&pieces, join) {
+                let at = at as usize;
+                bytes[at..at + hi - lo].copy_from_slice(&source[lo..hi]);
+                count += 1;
+            }
+            assert_eq!(count, calls);
+            assert_eq!(bytes, [4, 5, 3, 4, 15, 16, 0xff, 0xff, 17, 11, 12]);
+        }
+        let many: Vec<_> = (0..100).map(|i| (first.clone(), i % 8, i % 8 + 1, i as u64)).collect();
+        assert_eq!(super::relay_copy_runs(&many, true).count(), 13);
+        let overflow = [(first.clone(), 0, 1, u64::MAX), (first, 1, 2, 0)];
+        assert_eq!(super::relay_copy_runs(&overflow, true).count(), 2);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -5408,8 +5470,8 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in relay_copy_runs(check.as_ref().map_or(&pieces, |c| &c.copies), relay_copy_runs_on()) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
