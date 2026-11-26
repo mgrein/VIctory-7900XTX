@@ -1363,9 +1363,18 @@ pub(crate) static COLD_RANGES: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// the DexNom tree this took the world from 5.9 to 6.5 frames a second.
 /// Ported from local DexNom-tree work (`consider_cold`).
 fn cold_on() -> bool {
+    #[cfg(test)]
+    if TEST_COLD.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COLD_GUARDS").is_some_and(|v| v == "1"))
 }
+
+/// Tests of the guards for cold ranges turn them on for the process (they
+/// are off by default; other tests use small ranges they never take).
+#[cfg(test)]
+static TEST_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The fewest pages of a range [`consider_cold`] looks at: 16 MiB.
 const COLD_LEAST: usize = (16 << 20) / PAGE;
@@ -3198,6 +3207,7 @@ mod tests {
     /// still reported (by its fault) as written; freed, it is forgotten.
     #[test]
     fn a_quiet_big_range_goes_to_the_guards_and_still_reports_writes() {
+        TEST_COLD.store(true, std::sync::atomic::Ordering::Relaxed);
         const SIZE: usize = 32 << 20;
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -3232,6 +3242,7 @@ mod tests {
     /// asking, and guards it at the first asking after.
     #[test]
     fn a_range_going_cold_leaves_alone_what_the_kernel_writes() {
+        TEST_COLD.store(true, std::sync::atomic::Ordering::Relaxed);
         const SIZE: usize = 32 << 20;
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
