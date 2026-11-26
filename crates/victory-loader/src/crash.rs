@@ -110,6 +110,8 @@ fn title_output() -> String {
 
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
+    // Before the handler: it reads no environment variable and logs nothing itself.
+    crate::console_insn::configure();
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };

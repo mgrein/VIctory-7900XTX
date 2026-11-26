@@ -28,6 +28,83 @@ fn remembers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
 }
 
+/// Reads the switches above and below and starts the thread that logs what the handler saw:
+/// called before the vectored handler is installed. The handler runs on a title thread
+/// interrupted anywhere, perhaps inside the process environment lock or a lock the log takes:
+/// it reads no environment variable, waits for no lock and logs nothing itself (it counts in
+/// atomics, which that thread logs from).
+pub(crate) fn configure() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = (remembers(), patches_waits(), patches_clzero());
+        let _ = std::thread::Builder::new().name("console cpu log".into()).spawn(report);
+    });
+}
+
+/// The kinds of [`ConsoleOnly`] as numbers, for what is kept in atomics.
+const KINDS: [&str; 9] = ["ud2", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "extrq/insertq", "rdpid"];
+
+fn kind(what: ConsoleOnly) -> usize {
+    use ConsoleOnly as C;
+    match what {
+        C::Ud2 => 0,
+        C::Clwb => 1,
+        C::Monitorx => 2,
+        C::Mwaitx => 3,
+        C::Clzero => 4,
+        C::ClzeroLoop { .. } => 5,
+        C::Rdpru => 6,
+        C::Extrq { .. } | C::Insertq { .. } => 7,
+        C::Rdpid(_) => 8,
+    }
+}
+
+/// Where each kind faulted first (0: not yet).
+static FIRST: [std::sync::atomic::AtomicUsize; KINDS.len()] = [const { std::sync::atomic::AtomicUsize::new(0) }; KINDS.len()];
+
+/// Logs, outside the handler, each kind of instruction the first time it is emulated, how
+/// often the handler ran at every power of two from 65,536 on, and (diagnostics) the busiest
+/// places every five seconds.
+fn report() {
+    let mut logged = [false; KINDS.len()];
+    let mut next_count = 1u64 << 16;
+    #[cfg(feature = "diagnostics")]
+    let mut since = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for (k, first) in FIRST.iter().enumerate() {
+            let at = first.load(Relaxed);
+            if at != 0 && !logged[k] {
+                logged[k] = true;
+                if k != 0 {
+                    tracing::warn!(
+                        instruction = KINDS[k],
+                        at = format_args!("{at:#x}"),
+                        "a console CPU instruction this CPU lacks: emulated (logged once)"
+                    );
+                }
+            }
+        }
+        let emulated = EMULATED.load(Relaxed);
+        if emulated >= next_count {
+            while next_count <= emulated {
+                next_count <<= 1;
+            }
+            tracing::info!(
+                emulated,
+                asked = ASKED.load(Relaxed),
+                zeroed_mb = ZEROED.load(Relaxed) >> 20,
+                "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        if since.elapsed().as_secs() >= 5 {
+            sites::line(since.elapsed().as_secs_f64());
+            since = std::time::Instant::now();
+        }
+    }
+}
+
 /// Answers a remembered region gives before Windows is asked about it again: one freed or
 /// protected meanwhile is forgotten then.
 const ANSWERS: u32 = 4096;
@@ -135,7 +212,12 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    // Never waited for (see `configure`): busy, the loop is emulated this time.
+    let mut stubs = match STUBS.try_lock() {
+        Ok(stubs) => stubs,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
     }
@@ -171,8 +253,17 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
 }
 
 /// One thread at a time changes code: a second one would take the first one's loosened
-/// protection for the page's own.
+/// protection for the page's own. Never waited for (see [`configure`]): a thread that finds it
+/// taken leaves the code as it is and emulates the instruction this time.
 static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn patching() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match PATCHING.try_lock() {
+        Ok(one) => Some(one),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
 
 /// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
 /// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
@@ -188,7 +279,7 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
     if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
-    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_one) = patching() else { return false };
     let word = (at & !15) as *mut u128;
     let here = (at & 15)..(at & 15) + N;
     let mut old = 0u32;
@@ -232,7 +323,6 @@ mod sites {
     static SITES: [(AtomicUsize, AtomicUsize, AtomicU64); 512] =
         [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0)) }; 512];
     const NAMES: [&str; 8] = ["other", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "extrq/insertq"];
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     static PATCHED: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn patched() {
@@ -262,19 +352,10 @@ mod sites {
             }
             i = (i + 1) % SITES.len();
         }
-        // Now and then: is a line due? Never waited for.
-        if let Ok(mut last) = LAST.try_lock() {
-            let since = *last.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed().as_secs() >= 5 {
-                let s = since.elapsed().as_secs_f64();
-                *last = Some(std::time::Instant::now());
-                drop(last);
-                line(s);
-            }
-        }
     }
 
-    fn line(seconds: f64) {
+    /// The line for the last `seconds` (from `report`, outside the handler).
+    pub(super) fn line(seconds: f64) {
         let mut all: Vec<(u64, usize, usize)> =
             SITES.iter().map(|s| (s.2.swap(0, Relaxed), s.0.load(Relaxed), s.1.load(Relaxed))).filter(|s| s.0 > 0).collect();
         all.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
@@ -379,15 +460,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
     let Some((what, len)) = decode::decode(code) else { return 0 };
-    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut seen) = SEEN.lock()
-        && !seen.contains(&std::mem::discriminant(&what))
-    {
-        seen.push(std::mem::discriminant(&what));
-        if what != ConsoleOnly::Ud2 {
-            tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
-        }
-    }
+    // Logged by `report`, outside the handler.
+    let _ = FIRST[kind(what)].compare_exchange(0, rip, Relaxed, Relaxed);
     #[cfg(feature = "diagnostics")]
     if what != ConsoleOnly::Ud2 {
         sites::count(rip, what);
@@ -398,12 +472,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // nothing to write back on the PC: patched to NOPs, no exception next time
             use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
             let mut old = 0u32;
-            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
+            if let Some(_one) = patching() {
+                // SAFETY: the instruction's own bytes, made writable for the patch and restored.
+                unsafe {
+                    if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                        std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
+                        VirtualProtect(rip as *const _, len, old, &mut old);
+                    }
                 }
             }
         }
@@ -522,16 +597,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
     }
     ctx.Rip += len as u64;
-    // How often this runs at all (each one is an exception: a trip into Windows and back).
-    let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
-    if emulated >= 1 << 16 && emulated.is_power_of_two() {
-        tracing::info!(
-            emulated,
-            asked = ASKED.load(Relaxed),
-            zeroed_mb = ZEROED.load(Relaxed) >> 20,
-            "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
-        );
-    }
+    // How often this runs at all (each one is an exception: a trip into Windows and back;
+    // logged by `report`).
+    EMULATED.fetch_add(1, Relaxed);
     CONTINUE_EXECUTION
 }
 
