@@ -52,7 +52,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<Pending>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -102,6 +102,51 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// The ranges a copy's shaders write ([`Shadow::writing`]), in the order
+/// they were declared, each once, and the same ranges in a set: dispatches
+/// declare the same ranges thousands of times, and whether one is declared
+/// already was a walk over all of them (after fxceless/victory-fork PR
+/// #1159, fffluffy-dev). Read as the list; changed only through its own
+/// methods, which keep the two alike.
+#[derive(Default)]
+struct Pending {
+    ranges: Vec<(usize, usize)>,
+    set: std::collections::HashSet<(usize, usize)>,
+}
+
+impl std::ops::Deref for Pending {
+    type Target = Vec<(usize, usize)>;
+    fn deref(&self) -> &Self::Target {
+        &self.ranges
+    }
+}
+
+impl Pending {
+    /// Whether `range` is declared.
+    fn contains(&self, range: &(usize, usize)) -> bool {
+        self.set.contains(range)
+    }
+
+    /// Declares `range`, unless it is already.
+    fn push(&mut self, range: (usize, usize)) {
+        if self.set.insert(range) {
+            self.ranges.push(range);
+        }
+    }
+
+    /// Keeps the ranges `keep` says to.
+    fn retain(&mut self, mut keep: impl FnMut(&(usize, usize)) -> bool) {
+        let set = &mut self.set;
+        self.ranges.retain(|r| {
+            let kept = keep(r);
+            if !kept {
+                set.remove(r);
+            }
+            kept
+        });
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1031,6 +1076,81 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+#[cfg(test)]
+mod writing_tests {
+    use super::{Pending, outside};
+
+    /// The parts of `[from, to)` no range of `pending` holds, cutting each
+    /// out in turn as `Shadow::writing` did, and the lists that made.
+    fn one_at_a_time(from: usize, to: usize, pending: &[(usize, usize)]) -> (Vec<(usize, usize)>, usize) {
+        let (mut parts, mut lists) = (vec![(from, to)], 1);
+        for &(a, e) in pending {
+            let mut rest = Vec::with_capacity(parts.len() + 1);
+            lists += 1;
+            for (from, to) in parts {
+                if e <= from || a >= to {
+                    rest.push((from, to));
+                    continue;
+                }
+                if from < a {
+                    rest.push((from, a));
+                }
+                if e < to {
+                    rest.push((e, to));
+                }
+            }
+            parts = rest;
+        }
+        (parts.into_iter().filter(|&(a, e)| a < e).collect(), lists)
+    }
+
+    /// Overlapping, repeated, touching and empty declared ranges: one pass
+    /// gives the same non-empty parts, in order, with two lists a range
+    /// instead of one per range declared before it (fxceless/victory-fork
+    /// PR #1159, fffluffy-dev).
+    #[test]
+    fn a_new_range_s_parts_are_those_one_cut_at_a_time_gave() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % n
+        };
+        let (mut before, mut after) = (0, 0);
+        let mut pending = Pending::default();
+        for _ in 0..960 {
+            let a = next(1 << 16);
+            let range = (a, a + [0, 1, 16, 256, 4096, 40_000][next(6)]);
+            let (old, lists) = one_at_a_time(range.0, range.1, &pending);
+            let new = outside(range.0, range.1, pending.to_vec());
+            assert_eq!(new.iter().copied().filter(|&(a, e)| a < e).collect::<Vec<_>>(), old, "{range:?}");
+            assert!(new.windows(2).all(|w| w[0].1 <= w[1].0), "in order, apart");
+            (before, after) = (before + lists, after + 2);
+            let had = pending.ranges.contains(&range);
+            assert_eq!(pending.contains(&range), had);
+            pending.push(range);
+            assert_eq!(pending.len(), pending.set.len());
+        }
+        assert!(after * 100 < before, "lists for 960 declared ranges: {before} one at a time, {after} in one pass");
+    }
+
+    /// The set and the list of declared ranges stay alike through pushes
+    /// of ranges declared already and through what is let go.
+    #[test]
+    fn declared_ranges_are_listed_once_and_let_go_from_both() {
+        let mut pending = Pending::default();
+        for r in [(0, 16), (8, 32), (0, 16), (64, 80), (8, 32)] {
+            pending.push(r);
+        }
+        assert_eq!(*pending, vec![(0, 16), (8, 32), (64, 80)]);
+        pending.retain(|&(a, _)| a != 8);
+        assert_eq!(*pending, vec![(0, 16), (64, 80)]);
+        assert!(!pending.contains(&(8, 32)) && pending.contains(&(64, 80)));
+        pending.push((8, 32));
+        assert_eq!(*pending, vec![(0, 16), (64, 80), (8, 32)]);
+        assert_eq!(pending.set.len(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -3190,24 +3310,12 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        // In one pass over the declared ranges, sorted ([`outside`]; after
+        // fxceless/victory-fork PR #1159, fffluffy-dev): cutting them out one
+        // at a time made a list per declared range for every new one
+        // (461,280 lists for 960 distinct ranges).
+        let (from, to) = self.inside(address, len);
+        let parts = outside(from, to, pending.iter().map(|&(a, e)| self.inside(a, e - a)).collect());
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
