@@ -373,9 +373,7 @@ pub fn on() -> bool {
     RECORDER.get().is_some()
 }
 
-thread_local! {
-    static OURS: Cell<u32> = const { Cell::new(0) };
-}
+static OURS: crate::local::Local<Cell<u32>> = crate::local::Local::new(|| Cell::new(0));
 
 /// While it lives, this thread's D3D12 calls are our own: not recorded.
 pub(super) struct Ours;

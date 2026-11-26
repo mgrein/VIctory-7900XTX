@@ -100,7 +100,7 @@ pub(crate) fn on() -> bool {
 }
 
 pub(super) fn thread() -> u32 {
-    thread_local!(static ID: Cell<u32> = const { Cell::new(0) });
+    static ID: crate::local::Local<Cell<u32>> = crate::local::Local::new(|| Cell::new(0));
     ID.with(|id| {
         if id.get() == 0 {
             // SAFETY: a plain query.
@@ -225,10 +225,8 @@ pub(crate) fn called(took: std::time::Duration) {
     let inside = (took.as_nanos() as u64).saturating_mul(frequency()) / 1_000_000_000;
     let t1 = ticks();
     let t0 = t1 - inside;
-    thread_local! {
-        /// The run under way: from, to, calls, ticks inside them.
-        static RUN: Cell<(u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
-    }
+    /// The run under way: from, to, calls, ticks inside them.
+    static RUN: crate::local::Local<Cell<(u64, u64, u64, u64)>> = crate::local::Local::new(|| Cell::new((0, 0, 0, 0)));
     RUN.with(|run| {
         let (from, to, calls, sum) = run.get();
         if calls > 0 && micros(t0.saturating_sub(to)) < RUN_GAP {
@@ -245,10 +243,8 @@ pub(crate) fn called(took: std::time::Duration) {
     }
 }
 
-thread_local! {
-    /// What the wait this thread makes now stands for ([`card_wait`]).
-    static CARD: Cell<u64> = const { Cell::new(0) };
-}
+/// What the wait this thread makes now stands for ([`card_wait`]).
+static CARD: crate::local::Local<Cell<u64>> = crate::local::Local::new(|| Cell::new(0));
 
 /// While it lives, this thread's waits are for the card.
 pub(crate) struct CardWait(());
@@ -313,10 +309,8 @@ pub(crate) fn polled(at: usize, value: u64) {
     if !on() {
         return;
     }
-    thread_local! {
-        /// The same answer, again and again: fence, value, from, to.
-        static SAME: Cell<(usize, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
-    }
+    /// The same answer, again and again: fence, value, from, to.
+    static SAME: crate::local::Local<Cell<(usize, u64, u64, u64)>> = crate::local::Local::new(|| Cell::new((0, 0, 0, 0)));
     let t = ticks();
     SAME.with(|same| {
         let (fence, was, from, to) = same.get();

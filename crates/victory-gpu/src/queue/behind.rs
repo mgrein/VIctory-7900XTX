@@ -663,10 +663,8 @@ fn number(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
 
-thread_local! {
-    /// This is the thread that does what is in the line.
-    static OURS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// This is the thread that does what is in the line.
+static OURS: crate::local::Local<std::cell::Cell<bool>> = crate::local::Local::new(|| std::cell::Cell::new(false));
 
 /// Whether submissions are prepared by a thread of ours
 /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
@@ -971,9 +969,7 @@ mod tests {
         }
     }
 
-    thread_local! {
-        static FORCED_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
+    static FORCED_HERE: crate::local::Local<std::cell::Cell<u32>> = crate::local::Local::new(|| std::cell::Cell::new(0));
 
     fn fence() -> usize {
         let mut f = std::ptr::null();

@@ -5,9 +5,12 @@
 //! `VICTORY_MEMORY_CATEGORIES=1` for one extra periodic line that gathers the
 //! memory categories already counted here into one approximation.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use crate::local::Local;
 
 /// Counters since the last line.
 pub(crate) enum C {
@@ -148,15 +151,18 @@ static COUNT: [Bank<COUNTERS>; BANKS] = [const { Bank([const { AtomicU64::new(0)
 #[inline]
 fn bank() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    thread_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) });
-    // (Asked by the allocator too: nothing here allocates.)
-    MINE.try_with(|mine| {
-        if mine.get() == usize::MAX {
-            mine.set(NEXT.fetch_add(1, Relaxed) % BANKS);
+    /// The set plus one (0: none chosen yet). Asked by the allocator too:
+    /// nothing here allocates (a plain TLS word, not `thread_local!`, whose
+    /// every access cost more than the counting it serves: `crate::local`).
+    static MINE: crate::local::Word = crate::local::Word::new();
+    match MINE.get() {
+        0 => {
+            let mine = NEXT.fetch_add(1, Relaxed) % BANKS;
+            MINE.set(mine + 1);
+            mine
         }
-        mine.get()
-    })
-    .unwrap_or(0)
+        mine => mine - 1,
+    }
 }
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1102,16 +1108,32 @@ struct Submitter {
 static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
 static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 
-thread_local! {
-    /// This thread's last submission: when it returned ([`now_us`]) and the
-    /// thread's processor time then (user, kernel).
-    static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };
-    /// The thread's processor time when its running submission was called.
-    static ENTERED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-    /// List-call nanoseconds of this thread since its last submission.
-    static OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
-    static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+/// This thread's last submission: when it returned ([`now_us`]) and the
+/// thread's processor time then (user, kernel).
+static LEFT: Local<Cell<Option<(u64, u64, u64)>>> = Local::new(|| Cell::new(None));
+/// The thread's processor time when its running submission was called.
+static ENTERED: Local<Cell<(u64, u64)>> = Local::new(|| Cell::new((0, 0)));
+/// This thread's list calls, in one value so that a call reaches it once:
+/// nanoseconds since its last submission, and the time not yet added to
+/// `RECORDERS` (nanoseconds, calls).
+static CALLS: Local<Cell<Calls>> = Local::new(|| Cell::new(Calls { ours: 0, unsent: 0, unsent_calls: 0 }));
+
+#[derive(Clone, Copy)]
+struct Calls {
+    ours: u64,
+    unsent: u64,
+    unsent_calls: u64,
+}
+
+/// List-call nanoseconds of this thread since its last submission, from now
+/// on 0.
+fn ours_taken() -> u64 {
+    CALLS.with(|c| {
+        let mut calls = c.get();
+        let ours = std::mem::take(&mut calls.ours);
+        c.set(calls);
+        ours
+    })
 }
 
 fn thread_id() -> u32 {
@@ -1156,26 +1178,86 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// While a list thread translates a chunk of list calls timed whole: the
+/// calls of the chunk so far (`None`: each call is timed by itself).
+static CHUNK: Local<Cell<Option<u64>>> = Local::new(|| Cell::new(None));
+
+/// Whether the list threads (`list::thin`) time each chunk of calls they
+/// translate whole instead of each call (`VICTORY_CALL_TIMES=each`: each
+/// call, as before). Timing a call read the clock twice, some 40,000 times
+/// a frame on those threads (1.2% of their time in a sampled profile); a
+/// chunk is timed by the loop that runs it anyway. The calls' count and
+/// time in the log stay whole; the time then holds the translating between
+/// the calls too, and a thread's calls appear in the timeline as one run
+/// per chunk. With the timeline on (`VICTORY_TIMELINE`), each call is
+/// timed, for its long calls.
+fn chunks_timed() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var("VICTORY_CALL_TIMES").map_or(true, |v| v.trim() != "each"))
+        && !crate::timeline::on()
+}
+
+/// A list thread begins a chunk of calls: whether it is timed whole (then
+/// [`chunk_ends`] follows).
+pub(crate) fn chunk_begins() -> bool {
+    let whole = chunks_timed();
+    if whole {
+        CHUNK.set(Some(0));
+    }
+    whole
+}
+
+/// The chunk [`chunk_begins`] began at `started` is done.
+pub(crate) fn chunk_ends(started: std::time::Instant) {
+    let calls = CHUNK.replace(None).unwrap_or(0);
+    if calls > 0 {
+        recorded_many(started, calls);
+    }
+}
+
+/// A list call begins: when, unless it is part of a chunk timed whole
+/// (then it is counted there). Passed to [`recorded`] as it returns.
+#[inline]
+pub(crate) fn call_begins() -> Option<std::time::Instant> {
+    CHUNK.with(|c| match c.get() {
+        Some(calls) => {
+            c.set(Some(calls + 1));
+            None
+        }
+        None => Some(std::time::Instant::now()),
+    })
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
+    recorded_many(started, 1);
+}
+
+/// `calls` list calls on this thread, which began at `started`, have
+/// returned.
+fn recorded_many(started: std::time::Instant, calls: u64) {
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
-    add(C::RecordCalls, 1);
-    add(C::RecordNs, ns);
+    // One set of counters looked up for both.
+    let count = &COUNT[bank()].0;
+    count[C::RecordCalls as usize].fetch_add(calls, Relaxed);
+    count[C::RecordNs as usize].fetch_add(ns, Relaxed);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
-    OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
-    // By thread, a couple of milliseconds at a time.
+    let (unsent, calls) = CALLS.with(|c| {
+        let was = c.get();
+        let (unsent, calls) = (was.unsent + ns, was.unsent_calls + calls);
+        // By thread, a couple of milliseconds at a time.
+        let (kept, kept_calls) = if unsent < 2_000_000 { (unsent, calls) } else { (0, 0) };
+        c.set(Calls { ours: was.ours + ns, unsent: kept, unsent_calls: kept_calls });
+        (unsent, calls)
+    });
     if unsent < 2_000_000 {
-        UNSENT.with(|u| u.set((unsent, calls)));
         return;
     }
-    UNSENT.with(|u| u.set((0, 0)));
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1194,7 +1276,7 @@ pub(crate) fn submission_begins() {
     }
     let (user, kernel) = thread_times();
     ENTERED.with(|e| e.set((user, kernel)));
-    let ours = OURS.with(|o| o.replace(0));
+    let ours = ours_taken();
     if let Some((left, u, k)) = LEFT.with(|l| l.get()) {
         let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
         let s = submitter(&mut all, thread_id());
@@ -1214,7 +1296,7 @@ pub(crate) fn submission_ends(lock: u64) {
     let (user, kernel) = thread_times();
     let (u, k) = ENTERED.with(|e| e.get());
     LEFT.with(|l| l.set(Some((now, user, kernel))));
-    OURS.with(|o| o.set(0));
+    ours_taken();
     let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
     let s = submitter(&mut all, thread_id());
     s.submissions += 1;

@@ -60,6 +60,8 @@ pub mod port_descriptors;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(windows)]
+mod local;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

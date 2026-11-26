@@ -145,20 +145,17 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
-thread_local! {
-    /// While a draw is prepared (`State::bind`, then its targets' states):
-    /// the depth target the draw only tests (0: none, or one it writes),
-    /// and whether a view its shaders read is of that same texture.
-    static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
-        const { std::cell::Cell::new((0, false)) };
-    /// While a stage's tables are walked (`State::tables`): whether that
-    /// stage's shader can store to buffers (`Translated::stores`).
-    static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    /// While `State::early_textures` runs the texture pass: the
-    /// milliseconds and the bytes that run may take, in place of the
-    /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
-}
+/// While a draw is prepared (`State::bind`, then its targets' states):
+/// the depth target the draw only tests (0: none, or one it writes),
+/// and whether a view its shaders read is of that same texture.
+static TESTED_DEPTH: crate::local::Local<std::cell::Cell<(usize, bool)>> = crate::local::Local::new(|| std::cell::Cell::new((0, false)));
+/// While a stage's tables are walked (`State::tables`): whether that
+/// stage's shader can store to buffers (`Translated::stores`).
+static STORES: crate::local::Local<std::cell::Cell<bool>> = crate::local::Local::new(|| std::cell::Cell::new(true));
+/// While `State::early_textures` runs the texture pass: the
+/// milliseconds and the bytes that run may take, in place of the
+/// pass's own per frame.
+static PASS_BUDGET: crate::local::Local<std::cell::Cell<Option<(u64, u64, bool)>>> = crate::local::Local::new(|| std::cell::Cell::new(None));
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it

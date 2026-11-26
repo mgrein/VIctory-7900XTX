@@ -4062,9 +4062,7 @@ impl Shadow {
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
     ) -> Result<Option<Vec<(usize, usize)>>, ()> {
-        thread_local! {
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
+        static TITLE: crate::local::Local<std::cell::RefCell<Vec<u8>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
             let title = &mut title[..n];
@@ -4427,9 +4425,7 @@ impl Shadow {
     /// 4 KiB that title memory and the CPU's side have alike are left as they
     /// are, and nothing of them is sent ([`land_echo`]).
     fn take_landed(&self, from: usize, to: usize) -> usize {
-        thread_local! {
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
+        static TITLE: crate::local::Local<std::cell::RefCell<Vec<u8>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
         let start = self.start as usize;
         let first = start / KERNEL_PAGE;
         // Runs of pages noted, and not noted (any more).
@@ -4487,10 +4483,8 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
-        thread_local! {
-            /// A page of title memory, as read.
-            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
+        /// A page of title memory, as read.
+        static TITLE: crate::local::Local<std::cell::RefCell<Vec<u8>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -5262,13 +5256,11 @@ pub(crate) fn window_finds() -> [u64; 2] {
     [0, 1].map(|i| WINDOW_FINDS[i].swap(0, Ordering::Relaxed))
 }
 
-thread_local! {
-    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
-    /// ask: the same buffers are asked about draw after draw, from five
-    /// threads, each time through the map's lock and a dozen of its nodes
-    /// (7 % of the recording threads' time, profile waits-1).
-    static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+/// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
+/// ask: the same buffers are asked about draw after draw, from five
+/// threads, each time through the map's lock and a dozen of its nodes
+/// (7 % of the recording threads' time, profile waits-1).
+static FOUND: crate::local::Local<std::cell::RefCell<Vec<Found>>> = crate::local::Local::new(|| std::cell::RefCell::new(Vec::new()));
 
 /// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not), for title
 /// buffers' copies and for windows outside buffers alike. Windows came in
