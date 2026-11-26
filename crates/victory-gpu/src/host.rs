@@ -8141,14 +8141,50 @@ static REFRESH_NS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomi
 #[cfg(feature = "diagnostics")]
 static FLUSH_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `shadow.nothing_new(from, to - from)`, timed into [`REFRESH_NS`].
+/// Of the small steps timed one by one in diagnostics builds (whether a
+/// refresh copies nothing, [`known_nothing`]; a copy of title memory,
+/// [`copy_mapped`]): whether this one is timed, and if so how many it
+/// stands for (0: not timed). Every how manyth step a thread takes is
+/// timed, and its time counted that many times over: the two clock reads
+/// around each step were about as long as a step itself, some 3% of the
+/// submitting thread in a sampled profile (tens of thousands a frame).
+/// `VICTORY_TIME_EVERY=n` times every n-th (default 8; 1 times each, as
+/// before).
+#[cfg(feature = "diagnostics")]
+fn timed_weight() -> u64 {
+    static EVERY: OnceLock<usize> = OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_TIME_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 1024)
+    });
+    if every == 1 {
+        return 1;
+    }
+    static LEFT: crate::local::Word = crate::local::Word::new();
+    match LEFT.get() {
+        0 => {
+            LEFT.set(every - 1);
+            every as u64
+        }
+        left => {
+            LEFT.set(left - 1);
+            0
+        }
+    }
+}
+
+/// `shadow.nothing_new(from, to - from)`, timed into [`REFRESH_NS`] (one
+/// call in [`timed_weight`]'s).
 fn known_nothing(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let weight = timed_weight();
+    #[cfg(feature = "diagnostics")]
+    let started = (weight != 0).then(std::time::Instant::now);
     let nothing = shadow.nothing_new(from, to - from);
     #[cfg(feature = "diagnostics")]
     {
-        REFRESH_NS[0].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(started) = started {
+            REFRESH_NS[0].fetch_add(started.elapsed().as_nanos() as u64 * weight, Ordering::Relaxed);
+        }
         REFRESH_NS[1].fetch_add(1, Ordering::Relaxed);
     }
     nothing
@@ -9015,14 +9051,20 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    // (Timed one copy in `timed_weight`'s, in nanoseconds: in whole
+    // microseconds a copy, most copies counted nothing.)
     #[cfg(feature = "diagnostics")]
-    let moved = std::time::Instant::now();
+    let weight = timed_weight();
+    #[cfg(feature = "diagnostics")]
+    let moved = (weight != 0).then(std::time::Instant::now);
     let since = crate::watch::changes();
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
     let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    if let Some(moved) = moved {
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_nanos() as u64 * weight / 1000);
+    }
     if whole {
         return;
     }
