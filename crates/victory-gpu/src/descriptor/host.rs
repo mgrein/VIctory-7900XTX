@@ -5127,6 +5127,23 @@ fn kin(old: &View, new: &View) -> Kin {
 /// texture; 1: one of the same kind in another place or size; 2: any of the
 /// same dimension.
 fn keep_shown() -> u8 {
+    // `VICTORY_KEEP_SHOWN_ROOM=1`: only while the card has room
+    // (`crate::resource::room_lately`). The slot holds the texture it goes
+    // on showing, so on a full card the old and the new one are both there
+    // when one of them might fit; without room the slot then reads as it
+    // did before slots kept anything (zeros, then the neutral texture: the
+    // pop [`keep_shown`] was made against). Off unless set: a card that is
+    // full all the time would pop all the time. (After
+    // Belobug/VIctory-Belobug-AMD e9428969, beloooo, where it is always on.)
+    #[cfg(windows)]
+    {
+        static ROOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ROOM.get_or_init(|| std::env::var_os("VICTORY_KEEP_SHOWN_ROOM").is_some_and(|v| v == "1"))
+            && !crate::resource::room_lately()
+        {
+            return 0;
+        }
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
