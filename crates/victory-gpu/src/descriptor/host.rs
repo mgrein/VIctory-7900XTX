@@ -13,6 +13,46 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod copies;
+
+/// `CreateShaderResourceView` of `resource` (none: a null view) at `at`, a
+/// slot the card does not see: copied from the one this thread kept if it
+/// keeps views ([`copies`]), else made there.
+fn create_srv(resource: Option<&ID3D12Resource>, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    // SAFETY: a slot of a heap of views; the caller's resource is live and
+    // its description one the host takes.
+    let make = |to| unsafe { host.device.CreateShaderResourceView(resource, desc.map(std::ptr::from_ref), to) };
+    if !(copies::kept_here() && copies::through(copies::srv_key(resource, desc), resource, at, make)) {
+        make(at);
+    }
+}
+
+/// `CreateUnorderedAccessView` (no counter), as [`create_srv`].
+fn create_uav(resource: Option<&ID3D12Resource>, desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    // SAFETY: as in `create_srv`.
+    let make = |to| unsafe {
+        host.device
+            .CreateUnorderedAccessView(resource, None::<&ID3D12Resource>, desc.map(std::ptr::from_ref), to)
+    };
+    if !(copies::kept_here() && copies::through(copies::uav_key(resource, desc), resource, at, make)) {
+        make(at);
+    }
+}
+
+/// `CreateConstantBufferView` of memory of `owner` (none: a null view, or
+/// memory nobody's view holds), as [`create_srv`].
+fn create_cbv(owner: Option<&ID3D12Resource>, desc: &D3D12_CONSTANT_BUFFER_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    // SAFETY: a slot of a heap of views; the range lies in live memory.
+    let make = |to| unsafe { host.device.CreateConstantBufferView(Some(desc), to) };
+    let kept = (owner.is_some() || desc.BufferLocation == 0) && copies::kept_here();
+    if !(kept && copies::through(Some(copies::cbv_key(owner, desc)), owner, at, make)) {
+        make(at);
+    }
+}
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -2991,7 +3031,9 @@ impl HostHeap {
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
+        if host().is_none() {
+            return;
+        }
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -3006,11 +3048,8 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.at(index))
-        };
+        // A live buffer covering the range.
+        create_srv(Some(buffer), Some(&desc), self.at(index));
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
@@ -3031,7 +3070,9 @@ impl HostHeap {
     /// root UAV with a size, whose accesses past it do nothing instead of
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
+        if host().is_none() {
+            return;
+        }
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -3046,15 +3087,8 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                buffer,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.at(index),
-            )
-        };
+        // A live buffer covering the range.
+        create_uav(Some(buffer), Some(&desc), self.at(index));
         self.put(index);
         self.clear_twin(index);
         self.keep(index, Some(buffer.clone()));
@@ -3063,7 +3097,9 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
-        let Some(host) = host() else { return };
+        if host().is_none() {
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -3075,15 +3111,8 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.at(index),
-            )
-        };
+        // A null resource is allowed with a desc.
+        create_uav(None, Some(&desc), self.at(index));
         self.put(index);
         self.clear_twin(index);
         self.keep(index, None);
@@ -3110,16 +3139,15 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
-        let Some(host) = host() else { return };
+        if host().is_none() {
+            return;
+        }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.at(index))
-        };
+        // The memory is the caller's, of `buffer`.
+        create_cbv(Some(buffer), &desc, self.at(index));
         self.put(index);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
@@ -3139,8 +3167,7 @@ impl HostHeap {
                     },
                 },
             };
-            // SAFETY: as above, and a slot of our heaps.
-            unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
+            create_srv(Some(buffer), Some(&raw), twin);
         }
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
@@ -3156,7 +3183,9 @@ impl HostHeap {
     /// null one. Whether the twin was made (`false`: the caller copies the
     /// bytes as before).
     pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
-        let Some(host) = host() else { return false };
+        if host().is_none() {
+            return false;
+        }
         let Some(twin) = self.twin(index) else { return false };
         // SAFETY: a live buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
@@ -3185,13 +3214,11 @@ impl HostHeap {
             SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
         };
         let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
-        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
-        // zero location makes a null constant buffer view).
-        unsafe {
-            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
-            self.put(index);
-            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
-        }
+        // The ranges lie in the live buffer (a zero location makes a null
+        // constant buffer view).
+        create_cbv(Some(buffer), &cbv, self.at(index));
+        self.put(index);
+        create_srv(Some(buffer), Some(&raw), twin);
         self.twin_made(index, true);
         self.keep(index, Some(buffer.clone()));
         true
@@ -4001,12 +4028,8 @@ fn buffer_srv(
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
-    let host = host()?;
-    // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
+    // A live buffer.
+    create_srv(Some(&shadow.buffer), Some(&desc), at);
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
@@ -4017,12 +4040,9 @@ fn buffer_srv(
                 StructureByteStride: 0,
                 Flags: D3D12_BUFFER_SRV_FLAG_RAW,
             };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
+            create_srv(Some(&shadow.buffer), Some(&desc), twin);
+            // SAFETY: a live buffer.
+            let start = unsafe { shadow.buffer.GetGPUVirtualAddress() } + first * 4;
             if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
@@ -4124,12 +4144,8 @@ fn buffer_uav(
         );
         return None;
     }
-    let host = host()?;
-    // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    // A live buffer.
+    create_uav(Some(&shadow.buffer), Some(&desc), at);
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
@@ -4141,12 +4157,9 @@ fn buffer_uav(
                 CounterOffsetInBytes: 0,
                 Flags: D3D12_BUFFER_UAV_FLAG_RAW,
             };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
+            create_uav(Some(&shadow.buffer), Some(&desc), twin);
+            // SAFETY: a live buffer.
+            let start = unsafe { shadow.buffer.GetGPUVirtualAddress() } + first * 4;
             if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
@@ -4309,7 +4322,9 @@ fn constant_twinned(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
 ) -> bool {
-    let Some(host) = host() else { return false };
+    if host().is_none() {
+        return false;
+    }
     // SAFETY: a live buffer.
     let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
     let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
@@ -4325,9 +4340,9 @@ fn constant_twinned(
         D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
     };
     let bytes = u64::from(constant_bytes(size)).min(room) & !3;
-    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
-    unsafe {
-        host.device.CreateConstantBufferView(Some(&cbv), at);
+    // The ranges lie in the live buffer.
+    create_cbv(Some(buffer), &cbv, at);
+    {
         if let Some(twin) = twin {
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
@@ -4345,7 +4360,7 @@ fn constant_twinned(
             if bytes == 0 {
                 null_buffer_view(twin);
             } else {
-                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+                create_srv(Some(buffer), Some(&raw), twin);
             }
             crate::port_cbv::twinned();
         }
@@ -4390,12 +4405,10 @@ fn make_twinned(
                 BufferLocation: gpu,
                 SizeInBytes: constant_bytes(size),
             };
-            // SAFETY: slots of our heap; the range lies in the host copy.
-            unsafe {
-                device.CreateConstantBufferView(Some(&desc), at);
-                if let Some(twin) = twin {
-                    device.CreateConstantBufferView(Some(&desc), twin);
-                }
+            // The range lies in the host copy.
+            create_cbv(Some(&shadow.buffer), &desc, at);
+            if let Some(twin) = twin {
+                create_cbv(Some(&shadow.buffer), &desc, twin);
             }
             Some(Some(shadow.buffer.clone()))
         }
@@ -4472,14 +4485,8 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
+                // A live texture.
+                create_srv(Some(texture), desc.as_ref(), at);
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -4533,15 +4540,8 @@ fn make_twinned(
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
-            // SAFETY: a live texture and a slot of our heap.
-            unsafe {
-                device.CreateUnorderedAccessView(
-                    texture,
-                    None::<&ID3D12Resource>,
-                    desc.as_ref().map(std::ptr::from_ref),
-                    at,
-                )
-            };
+            // A live texture.
+            create_uav(Some(texture), desc.as_ref(), at);
             Some(Some(texture.clone()))
         }
         View::Sampler(words) => {
@@ -5013,7 +5013,9 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    if host().is_none() {
+        return;
+    }
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     // Unordered views: whether a buffer, and the title's view dimension.
     let (buffer, dimension) = match view {
@@ -5037,9 +5039,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            // A zero location makes a null view.
+            return create_cbv(None, &D3D12_CONSTANT_BUFFER_VIEW_DESC::default(), at);
         }
         _ => return null_view(at),
     };
@@ -5052,15 +5053,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     } else {
         null_uav_desc(dimension)
     };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+    // A null resource is allowed with a desc.
+    create_uav(None, Some(&desc), at);
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -5106,7 +5100,9 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    if host().is_none() {
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -5119,11 +5115,8 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             },
         },
     };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    // A null resource is allowed with a desc.
+    create_srv(None, Some(&desc), at);
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -5133,7 +5126,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
     }
-    let Some(host) = host() else { return };
+    if host().is_none() {
+        return;
+    }
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -5146,11 +5141,8 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let mut desc = srv_desc(&w);
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    // A null resource is allowed with a desc.
+    create_srv(None, Some(&desc), at);
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -5158,7 +5150,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    if host().is_none() {
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -5170,11 +5164,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             },
         },
     };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    // A null resource is allowed with a desc.
+    create_srv(None, Some(&desc), at);
 }
 
 #[cfg(test)]
