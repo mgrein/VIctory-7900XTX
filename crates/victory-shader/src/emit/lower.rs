@@ -1594,6 +1594,35 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`zero_mask_on`] and [`entry_copy_on`], for its thread only.
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_ZERO_MASK=0`: a lane mask that is identically empty, read as data in a block
+/// not every lane of a console wave runs, is balloted and exchanged (so refused) as before.
+/// Otherwise both its dwords are 0 with no ballot: no lane contributes a bit to it.
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_ENTRY_COPY=0`: a scalar copy of an entry-block lane mask, read as data in a
+/// block not every lane runs, is refused as before ([`Lower::entry_mask_copied_by`]).
+fn entry_copy_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ENTRY_COPY").is_none_or(|v| v != "0"))
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -4619,15 +4648,60 @@ impl<'a> Lower<'a> {
         Some(r)
     }
 
+    /// The entry-block lane mask that the scalar copy writing `lo` in IR
+    /// block `block` copies (`s_mov_b64`, or `s_and_b64`/`s_or_b64` of a mask
+    /// with itself): a scalar copy keeps both dwords even where some lanes
+    /// skip it, and the entry block runs every lane, so both host waves can
+    /// ballot the source there.
+    fn entry_mask_copied_by(&self, block: usize, lo: Value) -> Option<Value> {
+        let inst = self.x.p.blocks.get(block)?.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let operand = match (inst.name(), src.as_slice()) {
+            ("s_mov_b64", [a]) => a,
+            ("s_and_b64" | "s_or_b64", [a, b]) if a == b => a,
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *operand else {
+            return None;
+        };
+        let source = inst.read(Reg::S(code))?;
+        let high = inst.read(Reg::S(code.checked_add(1)?))?;
+        (self.x.p.blocks[0].preds.is_empty()
+            && self.all_lanes(0)
+            && self.def_block.get(&source) == Some(&0)
+            && self.x.st.highs.get(&high) == Some(&source)
+            && self.x.st.active.contains(&source))
+        .then_some(source)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         // A mask operation on numbers (`sop`): its number is known.
-        let (lo, high) = match self.x.st.highs.get(&v) {
+        let (mut lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        // A copy of a mask the entry block writes, made where not every lane
+        // runs: the copy's 64 bits are its source's whichever lanes skip it,
+        // and both host waves ballot the source in the entry block.
+        if !self.local
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && entry_copy_on()
+            && let Some(&block) = self.def_block.get(&lo)
+            && !self.all_lanes(block)
+            && let Some(source) = self.entry_mask_copied_by(block, lo)
+        {
+            lo = source;
+        }
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask: either dword
+        // is 0 even where the other half of a console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
