@@ -2588,6 +2588,13 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            // No host copy for want of the card's memory: the slot is held
+            // back like one refused for room, and looked at again when the
+            // card may have it (marked done, it was never uploaded).
+            if texture.is_none() && crate::resource::retrying(resource) {
+                host.texture_slot_held(index, write, frame + 8);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
