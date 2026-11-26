@@ -10,3 +10,8 @@ xtask = "run --quiet --package xtask --"
 # this.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# The same for a toolchain whose host is windows-gnu (rustup's default on some
+# machines): without it the flag above never applied there.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
