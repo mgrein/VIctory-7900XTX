@@ -5044,8 +5044,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let from = placed_from(at, PLACED_LONGEST.load(Ordering::Relaxed));
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range((from, 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
@@ -5065,6 +5066,20 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// The longest window ever put in place in [`LOOSE`], in bytes (it only
+/// grows). A window is not one 4 MiB cell: an ask with a length that
+/// crosses a cell's line makes one of 8 MiB or more ([`window_of`]), so
+/// [`in_place_let_go`] cannot look for the windows over a range among those
+/// that begin at most 4 MiB below it alone; one that began lower stayed in
+/// the table pointing at memory the title now has at another address.
+static PLACED_LONGEST: AtomicU64 = AtomicU64::new(0);
+
+/// The lowest start a window in place that reaches past `at` may have,
+/// with windows in place of at most `longest` bytes.
+fn placed_from(at: u64, longest: u64) -> u64 {
+    at.saturating_sub(longest)
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -5471,6 +5486,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
+        // (Under the lock, before anyone can find it: see `in_place_let_go`.)
+        PLACED_LONGEST.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
@@ -5610,9 +5627,25 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, placed_from,
+        resolve_card_limits, tail_of, window_of,
     };
+
+    /// A window in place that an ask across a cell's line made (8 MiB)
+    /// is found by a change of memory more than 4 MiB past its start.
+    #[test]
+    fn windows_in_place_are_found_however_long() {
+        let v = 0xd_1200_0000u64;
+        let (start, len) = window_of(v + 0x3e_6666, v + 0x43_3333, WINDOW);
+        assert_eq!((start, len), (v, 8 << 20));
+        let at = v + (6 << 20);
+        let from = placed_from(at, len);
+        assert!(from <= start && start + len > at);
+        // The old bound, 4 MiB below, passed it over.
+        assert!(at - WINDOW > start);
+        assert_eq!(placed_from(0x1000, 8 << 20), 0);
+        assert_eq!(placed_from(at, 0), at);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
