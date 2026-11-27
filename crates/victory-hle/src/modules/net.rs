@@ -6,7 +6,8 @@
 //! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
 //!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
 //!   `WSAENETUNREACH`.
-//! * Forward lookups other than `localhost` and IP literals fail with
+//! * Forward lookups other than `localhost`, the machine's own host name
+//!   (answered as `localhost`) and IP literals fail with
 //!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
 //!   numeric, or fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
@@ -189,6 +190,61 @@ fn resolvable(name: Option<String>) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether `name` is the whole of the machine's host name, as
+/// `gethostname` gives it (case aside).
+fn same_host(name: &str, hostname: &str) -> bool {
+    !hostname.is_empty() && name.eq_ignore_ascii_case(hostname)
+}
+
+/// `VICTORY_NETWORK_LOCAL_NAME=0`: a lookup of the machine's own host name
+/// fails like any other name, as before; unset or 1: it is answered as
+/// `localhost` (both IPv4 and IPv6 loopback), as a console without a
+/// network answers its own name, so the title stays on loopback.
+fn local_name_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NETWORK_LOCAL_NAME").is_none_or(|v| v != "0"))
+}
+
+/// The machine's host name, once Winsock could give it (it fails before
+/// `WSAStartup`, so only a success is kept).
+fn host_name() -> Option<&'static str> {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if HOST.get().is_none() {
+        let mut buf = [0 as c_char; 256];
+        if host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32)(buf.as_mut_ptr(), buf.len() as i32) == 0
+            && let Some(local) = narrow(buf.as_ptr())
+        {
+            let _ = HOST.set(local);
+        }
+    }
+    HOST.get().map(String::as_str)
+}
+
+/// The name a forward lookup goes to the host with: `localhost` for the
+/// machine's own name ([`local_name_on`]), the title's name if it is
+/// [`resolvable`], and `None` (blocked) otherwise.
+fn forward_name<T>(name: Option<String>, original: *const T, localhost: *const T) -> Option<*const T> {
+    if local_name_on()
+        && let Some(query) = name.as_deref()
+        && !query.is_empty()
+        && !query.eq_ignore_ascii_case("localhost")
+        && query.parse::<IpAddr>().is_err()
+        && host_name().is_some_and(|local| same_host(query, local))
+    {
+        return Some(localhost);
+    }
+    resolvable(name).then_some(original)
+}
+
+fn forward_a(name: *const c_char) -> Option<*const c_char> {
+    forward_name(narrow(name), name, c"localhost".as_ptr())
+}
+
+fn forward_w(name: *const u16) -> Option<*const u16> {
+    const LOCALHOST: &[u16] = &[108, 111, 99, 97, 108, 104, 111, 115, 116, 0];
+    forward_name(wide(name), name, LOCALHOST.as_ptr())
 }
 
 /// Reverse lookups ask DNS unless the address is loopback.
@@ -551,9 +607,9 @@ pub extern "system" fn getaddrinfo(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(narrow(node)) {
+    let Some(node) = forward_a(node) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -565,9 +621,9 @@ pub extern "system" fn GetAddrInfoW(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(wide(node)) {
+    let Some(node) = forward_w(node) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -585,9 +641,9 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
@@ -605,18 +661,18 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(wide(name)) {
+    let Some(name) = forward_w(name) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)(name)
 }
 
@@ -627,9 +683,9 @@ pub extern "system" fn WSAAsyncGetHostByName(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)(
         window, message, name, buf, buf_len,
     )
@@ -890,6 +946,14 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
+
+    #[test]
+    fn the_own_host_name_matches_only_whole() {
+        assert!(same_host("UNIT-HOST", "unit-host"));
+        assert!(!same_host("unit-host.example", "unit-host"));
+        assert!(!same_host("unit", "unit-host"));
+        assert!(!same_host("", ""));
+    }
 
     fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
         let mut a = [0u8; 16];
