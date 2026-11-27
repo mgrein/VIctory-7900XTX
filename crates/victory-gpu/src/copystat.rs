@@ -912,6 +912,17 @@ fn log_memory() {
             if crate::pool::draining() { "yes" } else { "no" },
             drained_bytes >> 20
         );
+        let s = crate::pool::slack();
+        tracing::info!(
+            "memory free inside texture blocks: {} blocks hold pieces with {} MB free between them (widest {} MB), {} of them              under a quarter held with {} MB free; {} empty blocks kept; {} MB of pieces given back still resting",
+            s.partial,
+            s.free >> 20,
+            s.widest >> 20,
+            s.thin,
+            s.thin_free >> 20,
+            s.empty,
+            s.resting >> 20
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
