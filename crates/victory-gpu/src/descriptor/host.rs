@@ -922,61 +922,17 @@ pub(crate) fn page_written(at: usize, len: usize) {
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    let lost = note_range(&mut ranges, start, end, MOST);
-    PAGE_WRITES[1].fetch_add(lost, Relaxed);
-}
-
-/// Whether a full list of noted ranges is kept as one range over all of
-/// them ([`note_range`]); `VICTORY_REMAP_OVERFLOW=0` empties it, as before.
-fn keep_overflow() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_OVERFLOW").is_none_or(|v| v != "0"))
-}
-
-/// Adds `[start, end)` to the `ranges` kept for a texture pass
-/// ([`remapped`], [`page_written`]), at most `most` of them: a range that
-/// touches the last one is made one with it (pages are mapped one after
-/// the other); a full list is first joined ([`join`]: several threads
-/// map and write, the same textures' ranges over and over), and if it is
-/// still full it becomes one range from the lowest start to the highest
-/// end. Returns how many ranges were given up for that one, or dropped.
-///
-/// The full list was emptied: the textures in the ranges dropped were not
-/// looked at again, and showed what they held before the streaming burst
-/// (the idea of DexNom/VIctory 921d8d3b, uiliannn/VItoriaBr 89434b72 and
-/// maren-halv/VIctory-DXR 443fd629). One range over all of them looks at
-/// more slots than were touched, once.
-fn note_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize) -> u64 {
-    note_range_as(ranges, start, end, most, keep_overflow())
-}
-
-fn note_range_as(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, most: usize, keep: bool) -> u64 {
     if let Some(last) = ranges.last_mut()
-        && last.0 <= end
-        && start <= last.1
+        && last.1 == start
     {
-        last.0 = last.0.min(start);
-        last.1 = last.1.max(end);
-        return 0;
+        last.1 = end;
+        return;
     }
-    let mut lost = 0;
-    if ranges.len() >= most {
-        if keep {
-            join(ranges);
-        }
-        if ranges.len() >= most {
-            lost = ranges.len() as u64;
-            // (Joined: sorted by start.)
-            let all = (ranges[0].0, ranges.iter().map(|r| r.1).max().unwrap_or(0));
-            ranges.clear();
-            if keep {
-                ranges.push((all.0.min(start), all.1.max(end)));
-                return lost;
-            }
-        }
+    if ranges.len() >= MOST {
+        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
     }
     ranges.push((start, end));
-    lost
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -1028,10 +984,20 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // (Full when no pass runs: no shader that picks textures by index is
-    // bound.)
-    let lost = note_range(&mut ranges, start, end, MOST);
-    STALE[2].fetch_add(lost, Relaxed);
+    // Pages are mapped one after the other.
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return;
+    }
+    if ranges.len() >= MOST {
+        // No pass runs (no shader that picks textures by index is bound):
+        // the slots there are looked at when they are due, as before.
+        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -7395,49 +7361,6 @@ void main(uint i : SV_DispatchThreadID) { uint4 r = v[i >> 2]; uint k = i & 3; d
         assert_eq!(TextureQueue::in_turns(only(0), 100, 3).len(), 100);
         assert_eq!(TextureQueue::in_turns(due.clone(), 4096, 0).len(), 1010);
         assert!(TextureQueue::in_turns(due.clone(), 0, 0).is_empty());
-    }
-
-    /// A full list of noted ranges loses no memory: it is joined, and if it
-    /// is still full, one range over all of them stands for it.
-    #[test]
-    fn a_full_list_of_noted_ranges_keeps_all_their_memory() {
-        let covered = |ranges: &[(u64, u64)], at: u64| ranges.iter().any(|r| r.0 <= at && at < r.1);
-        // Pages mapped one after the other are one range; so is a range
-        // that lies over the last.
-        let mut ranges = Vec::new();
-        for page in 0..100u64 {
-            assert_eq!(note_range_as(&mut ranges, page << 12, (page + 1) << 12, 8, true), 0);
-        }
-        assert_eq!(note_range_as(&mut ranges, 50 << 12, 120 << 12, 8, true), 0);
-        assert_eq!(ranges, [(0, 120 << 12)]);
-        // Two threads' ranges, turn by turn: the full list is joined, and
-        // nothing is given up.
-        let mut ranges = Vec::new();
-        for page in 0..64u64 {
-            assert_eq!(note_range_as(&mut ranges, page << 12, (page + 1) << 12, 8, true), 0);
-            assert_eq!(note_range_as(&mut ranges, (1000 + page) << 12, (1001 + page) << 12, 8, true), 0);
-        }
-        assert!(ranges.len() <= 8);
-        for page in (0..64u64).chain(1000..1064) {
-            assert!(covered(&ranges, page << 12), "page {page}");
-        }
-        // Ranges apart from one another: one range over all of them.
-        let mut ranges = Vec::new();
-        let mut lost = 0;
-        for k in 0..20u64 {
-            lost += note_range_as(&mut ranges, (k * 10) << 12, (k * 10 + 1) << 12, 8, true);
-        }
-        assert!(lost >= 8 && ranges.len() <= 8);
-        for k in 0..20u64 {
-            assert!(covered(&ranges, (k * 10) << 12), "range {k}");
-        }
-        // As before (`VICTORY_REMAP_OVERFLOW=0`): the full list is emptied.
-        let mut ranges = Vec::new();
-        let mut lost = 0;
-        for k in 0..9u64 {
-            lost += note_range_as(&mut ranges, (k * 10) << 12, (k * 10 + 1) << 12, 8, false);
-        }
-        assert_eq!((lost, ranges.as_slice()), (8, &[(80u64 << 12, 81u64 << 12)][..]));
     }
 
     /// The order of the due slots with only its two ends sorted is the one
