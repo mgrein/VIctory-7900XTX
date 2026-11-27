@@ -123,6 +123,32 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        // `VICTORY_BVH_NO_HIT=1` ([`crate::emit::bvh_no_hit`]): while the
+        // structures are not built, a box enters no child and anything else
+        // is missed, with nothing read. The builder never runs, so this is
+        // decided here, from the node pointer alone: the ray's operands are
+        // not resolved (one the program never wrote no longer refuses the
+        // translation; fxceless PR #1221, BradRoland).
+        let no_hit = crate::emit::bvh_no_hit();
+        let unbuilt = |l: &mut Self, pointer: V| {
+            let c = l.cur;
+            let (k4, k6) = (l.s.m.i32(4), l.s.m.i32(6));
+            let pair = l.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = l.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = l.s.m.i32(bvh::NONE);
+            bvh::MISS.map(|miss| {
+                let miss = l.s.m.i32(miss.to_bits());
+                l.s.m.select(c, is_box, none, miss)
+            })
+        };
+        if no_hit == 1 {
+            let v = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+            let pointer = self.i32_of(v)?;
+            for (k, r) in unbuilt(self, pointer).into_iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -141,28 +167,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
-        // `VICTORY_BVH_NO_HIT=1` ([`crate::emit::bvh_no_hit`]): while the
-        // structures are not built, a box enters no child and anything else
-        // is missed, with nothing read.
-        let no_hit = crate::emit::bvh_no_hit();
-        let unbuilt = (no_hit != 0).then(|| {
-            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
-            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
-            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
-            let none = self.s.m.i32(bvh::NONE);
-            bvh::MISS.map(|miss| {
-                let miss = self.s.m.i32(miss.to_bits());
-                self.s.m.select(c, is_box, none, miss)
-            })
-        });
-        if let (1, Some(unbuilt)) = (no_hit, unbuilt) {
-            // The builder never runs: decided here.
-            let _ = &ray;
-            for (k, &r) in unbuilt.iter().enumerate() {
-                self.write(inst, Reg::V(dst + k as u8), r, guard);
-            }
-            return Ok(());
-        }
+        let unbuilt = (no_hit != 0).then(|| unbuilt(self, pointer));
         // Asked of the host: only the lanes that run where the builder runs
         // whole read and test the node.
         let built = (no_hit == 2).then(|| {
