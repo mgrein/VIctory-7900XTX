@@ -1194,6 +1194,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => {
             crate::drvwatch::start();
+            crate::pso_trace::register(&host.device);
             if crate::dxr::requested() {
                 let _ = host.raytracing_tier_1_1();
             }
@@ -1211,7 +1212,8 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        let debug = cfg!(feature = "diagnostics")
+            && (crate::switch::on("VICTORY_D3D12_DEBUG") || crate::pso_trace::enabled());
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -4297,6 +4299,7 @@ mod card_steps;
 pub(crate) mod indirects;
 pub(crate) mod latency;
 mod panel;
+mod framelog;
 mod place;
 pub(crate) mod rec;
 pub(crate) mod reflex;
@@ -6866,7 +6869,10 @@ impl Host {
                     let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
-                    tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    // (Said by the pipeline trace's callback when it is on.)
+                    if !crate::pso_trace::registered() {
+                        tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }
@@ -10765,6 +10771,7 @@ impl Host {
             }
             let presented = p.meter.record_present(p.hwnd, status);
             crate::memstat::presented(self);
+            framelog::presented();
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]

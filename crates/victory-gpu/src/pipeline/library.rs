@@ -520,6 +520,7 @@ pub(crate) fn pipeline(
 ) -> windows::core::Result<ID3D12PipelineState> {
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+        let _traced = crate::pso_trace::scope(name, "create");
         create()
     };
     let wide = HSTRING::from(name);
@@ -534,6 +535,7 @@ pub(crate) fn pipeline(
         let _one = same_name(name);
         let _call = call("load", name);
         loading.next("pipeline: load a PSO from the driver library");
+        let _traced = crate::pso_trace::scope(name, "load");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).

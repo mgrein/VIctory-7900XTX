@@ -175,9 +175,9 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
 /// line (right behind a look of ours).
 #[derive(Clone, Copy, Default)]
-struct Counters([u64; COUNTERS]);
+pub(super) struct Counters(pub(super) [u64; COUNTERS]);
 
-const COUNTERS: usize = 12;
+pub(super) const COUNTERS: usize = 12;
 
 /// The process's processor time so far, all threads, in microseconds.
 fn processor_us() -> u64 {
@@ -199,7 +199,7 @@ fn processors() -> usize {
 }
 
 impl Counters {
-    fn now() -> Counters {
+    pub(super) fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
         #[cfg(feature = "diagnostics")]
         let recording = crate::copystat::peek(crate::copystat::C::RecordNs);
@@ -223,7 +223,7 @@ impl Counters {
     }
 
     /// What came since `before`, per frame.
-    fn since(self, before: Counters, frames: f64) -> [f64; COUNTERS] {
+    pub(super) fn since(self, before: Counters, frames: f64) -> [f64; COUNTERS] {
         let mut out = [0.0; COUNTERS];
         for (i, out) in out.iter_mut().enumerate() {
             let (was, is) = (before.0[i], self.0[i]);
