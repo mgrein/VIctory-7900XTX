@@ -3437,7 +3437,35 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     let [plane] = &t.planes[..] else {
         return None;
     };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    let mut layout = plane.layout.clone();
+    let at = r.data() as usize;
+    // The water height plane (256x256 R32_FLOAT, `SW_64KB_R_X`) is the one
+    // XOR layout with an address equation: it holds only for a texture on
+    // a 64 KiB boundary, and the equation is the console's.
+    const R32_FLOAT: u32 = 41;
+    if r.desc.format == R32_FLOAT && at.is_multiple_of(65536) {
+        use victory_formats::texture::RenderPipeConfig;
+        layout.configure_render_xor(match crate::console::current() {
+            crate::console::Console::SeriesS => RenderPipeConfig::Pipes8Packers4,
+            crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
+        });
+    }
+    // A layout that cannot be addressed could not be tiled back once the
+    // card had copied it: no copy is recorded and waited for.
+    if !layout.addressable() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                width = r.desc.width,
+                height = r.desc.height,
+                format = r.desc.format,
+                swizzle = layout.desc.swizzle.0,
+                "a texture of a kind copied back has a layout that cannot be tiled: not copied back"
+            )
+        });
+        return None;
+    }
+    Some((layout, at, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3960,6 +3988,31 @@ mod tests {
         }
     }
 
+    /// A texture of a kind copied back gets a target only where its layout
+    /// can be tiled: a plain swizzle, or the water plane's `SW_64KB_R_X` on
+    /// a 64 KiB boundary; not that one off the boundary, nor another XOR
+    /// mode. (After cool_fox d9f3ea6f, DoubleGhosty.)
+    #[test]
+    #[cfg(windows)]
+    fn copied_back_textures_need_a_layout_that_can_be_tiled() {
+        for (swizzle, bias, supported) in
+            [(0x105, 0, true), (0x11b, 0, true), (0x11b, 256, false), (0x119, 0, false)]
+        {
+            let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
+            let bytes = footprint(&desc).unwrap().size as usize;
+            let memory = vec![0u8; bytes + 65536 + bias];
+            let at = (memory.as_ptr() as usize).next_multiple_of(65536) + bias;
+            let mut r = std::ptr::null();
+            assert_eq!(
+                create_at_address(std::ptr::null(), at as u64, &desc, 0, std::ptr::null(), &PAGEABLE_IIDS[0], &mut r),
+                S_OK
+            );
+            let target = title_texture(r).map(|(_, base, extent)| (base, extent));
+            assert_eq!(target, supported.then_some((at, bytes)), "layout {swizzle:#x} at +{bias}");
+            assert_eq!(resource_release(r), 0);
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
@@ -4396,6 +4449,98 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// An earlier title-memory upload must not suppress a later alias copy
+    /// from a GPU-written probe atlas into the same sampled texture.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
