@@ -407,8 +407,14 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
-    /// Made with `SEC_COMMIT`: every page is committed already.
+    /// Made with `SEC_COMMIT`, or backed by a file: every page is
+    /// committed already.
     whole: bool,
+    /// The temporary file behind the section (`VICTORY_FILE_PHYSICAL=1`,
+    /// [`backing_file`]), closed after the section's handle; it goes away
+    /// with its last handle.
+    #[allow(dead_code)]
+    file: Option<std::fs::File>,
 }
 
 impl Section {
@@ -508,6 +514,7 @@ impl Drop for Section {
         victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
+        // (The file, if any, after it: `file` is dropped now.)
     }
 }
 
@@ -665,6 +672,90 @@ fn page_table_mut() -> RwLockWriteGuard<'static, Pages> {
     PAGES.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether physical pages are backed by a temporary file instead of the
+/// paging file (`VICTORY_FILE_PHYSICAL=1`, off by default; read here).
+///
+/// The title asks for 6.1 GiB of physical pages at once, which charges the
+/// system's commit as the pages are mapped: on a host with a small paging
+/// file the commit limit is met (error 1455) and the title faults on the
+/// null it gets; on 32 GiB the process sat at 25-31 GiB private. A file's
+/// section charges no commit: its pages are written back to the file, not
+/// the paging file, when memory runs short. The file is sparse (disk space
+/// taken only for pages written out) and deleted when its last handle
+/// closes. Slower than the paging file if the pages are paged out; such a
+/// section is not opened as a host heap (`victory_gpu::pool_in_place`), its
+/// windows are copied. Where it is put: `VICTORY_PHYSICAL_DIR`, else the
+/// temporary directory.
+fn file_physical() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_FILE_PHYSICAL").is_some_and(|v| v == "1"));
+    *ON && !on_wine()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`file_physical`] for the sections this thread makes.
+    static FILE_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A new temporary file for a section of `size` bytes ([`file_physical`]),
+/// if asked for and the host gives one.
+fn backing_file(size: usize) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    #[cfg(test)]
+    let asked = file_physical() || FILE_IN_TEST.get();
+    #[cfg(not(test))]
+    let asked = file_physical();
+    if !asked {
+        return None;
+    }
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::var_os("VICTORY_PHYSICAL_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let path = dir.join(format!(
+        "victory-physical-{}-{}.bin",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .attributes(FILE_ATTRIBUTE_TEMPORARY)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "no file for physical pages (VICTORY_FILE_PHYSICAL)");
+            return None;
+        }
+    };
+    // Sparse: the section's size takes no disk space until pages are
+    // written out (best effort; a file system without it takes the space).
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    let mut returned = 0;
+    // SAFETY: a file handle of ours; the control takes no buffers.
+    unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    tracing::debug!(path = %path.display(), size, "physical pages backed by a file");
+    Some(file)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -703,8 +794,34 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             )
         }
     };
+    let file = backing_file(size);
     let mut committed = on_wine() || victory_gpu::pool_in_place();
-    let mut handle = make(if committed { SEC_COMMIT } else { SEC_RESERVE });
+    let mut handle = std::ptr::null_mut();
+    if let Some(file) = &file {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: plain section creation over a file of ours; a file's
+        // section is committed whole and charges no commit.
+        handle = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle() as HANDLE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            tracing::warn!(n, error = %std::io::Error::last_os_error(), "physical pages not backed by a file (VICTORY_FILE_PHYSICAL): backed by the paging file");
+        }
+    }
+    let file = file.filter(|_| !handle.is_null());
+    if file.is_some() {
+        // Not opened as a host heap: windows of it are copied.
+        committed = false;
+    } else {
+        handle = make(if committed { SEC_COMMIT } else { SEC_RESERVE });
+    }
     if handle.is_null() && committed && !on_wine() {
         tracing::warn!(n, error = %std::io::Error::last_os_error(), "page pool section not committed: made reserved, its windows are copied");
         committed = false;
@@ -730,7 +847,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-        whole: committed,
+        whole: committed || file.is_some(),
+        file,
     });
     let mut table = page_table_mut();
     let first = table.next_page;
@@ -2419,6 +2537,50 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(at as *mut c_void, 3, std::ptr::null()), at as *mut c_void);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Physical pages backed by a temporary file (`VICTORY_FILE_PHYSICAL=1`)
+    /// behave as the paging file's: two views of a page show one set of
+    /// bytes, writes through the runtime's own window land, and the file is
+    /// gone with the last page.
+    #[test]
+    fn physical_pages_backed_by_a_file_alias_and_go_away() {
+        FILE_IN_TEST.set(true);
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        FILE_IN_TEST.set(false);
+        let path = {
+            let table = page_table();
+            let section = &table.pages[&pages[0]].section;
+            assert!(section.whole && section.file.is_some());
+            let mut name = vec![0u16; 1024];
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+            // SAFETY: a file handle of ours and a buffer of its length.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(section.file.as_ref().unwrap().as_raw_handle() as HANDLE, name.as_mut_ptr(), 1024, 0)
+            } as usize;
+            assert!(len > 0 && len < 1024);
+            std::path::PathBuf::from(String::from_utf16_lossy(&name[..len]).trim_start_matches(r"\?\").to_string())
+        };
+        assert!(path.exists(), "{path:?}");
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let b = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages[1..].as_ptr()), b);
+        // SAFETY: both mapped read-write; `b` shows `a`'s second page.
+        unsafe {
+            a.cast::<u8>().add(PAGE + 7).write(0x5a);
+            assert_eq!(b.cast::<u8>().add(7).read_volatile(), 0x5a);
+            b.cast::<u8>().add(PAGE - 1).write(0xa5);
+            assert_eq!(a.cast::<u8>().add(2 * PAGE - 1).read_volatile(), 0xa5);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert!(!path.exists(), "{path:?} left behind");
     }
 
     /// A title thread that reads and writes a page of a view while other
