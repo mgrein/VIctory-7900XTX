@@ -6392,8 +6392,10 @@ impl<'a> Lower<'a> {
                 };
                 self.write(inst, Reg::V(reg), x, guard);
             } else {
-                // Clear, then set: two atomics, so lanes writing other
-                // bytes of the dword keep theirs.
+                // One compare-exchange loop on the dword, so lanes writing
+                // other bytes of it keep theirs, and of two lanes writing
+                // the same byte one wins whole (a clear then a set, two
+                // atomics, could leave the OR of both; fxceless PR #913).
                 let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 if name != base {
                     // The data's high half.
@@ -6405,11 +6407,21 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-                use super::bitcode::Rmw;
                 let g = on(self, inside);
                 let at = self.begin_guarded(Some(g));
-                self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                let pre = self.cur;
+                let init = self.s.m.load(pre, p);
+                let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(pre, Term::Br(lp));
+                let i32t = self.s.t.i32;
+                let old = self.s.m.phi(lp, i32t);
+                let kept = self.s.m.bin(lp, Bin::And, old, keep);
+                let new = self.s.m.bin(lp, Bin::Or, kept, x);
+                let prev = self.s.m.cmpxchg(lp, p, old, new);
+                let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+                self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+                self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+                self.cur = exit;
                 self.end_guarded(at, &[]);
             }
             return Ok(());

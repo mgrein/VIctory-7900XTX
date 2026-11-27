@@ -2311,3 +2311,24 @@ fn sdwa_word_0_sign_extends_a_16_bit_result() {
         });
     }
 }
+
+/// `ds_write_b8` over 64 threads, each writing byte `thread & 3` of LDS[0]
+/// with `0x11 + (thread & 3)`: every byte holds what its writers wrote and
+/// the writers of the other bytes of the dword lose nothing (one
+/// compare-exchange loop on the dword).
+#[test]
+fn lds_byte_writes_keep_the_other_bytes_of_their_dword() {
+    const DS_WRITE_B8: u8 = 0x1E;
+    let mut body = vec![vop1(0x001, 7, 0x80)]; // v_mov_b32 v7, 0
+    body.extend(ds(DS_WRITE_B32, 0, 7, 7));
+    body.push(S_BARRIER);
+    body.push(vop2(0x1B, 5, 0x83, 0)); // v_and_b32 v5, 3, v0
+    body.push(vop2(0x25, 6, 0x91, 5)); // v_add_nc_u32 v6, 17, v5
+    body.extend(ds(DS_WRITE_B8, 0, 5, 6));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 7, 0));
+    let shader = build_cs(&body, 64, 512);
+    run_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0x1413_1211, "{backend}: got {got:#x}");
+    });
+}
