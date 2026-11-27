@@ -7327,7 +7327,11 @@ impl<'a> Lower<'a> {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                // SCC is the carry out of the add, as s_add_u32's (not
+                // whether the result is 0); the bits the shift drops do
+                // not count.
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                (r, Some(self.s.m.cmp(c, pred::IULT, r, t)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -7337,8 +7341,10 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
+                // SCC is the comparison (S0 < S1 for min, S0 > S1 for
+                // max), not whether the result is 0.
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
