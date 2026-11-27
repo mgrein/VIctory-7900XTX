@@ -91,6 +91,12 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
     RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Objects in [`RETIRED`] now, for the memory summary line
+/// (`crate::memstat`): each part's lock held for a length only.
+pub(crate) fn retired_waiting() -> usize {
+    RETIRED.iter().map(|part| part.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1206,6 +1212,8 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => {
+            crate::drvwatch::start();
+            crate::pso_trace::register(&host.device);
             if crate::dxr::requested() {
                 let _ = host.raytracing_tier_1_1();
             }
@@ -1223,7 +1231,8 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+        let debug = cfg!(feature = "diagnostics")
+            && (crate::switch::on("VICTORY_D3D12_DEBUG") || crate::pso_trace::enabled());
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -4603,8 +4612,8 @@ mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 pub(crate) mod latency;
-#[cfg(feature = "diagnostics")]
 mod panel;
+mod framelog;
 mod place;
 pub(crate) mod rec;
 pub(crate) mod reflex;
@@ -7182,7 +7191,10 @@ impl Host {
                     let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
-                    tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    // (Said by the pipeline trace's callback when it is on.)
+                    if !crate::pso_trace::registered() {
+                        tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }
@@ -10466,7 +10478,6 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -10539,7 +10550,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -11132,7 +11142,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -11190,11 +11199,12 @@ impl Host {
             latency::presented(status);
             reflex::mark(reflex::Marker::PresentEnd, frame);
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
             let presented = p.meter.record_present(p.hwnd, status);
+            crate::memstat::presented(self);
+            framelog::presented();
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
@@ -11258,7 +11268,6 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }

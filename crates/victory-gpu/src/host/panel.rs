@@ -1,12 +1,17 @@
-//! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): white
+//! The run's numbers on the picture, in every build (`VICTORY_PANEL=1`; off
+//! by default; F3 shows and hides it while our window has the focus): white
 //! text on a black box in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
 //! thread. Made again twice a second from the counters of
 //! the frame-rate line, memory and textures; a frame itself only copies the
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
-//! see the title's own.
+//! see the title's own. A release build has it too (after Belobug a-publier
+//! e9428969, `host/panel.rs`, and PRs #325 and #330, GPL-3.0-or-later),
+//! with the process's processor time beside; only the recording time is a
+//! diagnostics build's (0 elsewhere). Never cleared rectangles: a picture
+//! copied out of a buffer (64 or more cleared rectangles in a frame end the
+//! device on NVIDIA).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +32,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 10;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -170,14 +175,36 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
 /// line (right behind a look of ours).
 #[derive(Clone, Copy, Default)]
-struct Counters([u64; COUNTERS]);
+pub(super) struct Counters(pub(super) [u64; COUNTERS]);
 
-const COUNTERS: usize = 11;
+pub(super) const COUNTERS: usize = 12;
+
+/// The process's processor time so far, all threads, in microseconds.
+fn processor_us() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [created, ended, kernel, user] = &mut t;
+    // SAFETY: our own process and four times to fill.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), created, ended, kernel, user) } == 0 {
+        return 0;
+    }
+    let ticks = |f: &FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) / 10;
+    ticks(kernel) + ticks(user)
+}
+
+/// The PC's logical processors.
+fn processors() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
 
 impl Counters {
-    fn now() -> Counters {
+    pub(super) fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
+        #[cfg(feature = "diagnostics")]
+        let recording = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let recording = 0;
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         Counters([
             super::worked(),
@@ -189,13 +216,14 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            recording,
             crate::draw::drawn(),
+            processor_us(),
         ])
     }
 
     /// What came since `before`, per frame.
-    fn since(self, before: Counters, frames: f64) -> [f64; COUNTERS] {
+    pub(super) fn since(self, before: Counters, frames: f64) -> [f64; COUNTERS] {
         let mut out = [0.0; COUNTERS];
         for (i, out) in out.iter_mut().enumerate() {
             let (was, is) = (before.0[i], self.0[i]);
@@ -209,7 +237,7 @@ impl Counters {
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
+    let (working, private, _) = crate::memstat::process();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
@@ -219,6 +247,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
         format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+        format!("CPU {:.1} OF {} CORES", c[11] / 1e3 / ms.max(0.001), processors()),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
         format!("THIS PANEL {:.0} US A FRAME", cost),
@@ -363,6 +392,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -470,5 +500,16 @@ mod tests {
         (a.0[1], b.0[1]) = (50, 20);
         let c = b.since(a, 10.0);
         assert_eq!((c[0], c[1]), (2.0, 2.0));
+    }
+
+    #[test]
+    fn the_processor_time_grows_and_every_line_fits() {
+        let before = processor_us();
+        let mut x = 0u64;
+        for i in 0..20_000_000u64 {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+        }
+        assert!(processor_us() > before, "{x}");
+        assert!(processors() >= 1);
     }
 }

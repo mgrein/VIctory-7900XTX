@@ -40,6 +40,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod drvwatch;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod dxr;
@@ -76,6 +78,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod pso_trace;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -92,6 +96,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+mod memstat;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
