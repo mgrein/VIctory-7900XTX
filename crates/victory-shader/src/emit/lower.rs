@@ -1642,6 +1642,15 @@ fn resinfo_shape_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_SHAPE").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_RESINFO_MSAA=0`: a program that asks the size of a multisampled
+/// image (MIMG dimensions 6 and 7) is refused, as before. Otherwise the
+/// query reads the view as a 2D multisampled texture (or array of them):
+/// its sizes and one level. Other accesses to such views stay refused.
+fn resinfo_msaa_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_MSAA").is_none_or(|v| v != "0"))
+}
+
 /// The four results of an image size query (`image_get_resinfo`) of a view of
 /// DXIL resource kind `kind` from the host's `dimensions` (width, height,
 /// depth or layers, levels): with `console_shape` the sizes DXIL leaves out
@@ -12448,6 +12457,9 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            // Sized only ([`resinfo_msaa_on`]).
+            6 if name == "image_get_resinfo" && resinfo_msaa_on() => (3, 2),
+            7 if name == "image_get_resinfo" && resinfo_msaa_on() => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -12699,10 +12711,15 @@ impl<'a> Lower<'a> {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions ([`resinfo_sizes`]; UAVs:
             // one level).
+            let multisampled = matches!(kind, 3 | 8);
+            if multisampled && uav {
+                return Err("a multisampled UAV");
+            }
             let h = self.handle(site, src, false, props)?;
             // A UAV is a view of one level: its query keeps that level's
-            // sizes whatever the first address says.
-            let requested = if uav { None } else { Some(addr_val(self, 0)?) };
+            // sizes whatever the first address says. So is a multisampled
+            // view, whose DXIL query takes no level.
+            let requested = if uav || multisampled { None } else { Some(addr_val(self, 0)?) };
             let mip = requested.unwrap_or_else(|| self.s.m.undef(self.s.t.i32));
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);

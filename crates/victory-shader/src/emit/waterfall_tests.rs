@@ -166,6 +166,25 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .collect()
 }
 
+/// The waterfall's sample turned into `image_get_resinfo` of a
+/// multisampled view (MIMG dimensions 6 and 7): it translates and validates
+/// instead of refusing the program. Translated only: no multisampled texture
+/// is bound. From stellarr-studio/kelvaroq patch 0049.
+#[test]
+fn multisampled_resinfo_translates() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    if std::env::var_os("VICTORY_RESINFO_MSAA").is_some_and(|v| v == "0") {
+        return;
+    }
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    let query = words.iter().position(|&w| w == 0xF09C_0F08).unwrap();
+    words[query + 1] = 0x0003_0C00;
+    for dim in [6, 7] {
+        words[query] = 0xF038_0300 | dim << 3;
+        build(&words, false);
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;
