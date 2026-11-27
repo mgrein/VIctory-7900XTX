@@ -2363,6 +2363,9 @@ pub(crate) fn let_go_idle() {
     // once ([`sweep_rests`]).
     static EMPTY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
     let limited = most != u64::MAX;
+    // Parked host textures (`VICTORY_TEXTURE_RECYCLE`): all go on a card
+    // short of room, before any copy in use.
+    recycle_tick(limited);
     let now = crate::host::coarse_ms().max(1);
     if limited && sweep_rests(now, EMPTY[0].load(Relaxed), EMPTY[1].load(Relaxed), idle_ms, sweep_rest_ms()) {
         SWEPT_RESTED.fetch_add(1, Relaxed);
@@ -2587,7 +2590,7 @@ unsafe fn let_go_one(at: usize, idle_ms: u64, idle_frames: u64) -> Option<u64> {
     KINDS[2].fetch_add(1, Relaxed);
     KINDS[3].fetch_add(host.bytes, Relaxed);
     let bytes = host.bytes;
-    crate::host::retire(host);
+    retire_host(host);
     Some(bytes)
 }
 
@@ -3032,6 +3035,38 @@ fn host_texture_as(
         });
         return Ok(t);
     }
+    // A parked host texture of the same description and state, if any
+    // ([`recycle_most`]; a full chain of levels asked for as 0 is not
+    // looked for: the parked ones say their count).
+    if !reserved
+        && recycle_most() != 0
+        && fills(desc)
+        && d.sample_count <= 1
+        && d.mip_levels != 0
+        && clear_value.is_none()
+        // As for a piece of a block above: only a layout every level of
+        // which the upload writes whole.
+        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+    {
+        let wanted = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION(d.dimension as i32),
+            Alignment: 0,
+            Width: d.width,
+            Height: d.height,
+            DepthOrArraySize: d.depth_or_array_size,
+            MipLevels: d.mip_levels,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(d.format as i32),
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: d.sample_count,
+                Quality: d.sample_quality,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT(d.layout as i32),
+            Flags: D3D12_RESOURCE_FLAGS(d.flags as i32),
+        };
+        if let Some(t) = recycled(&wanted, crate::host::legal_for(d.flags, crate::host::texture_state(state))) {
+            return Ok(t);
+        }
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
@@ -3104,6 +3139,233 @@ thread_local! {
     /// The error the next making of a host texture of its own
     /// ([`host_texture_as`], not from a block) fails with.
     static FAIL_NEXT: std::cell::Cell<Option<HRESULT>> = const { std::cell::Cell::new(None) };
+}
+
+/// What a parked host texture is found again by ([`Recycle`]): its host
+/// description (alignment left out: the card fills it in) and the state it
+/// is in.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecycleKey {
+    dimension: u32,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: u32,
+    samples: (u32, u32),
+    layout: u32,
+    flags: u32,
+    state: u32,
+}
+
+/// Host textures of their own let go of after their last use on the card,
+/// kept for a while for a new host copy of the same description and state
+/// to take instead of a new allocation ([`recycled`]): the oldest go first
+/// past `most` bytes, and any after `age` milliseconds.
+#[cfg(any(windows, test))]
+struct Recycle<T> {
+    /// (key, bytes, parked at, texture), the oldest first.
+    parked: std::collections::VecDeque<(RecycleKey, u64, u64, T)>,
+    bytes: u64,
+}
+
+#[cfg(any(windows, test))]
+impl<T> Recycle<T> {
+    const fn new() -> Recycle<T> {
+        Recycle { parked: std::collections::VecDeque::new(), bytes: 0 }
+    }
+
+    /// Parks `item`; what goes to stay within `most` bytes (`item` itself
+    /// if it is larger).
+    fn park(&mut self, key: RecycleKey, bytes: u64, now: u64, item: T, most: u64) -> Vec<T> {
+        if bytes > most {
+            return vec![item];
+        }
+        self.parked.push_back((key, bytes, now, item));
+        self.bytes += bytes;
+        let mut gone = Vec::new();
+        while self.bytes > most
+            && let Some((_, b, _, t)) = self.parked.pop_front()
+        {
+            self.bytes -= b;
+            gone.push(t);
+        }
+        gone
+    }
+
+    /// The newest parked one of `key`, taken out.
+    fn take(&mut self, key: &RecycleKey) -> Option<T> {
+        let at = self.parked.iter().rposition(|(k, ..)| k == key)?;
+        let (_, b, _, t) = self.parked.remove(at)?;
+        self.bytes -= b;
+        Some(t)
+    }
+
+    /// Those parked `age` milliseconds or longer before `now`, taken out.
+    fn expire(&mut self, now: u64, age: u64) -> Vec<T> {
+        let mut gone = Vec::new();
+        while self.parked.front().is_some_and(|&(_, _, at, _)| now.saturating_sub(at) >= age)
+            && let Some((_, b, _, t)) = self.parked.pop_front()
+        {
+            self.bytes -= b;
+            gone.push(t);
+        }
+        gone
+    }
+}
+
+/// How many bytes of host textures [`Recycle`] keeps: with
+/// `VICTORY_TEXTURE_RECYCLE=1` (off by default),
+/// `VICTORY_TEXTURE_RECYCLE_MB` (256; at most 2,048); 0: none kept, every
+/// host texture of its own let go is freed as before. Only textures the
+/// title fills whose host copy is of its own (not a piece of a block, not
+/// made level by level), of one sample: every level is uploaded again
+/// before anything reads it, so what the texture held before shows in no
+/// texel. Parked ones count on the card as any; on a card short of room
+/// ([`let_go_idle`] with a limit) they all go. (Idea after XCL PR #2436;
+/// own code.)
+#[cfg(windows)]
+fn recycle_most() -> u64 {
+    #[cfg(test)]
+    if let most @ 1.. = RECYCLE_TEST.get() {
+        return most;
+    }
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_RECYCLE").is_none_or(|v| v != "1") {
+            return 0;
+        }
+        let mb = std::env::var("VICTORY_TEXTURE_RECYCLE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |mb| mb.min(2048));
+        tracing::info!("host textures let go are kept for reuse, up to {mb} MB (VICTORY_TEXTURE_RECYCLE)");
+        mb << 20
+    })
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// [`recycle_most`] on this thread, if not 0.
+    static RECYCLE_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How long a parked host texture waits for a taker before it is freed.
+#[cfg(windows)]
+const RECYCLE_AGE_MS: u64 = 10_000;
+
+#[cfg(windows)]
+static RECYCLED: std::sync::Mutex<Recycle<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> =
+    std::sync::Mutex::new(Recycle::new());
+
+/// Since the start: host textures parked, and taken again.
+#[cfg(windows)]
+pub(crate) static RECYCLES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The key of a host texture of description `d` in `state`.
+#[cfg(windows)]
+fn recycle_key(d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, state: u32) -> RecycleKey {
+    RecycleKey {
+        dimension: d.Dimension.0 as u32,
+        width: d.Width,
+        height: d.Height,
+        depth_or_array_size: d.DepthOrArraySize,
+        mip_levels: d.MipLevels,
+        format: d.Format.0 as u32,
+        samples: (d.SampleDesc.Count, d.SampleDesc.Quality),
+        layout: d.Layout.0 as u32,
+        flags: d.Flags.0 as u32,
+        state,
+    }
+}
+
+/// A host texture let go of, parked ([`Recycle`]) when it is dropped,
+/// which [`crate::host::retire`] does once every submission that may use it
+/// has run, if nothing else holds it then.
+#[cfg(windows)]
+struct Parking(Option<std::sync::Arc<HostTexture>>);
+
+#[cfg(windows)]
+impl Drop for Parking {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = self.0.take() else {
+            return;
+        };
+        if std::sync::Arc::strong_count(&host) != 1 {
+            return;
+        }
+        let texture = host.texture.clone();
+        let (state, bytes) = (host.state.load(Relaxed), host.bytes);
+        drop(host);
+        // No list, no slot, nothing else: only this reference is left.
+        if crate::host::references(&texture) != 1 {
+            return;
+        }
+        // SAFETY: a plain query on a live texture.
+        let key = recycle_key(&unsafe { texture.GetDesc() }, state);
+        let gone = RECYCLED.lock().unwrap_or_else(|e| e.into_inner()).park(
+            key,
+            bytes,
+            crate::host::coarse_ms(),
+            texture,
+            recycle_most(),
+        );
+        RECYCLES[0].fetch_add(1, Relaxed);
+        // Nothing uses them: freed at once (after the lock).
+        drop(gone);
+    }
+}
+
+/// Lets go of host copy `host` ([`crate::host::retire`]); one that may be
+/// taken again ([`recycle_most`]) is parked once the card is done with it.
+#[cfg(windows)]
+fn retire_host(host: std::sync::Arc<HostTexture>) {
+    if recycle_most() != 0
+        && host.filled
+        && host.tiled.is_none()
+        && host.bytes != 0
+        // SAFETY: a plain query on a live texture.
+        && unsafe { host.texture.GetDesc() }.SampleDesc.Count <= 1
+        && crate::pool::piece_of(&host.texture).is_none()
+    {
+        crate::host::retire(Parking(Some(host)));
+    } else {
+        crate::host::retire(host);
+    }
+}
+
+/// A parked host texture of description `d` in `state`, taken out.
+#[cfg(windows)]
+fn recycled(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    state: u32,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    let taken = RECYCLED.lock().unwrap_or_else(|e| e.into_inner()).take(&recycle_key(d, state))?;
+    let n = RECYCLES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            reused = n,
+            parked = RECYCLES[0].load(std::sync::atomic::Ordering::Relaxed),
+            "a host texture let go of was taken again for a new host copy (VICTORY_TEXTURE_RECYCLE)"
+        );
+    }
+    Some(taken)
+}
+
+/// Frees parked host textures that waited [`RECYCLE_AGE_MS`], or all of
+/// them on a card short of room (`short`).
+#[cfg(windows)]
+fn recycle_tick(short: bool) {
+    if recycle_most() == 0 {
+        return;
+    }
+    let gone = {
+        let mut parked = RECYCLED.lock().unwrap_or_else(|e| e.into_inner());
+        if short { parked.expire(u64::MAX, 0) } else { parked.expire(crate::host::coarse_ms(), RECYCLE_AGE_MS) }
+    };
+    drop(gone);
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -3317,7 +3579,7 @@ impl Drop for Resource {
         // A running submission may still read the host copy (and a depth
         // texture's colour twin).
         if let Some((host, twin)) = made {
-            crate::host::retire(host);
+            retire_host(host);
             if let Some(twin) = twin {
                 crate::host::retire(twin);
             }
@@ -5272,6 +5534,98 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(r.host.refused.load(Relaxed) && !retrying(image) && !host_waits(image));
         assert!(hosted(image, true).is_none());
         resource_release(image);
+    }
+
+    fn key(width: u64, state: u32) -> RecycleKey {
+        RecycleKey {
+            dimension: 3,
+            width,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            samples: (1, 0),
+            layout: 0,
+            flags: 0,
+            state,
+        }
+    }
+
+    /// Parked textures are found by description and state, the newest
+    /// first; the oldest go past the bytes kept, and all after their age.
+    #[test]
+    fn parked_textures_are_taken_by_description_and_state() {
+        let mut parked = Recycle::new();
+        assert!(parked.park(key(64, 0x40), 10, 0, 1, 25).is_empty());
+        assert!(parked.park(key(64, 0x40), 10, 5, 2, 25).is_empty());
+        assert!(parked.take(&key(64, 0)).is_none(), "another state");
+        assert!(parked.take(&key(128, 0x40)).is_none(), "another size");
+        assert_eq!(parked.take(&key(64, 0x40)), Some(2), "the newest first");
+        assert_eq!(parked.bytes, 10);
+        // Past the bytes kept: the oldest goes; one larger than all goes itself.
+        assert!(parked.park(key(128, 0x40), 10, 6, 3, 25).is_empty());
+        assert_eq!(parked.park(key(128, 0x40), 10, 7, 4, 25), vec![1]);
+        assert_eq!(parked.park(key(256, 0x40), 30, 8, 5, 25), vec![5]);
+        assert_eq!(parked.bytes, 20);
+        // Their age.
+        assert_eq!(parked.expire(10_006, 10_000), vec![3]);
+        assert_eq!(parked.expire(u64::MAX, 0), vec![4]);
+        assert_eq!(parked.bytes, 0);
+        assert!(parked.take(&key(128, 0x40)).is_none());
+    }
+
+    /// A host texture of its own let go of once the card is done with it is
+    /// handed out again for the same description and state, once.
+    #[cfg(windows)]
+    #[test]
+    fn a_host_texture_let_go_is_taken_again_for_the_same_description() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        RECYCLE_TEST.set(64 << 20);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        const READ: u32 = 0x40 | 0x80;
+        let mut made: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
+        // SAFETY: plain creation with our own description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATES(READ as i32),
+                    None,
+                    &mut made,
+                )
+                .unwrap();
+        }
+        let made = made.unwrap();
+        let raw = made.as_raw();
+        let mut copy = HostTexture::new(made, READ);
+        copy.filled = true;
+        drop(Parking(Some(std::sync::Arc::new(copy))));
+        assert!(recycled(&desc, 0).is_none(), "another state");
+        let again = recycled(&desc, READ).expect("parked");
+        assert_eq!(again.as_raw(), raw);
+        assert!(recycled(&desc, READ).is_none(), "taken once");
+        // One something else still holds is not parked.
+        let mut copy = HostTexture::new(again.clone(), READ);
+        copy.filled = true;
+        drop(Parking(Some(std::sync::Arc::new(copy))));
+        assert!(recycled(&desc, READ).is_none(), "held elsewhere");
+        RECYCLE_TEST.set(0);
     }
 
     #[test]

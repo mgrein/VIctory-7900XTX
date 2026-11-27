@@ -152,7 +152,6 @@ pub(crate) fn sparse_blocks() -> Vec<(usize, u64)> {
 }
 
 /// The block a texture made in one lies in, and its piece's bytes.
-#[cfg(test)]
 pub(crate) fn piece_of(texture: &ID3D12Resource) -> Option<(usize, u64)> {
     let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
     placed.by_texture.get(&(texture.as_raw() as usize)).map(|(p, _)| (p.block, p.len))
