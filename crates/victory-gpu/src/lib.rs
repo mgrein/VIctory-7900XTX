@@ -54,6 +54,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 mod port;
 #[cfg(windows)]
 mod port_cbv;

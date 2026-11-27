@@ -40,6 +40,7 @@ On in `play.ps1`'s NVIDIA profile; elsewhere off by default.
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (off for now) |
+| `VICTORY_MESH_LAUNCH=1` | Indirect mesh draws of one record without a count are launched by an amplification stage of ours that reads, bounds and charges the record on the card: no clamp pass before them (off until measured; `nowait` also leaves out the waits for earlier shader writes; changes the translation, so the shader cache keys on it) |
 
 What is known to be wrong:
 

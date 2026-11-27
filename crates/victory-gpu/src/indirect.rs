@@ -341,7 +341,7 @@ pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
 /// runs). A list whose budget one garbage record empties loses all its later
 /// draws, and which record that is may differ from frame to frame. The frame
 /// line says how many records a frame are refused.
-fn rest() -> u32 {
+pub(crate) fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
@@ -444,6 +444,19 @@ pub(crate) fn bound(
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+}
+
+/// [`bound`] charging `budget` (a host address) instead of the list's.
+#[cfg(test)]
+pub(crate) fn bound_with_budget(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    budget: u64,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, dst) = (clamp()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, None, spec, false).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will

@@ -12,6 +12,31 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload a translated mesh shader declares (and never
+/// reads) when the host puts an amplification shader of its own in front
+/// of it (the launch of indirect mesh records, `victory-gpu`'s `launch`,
+/// `VICTORY_MESH_LAUNCH`). NVIDIA's driver refuses a pipeline whose
+/// amplification shader hands a payload to a mesh shader that declares
+/// none; one that declares a payload is still taken without an
+/// amplification shader.
+pub const MESH_PAYLOAD_BYTES: u32 = 4;
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
+
+/// Whether the host launches mesh draws through its own amplification
+/// stage (`VICTORY_MESH_LAUNCH` set and not `0`; off by default): then
+/// translated mesh shaders declare [`MESH_PAYLOAD_BYTES`] of payload. Part
+/// of the translation: the shader cache keys on the switch when it is set.
+pub fn mesh_launch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// The payload bytes a translated mesh shader declares ([`mesh_launch`]).
+pub fn mesh_payload_bytes() -> u32 {
+    if mesh_launch() { MESH_PAYLOAD_BYTES } else { 0 }
+}
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -1182,7 +1207,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
