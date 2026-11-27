@@ -390,6 +390,10 @@ pub(crate) struct State {
     topology_set: bool,
     target_handles: Vec<u64>,
     depth_handle: u64,
+    /// The render target and depth descriptors as they were when the title
+    /// set them ([`TargetSnapshot`]), replayed in place of the handles.
+    target_snapshots: Vec<TargetSnapshot>,
+    depth_snapshot: TargetSnapshot,
     targets_set: bool,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
@@ -760,6 +764,48 @@ fn reupload_when_full() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
 }
 
+/// Whether the render target and depth descriptors are kept as they were
+/// when the title set the targets, for the host list that continues a cut
+/// one ([`State::replay`]); `VICTORY_TARGET_SNAPSHOT=0`: read again from
+/// the title's handles at the cut, as before. (After Cuebert's DexNom PR
+/// #48 and fxceless PR #1371.)
+fn target_snapshot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_SNAPSHOT").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of a render target or depth descriptor slot (its record,
+/// `crate::descriptor::RtvRecord`) at the time the title set it; its
+/// address serves as a handle to read the record from. Handle 0 is none.
+#[derive(Clone, Copy, Default)]
+struct TargetSnapshot(Option<[u64; TARGET_WORDS]>);
+
+const TARGET_WORDS: usize = size_of::<crate::descriptor::RtvRecord>().div_ceil(8);
+
+impl TargetSnapshot {
+    fn of(handle: u64) -> Self {
+        if handle == 0 {
+            return TargetSnapshot(None);
+        }
+        let mut words = [0u64; TARGET_WORDS];
+        // SAFETY: a descriptor slot the title passes, which holds a record
+        // (`crate::descriptor::rtv_record` reads as much).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                handle as *const u8,
+                words.as_mut_ptr().cast::<u8>(),
+                size_of::<crate::descriptor::RtvRecord>(),
+            );
+        }
+        TargetSnapshot(Some(words))
+    }
+
+    /// The address to read the record from while `self` stays where it is.
+    fn handle(&self) -> u64 {
+        self.0.as_ref().map_or(0, |words| words.as_ptr() as u64)
+    }
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -1112,6 +1158,11 @@ impl State {
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
+        if target_snapshot() {
+            self.target_snapshots.clear();
+            self.target_snapshots.extend(handles.iter().map(|&h| TargetSnapshot::of(h)));
+            self.depth_snapshot = TargetSnapshot::of(depth);
+        }
         self.targets_set = true;
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
@@ -1235,9 +1286,11 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// The render target views are made again from the descriptors as they
+    /// were when the title set the targets ([`target_snapshot`]): as on
+    /// the console and in Direct3D 12, setting targets reads their
+    /// descriptors then, and a descriptor the title rewrites before the
+    /// cut must not move the rest of the list's draws to another view.
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -1249,7 +1302,20 @@ impl State {
         self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            let depth = self.depth_handle;
+            if target_snapshot() {
+                // The snapshots stand for the descriptors (their address is
+                // the handle); set again from them, they snapshot themselves.
+                let snapshots = std::mem::take(&mut self.target_snapshots);
+                let depth_snapshot = self.depth_snapshot;
+                let at: Vec<u64> = snapshots.iter().map(TargetSnapshot::handle).collect();
+                self.set_targets(list, &at, depth_snapshot.handle());
+                // The title's handles, for a switch read again (none) and the listing.
+                self.target_handles = handles;
+                self.depth_handle = depth;
+            } else {
+                self.set_targets(list, &handles, depth);
+            }
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -4972,5 +5038,36 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod target_snapshot_tests {
+    use super::TargetSnapshot;
+    use crate::descriptor::{create_dsv, create_rtv, dsv_record, rtv_record};
+    use crate::object::This;
+
+    /// A target descriptor the title rewrites after setting it is replayed
+    /// as it was set (`State::replay`).
+    #[test]
+    fn a_rewritten_target_descriptor_replays_as_it_was_set() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 8];
+        let (rtv, dsv) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 64);
+        let (first, second) = (0x7a11_0000usize as This, 0x7a12_0000usize as This);
+        let desc = [28u32, 4, 0, 0, 0, 0];
+        create_rtv(null, first, &desc, rtv);
+        create_dsv(null, first, null.cast(), dsv);
+        let (kept, kept_depth) = (TargetSnapshot::of(rtv), TargetSnapshot::of(dsv));
+        create_rtv(null, second, &[10, 4, 0, 0, 0, 0], rtv);
+        create_dsv(null, second, null.cast(), dsv);
+        let was = rtv_record(kept.handle()).expect("a render target record");
+        assert_eq!(was.resource, first);
+        assert_eq!(was.desc().map(|d| d.Format.0), Some(28));
+        assert_eq!(dsv_record(kept_depth.handle()).map(|r| r.resource), Some(first));
+        assert_eq!(rtv_record(rtv).map(|r| r.resource), Some(second));
+        // A snapshot of itself is the same, and of no handle there is none.
+        assert_eq!(rtv_record(TargetSnapshot::of(kept.handle()).handle()).map(|r| r.key()), Some(was.key()));
+        assert!(rtv_record(TargetSnapshot::of(0).handle()).is_none());
     }
 }
