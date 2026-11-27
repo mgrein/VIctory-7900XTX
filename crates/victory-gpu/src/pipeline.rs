@@ -266,15 +266,43 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// the whole builder and the host side of title memory by address
 /// (`memory.rs`) working on a card; nothing reads the structures before
 /// the programs that walk them translate.
+///
+/// The group holds its pipelines weakly: a stage the title released can no
+/// longer be dispatched, so it leaves the group (and its host pipeline goes
+/// with the title's pipeline) instead of being kept, and made, for good.
 #[cfg(windows)]
 struct Builder {
-    pipelines: Vec<Arc<make::Pending>>,
+    pipelines: Vec<std::sync::Weak<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
     /// One could not be made, of so many (0: none).
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+}
+
+#[cfg(windows)]
+impl Builder {
+    /// Lets go of the stages the title released. A builder kept off stays
+    /// off for what is left, as it would until the title creates another.
+    fn prune(&mut self) {
+        if live_only(&mut self.pipelines) && self.off != 0 {
+            self.off = self.pipelines.len();
+        }
+    }
+
+    /// The stages the title still holds.
+    fn live(&self) -> Vec<Arc<make::Pending>> {
+        self.pipelines.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+}
+
+/// Drops the entries of `list` whose object is gone; whether there were any.
+#[cfg(windows)]
+fn live_only<T>(list: &mut Vec<std::sync::Weak<T>>) -> bool {
+    let before = list.len();
+    list.retain(|w| w.strong_count() > 0);
+    list.len() != before
 }
 
 #[cfg(windows)]
@@ -347,7 +375,8 @@ pub(crate) fn builder_whole_now() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
-    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.prune();
     b.whole && b.off != b.pipelines.len() && crate::frame::current() >= b.rests
 }
 
@@ -360,13 +389,15 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.prune();
     if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
         return true;
     }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    let live = b.live();
+    let missing: Vec<String> = live.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     // A stage translated in an approximate form counts as missing too (unless
     // `VICTORY_BVH_APPROXIMATE=1`, `victory_shader::emit::approximate_allowed`): what
     // it writes feeds the next stage's store offsets (per-half-wave builder programs lost
@@ -376,7 +407,7 @@ pub(crate) fn builder_runs() -> bool {
     let approximate: Vec<String> = if victory_shader::emit::approximate_allowed() {
         Vec::new()
     } else {
-        b.pipelines.iter().flat_map(|p| make::approximate(p)).collect()
+        live.iter().flat_map(|p| make::approximate(p)).collect()
     };
     if !approximate.is_empty() {
         b.off = b.pipelines.len();
@@ -632,7 +663,8 @@ fn hand_out(
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
+        b.prune();
+        b.pipelines.push(Arc::downgrade(&host));
         b.whole = false;
     }
     let pipeline = Box::new(Pipeline {
@@ -848,6 +880,26 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The builder's group lets go of the stages the title released and
+    /// keeps the ones it holds.
+    #[cfg(windows)]
+    #[test]
+    fn released_builder_stages_leave_the_group() {
+        use std::sync::{Arc, Weak};
+        let kept = Arc::new(1u32);
+        let released = Arc::new(2u32);
+        let mut list: Vec<Weak<u32>> = vec![Arc::downgrade(&kept), Arc::downgrade(&released)];
+        assert!(!super::live_only(&mut list));
+        assert_eq!(list.len(), 2);
+        drop(released);
+        assert!(super::live_only(&mut list));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].upgrade().as_deref(), Some(&1));
+        drop(kept);
+        assert!(super::live_only(&mut list));
+        assert!(list.is_empty());
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
