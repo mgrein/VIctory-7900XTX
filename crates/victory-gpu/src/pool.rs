@@ -152,7 +152,6 @@ pub(crate) fn sparse_blocks() -> Vec<(usize, u64)> {
 }
 
 /// The block a texture made in one lies in, and its piece's bytes.
-#[cfg(test)]
 pub(crate) fn piece_of(texture: &ID3D12Resource) -> Option<(usize, u64)> {
     let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
     placed.by_texture.get(&(texture.as_raw() as usize)).map(|(p, _)| (p.block, p.len))
@@ -533,6 +532,48 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// Where the free memory of the blocks lies ([`Slack`]).
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    fn slack(&self) -> Slack {
+        let mut s = Slack::default();
+        for block in self.blocks.iter().flatten() {
+            if block.free.whole(BLOCK) {
+                s.empty += 1;
+                continue;
+            }
+            let free: u64 = block.free.0.values().sum();
+            s.partial += 1;
+            s.free += free;
+            s.widest = s.widest.max(block.free.0.values().copied().max().unwrap_or(0));
+            if block.held < BLOCK / 4 {
+                s.thin += 1;
+                s.thin_free += free;
+            }
+        }
+        s.resting = self.resting.iter().map(|(_, p)| p.len).sum();
+        s
+    }
+}
+
+/// The free memory inside the blocks a texture still holds a piece of: what
+/// keeps 64 MiB blocks alive for little (XCL PR #2630's measure, idea only).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+pub(crate) struct Slack {
+    /// Blocks no piece is cut from (kept as spares).
+    pub(crate) empty: u64,
+    /// Blocks with at least one piece taken or resting, and their free bytes.
+    pub(crate) partial: u64,
+    pub(crate) free: u64,
+    /// Of those, the blocks whose pieces hold less than a quarter, and their
+    /// free bytes: what moving those pieces would give back.
+    pub(crate) thin: u64,
+    pub(crate) thin_free: u64,
+    /// The widest free range of a partial block.
+    pub(crate) widest: u64,
+    /// Bytes of pieces given back that still rest ([`REST`]).
+    pub(crate) resting: u64,
 }
 
 /// A mapped upload buffer's memory.
@@ -561,6 +602,12 @@ pub(crate) fn texture_room() -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+}
+
+/// For the memory line: the free memory inside the texture blocks.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slack() -> Slack {
+    lock(&TEXTURES).slack()
 }
 
 /// For the memory line: bytes of the pieces textures hold now.
@@ -964,6 +1011,38 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn slack_counts_free_memory_inside_blocks_still_held() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let mb = 1u64 << 20;
+        // Block 1: 4 MiB held, 28 + 32 MiB given back; block 2: 8 MiB held.
+        let (_small, _, _) = pool.take(4 * mb, 1, 0, make).unwrap();
+        let (big, _, _) = pool.take(28 * mb, 1, 0, make).unwrap();
+        let (fill, _, _) = pool.take(32 * mb, 1, 0, make).unwrap();
+        let (_other, _, _) = pool.take(8 * mb, 1, 0, make).unwrap();
+        pool.add(99, 0);
+        pool.give(big, 0);
+        pool.give(fill, 0);
+        let s = pool.slack();
+        assert_eq!(made.get(), 2);
+        assert_eq!((s.empty, s.partial), (1, 2));
+        // Resting pieces are not free yet.
+        assert_eq!(s.free, 56 * mb);
+        assert_eq!(s.resting, 60 * mb);
+        assert_eq!(s.thin, 2);
+        pool.reclaim(REST, SPARE_KEPT, false);
+        let s = pool.slack();
+        assert_eq!(s.free, 116 * mb);
+        assert_eq!((s.thin, s.thin_free), (2, 116 * mb));
+        assert_eq!(s.widest, 60 * mb);
+        assert_eq!((s.empty, s.resting), (1, 0));
     }
 
     #[test]

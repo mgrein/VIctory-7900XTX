@@ -2948,6 +2948,13 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            // No host copy for want of the card's memory: the slot is held
+            // back like one refused for room, and looked at again when the
+            // card may have it (marked done, it was never uploaded).
+            if texture.is_none() && crate::resource::retrying(resource) {
+                host.texture_slot_held(index, write, frame + 8);
+                continue;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -5129,7 +5136,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
