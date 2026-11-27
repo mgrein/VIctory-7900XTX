@@ -158,6 +158,17 @@ fn build() -> [u8; 32] {
                 bytes.extend_from_slice(b"VICTORY_PORT_CBV_SLOT=1");
             }
         }
+        // Switches that change a translation away from the default one:
+        // each only when set, so the translations cached without them keep
+        // their key.
+        for name in ["VICTORY_EARLY_DEPTH"] {
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_encoded_bytes());
+                bytes.push(0);
+            }
+        }
         // Native ray tracing (`VICTORY_NATIVE_RT=1`): traversal loops lifted
         // to `RayQuery`, and the switches that pick which and how. Only when
         // one is set, so the translations cached without them keep their key.
