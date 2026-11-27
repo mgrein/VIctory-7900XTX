@@ -395,6 +395,10 @@ pub(crate) struct State {
     target_snapshots: Vec<TargetSnapshot>,
     depth_snapshot: TargetSnapshot,
     targets_set: bool,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`, `VICTORY_TARGET_VARIANTS`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -1233,6 +1237,15 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
+        for (format, (texture, desc)) in formats.iter_mut().zip(&views) {
+            *format = bound_format(*texture, desc.as_ref().map(|d| d.Format));
+        }
+        if let Some((texture, record)) = &dsv {
+            formats[8] = bound_format(Some(*texture), record.depth_desc().map(|d| d.Format));
+        }
+        self.target_formats = formats;
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
@@ -1522,7 +1535,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -4533,6 +4546,19 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
+    }
+}
+
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format (0 for a
+/// null view without one).
+fn bound_format(texture: Option<&ID3D12Resource>, described: Option<DXGI_FORMAT>) -> u32 {
+    match (described, texture) {
+        (Some(format), _) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        (_, Some(texture)) => unsafe { texture.GetDesc() }.Format.0 as u32,
+        _ => 0,
     }
 }
 
