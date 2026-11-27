@@ -170,6 +170,30 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// NVIDIA: the driver's heap for the code of pipelines in use (512 MB by
+    /// default; past it the device is lost). `status` reads what the driver
+    /// gives the executable; `install` puts it into a driver profile of its
+    /// own that raises the heap, `remove` deletes that profile. Writing needs
+    /// an elevated prompt once; later runs get it by the executable's name.
+    #[cfg(windows)]
+    NvProfile {
+        #[arg(value_enum, default_value_t = NvAction::Status)]
+        action: NvAction,
+        /// The heap `install` sets, in MB (512 to 4095).
+        #[arg(long, default_value_t = 2048)]
+        mb: u32,
+        /// The executable's file name (default: this one's, e.g. victory.exe).
+        #[arg(long)]
+        exe: Option<String>,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, ValueEnum)]
+enum NvAction {
+    Status,
+    Install,
+    Remove,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -249,7 +273,41 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::NvProfile { action, mb, exe } => nv_profile(action, mb, exe),
     }
+}
+
+#[cfg(windows)]
+fn nv_profile(action: NvAction, mb: u32, exe: Option<String>) -> Result<()> {
+    use victory_hle::nvprofile;
+    let exe = exe
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        })
+        .unwrap_or_else(|| "victory.exe".to_owned());
+    match action {
+        NvAction::Status => {
+            let heap = nvprofile::shader_heap(&exe).map_err(anyhow::Error::msg)?;
+            let from = match heap.bytes {
+                Some((_, from)) => format!("set in the {from} profile"),
+                None => format!("the driver's default, {} MB", nvprofile::SHADER_HEAP_DEFAULT_MB),
+            };
+            println!(
+                "{exe}: profile {}, shader-code heap {} MB ({from})",
+                heap.profile.as_deref().unwrap_or("(none)"),
+                heap.mb()
+            );
+        }
+        NvAction::Install => println!("{}", nvprofile::install_shader_heap(&exe, mb).map_err(anyhow::Error::msg)?),
+        NvAction::Remove => match nvprofile::remove_shader_heap(&exe).map_err(anyhow::Error::msg)? {
+            true => println!("{exe}: its shader-heap profile deleted"),
+            false => println!("{exe}: no shader-heap profile of this to delete"),
+        },
+    }
+    Ok(())
 }
 
 fn show_config() -> Result<()> {

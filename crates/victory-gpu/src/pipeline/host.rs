@@ -529,6 +529,8 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline with the amplification stage of `crate::launch`
     /// (`VICTORY_MESH_LAUNCH`).
     pub(crate) launch: Option<Launch>,
+    /// Its driver code in the live total (`VICTORY_PSO_CODE_SIZE=1`, host/reflex.rs).
+    _code: crate::host::reflex::CodeBytes,
 }
 
 /// What a mesh pipeline with the amplification stage of `crate::launch`
@@ -911,6 +913,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                _code: crate::host::reflex::code_bytes(&pso),
                 pso,
                 root,
                 stages: bound,
@@ -1010,6 +1013,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                _code: crate::host::reflex::code_bytes(&pso),
                 pso,
                 root,
                 stages: bound,
@@ -1130,6 +1134,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            _code: crate::host::reflex::code_bytes(&pso),
             pso,
             root,
             stages: bound,

@@ -14,6 +14,8 @@
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
 # -Fps <n>      n frames a second: our frame clock and the title's own frame rate setting (VICTORY_FRAME_INTERVAL_MS=1000/n; 0: no pacing wait)
 # -SmoothMotion start a copy named victory_sm.exe, so that a Smooth Motion profile set for it in the NVIDIA App applies
+# -NvProfile    start a copy named victory_heap.exe, first put into an NVIDIA driver profile of its own with a 2 GB heap
+#               for shader code (`victory nv-profile install`; asks for administrator rights each time it is given)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -28,7 +30,8 @@ param(
     [ValidateRange(0, 1000)][int]$Fps,
     [switch]$SmoothMotion,
     # Start nothing: give back the executable and the settings (scripts\bench.ps1 runs them itself).
-    [switch]$Print
+    [switch]$Print,
+    [switch]$NvProfile
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -133,6 +136,24 @@ if ($SmoothMotion) {
     }
     $victory = $sm
     Write-Host "Starting ${sm}. Smooth Motion adds about a frame of latency; VICTORY_REFLEX=1 (-More) goes with it, in builds that have it."
+}
+if ($NvProfile) {
+    # NVIDIA keeps the code of the pipelines in use in a 512 MB heap and loses the device past it
+    # (xcl-dev/xcl #2403); the profile raises it for this executable's name. Writing it needs elevation.
+    # The driver already gives the name victory.exe a predefined profile of another game's, which is
+    # left alone, so the profile is made for a copy named victory_heap.exe (with -SmoothMotion, for
+    # victory_sm.exe, unless the NVIDIA App's profile for it holds it already).
+    if (-not $SmoothMotion) {
+        $heap = Join-Path (Split-Path $victory) 'victory_heap.exe'
+        if (-not (Test-Path $heap) -or (Get-Item $heap).LastWriteTime -lt (Get-Item $victory).LastWriteTime) {
+            Copy-Item $victory $heap -Force
+        }
+        $victory = $heap
+    }
+    $name = Split-Path $victory -Leaf
+    $p = Start-Process -FilePath $victory -ArgumentList 'nv-profile', 'install', '--mb', '2048', '--exe', $name -Verb RunAs -Wait -PassThru
+    if ($p.ExitCode -ne 0) { Write-Host "The NVIDIA profile was not written (exit $($p.ExitCode))." }
+    & $victory nv-profile status --exe $name
 }
 if ($Print) { return [pscustomobject]@{ Victory = (Resolve-Path $victory).Path; Exe = (Resolve-Path $Exe).Path; Settings = $settings } }
 # (Other settings left over in this window go; where your files are stays.)
