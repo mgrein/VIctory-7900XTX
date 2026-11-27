@@ -161,7 +161,7 @@ fn build() -> [u8; 32] {
         // Switches that change a translation away from the default one:
         // each only when set, so the translations cached without them keep
         // their key.
-        for name in ["VICTORY_EARLY_DEPTH", "VICTORY_WAVE_LOOP_SKIPS", "VICTORY_NAN_GUARD", "VICTORY_WAVE_WIDE_ONLY"] {
+        for name in ["VICTORY_EARLY_DEPTH", "VICTORY_WAVE_LOOP_SKIPS", "VICTORY_NAN_GUARD", "VICTORY_WAVE_WIDE_ONLY", "VICTORY_THREAD_TICKET"] {
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(name.as_bytes());
                 bytes.push(b'=');
