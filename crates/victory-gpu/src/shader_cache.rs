@@ -161,7 +161,7 @@ fn build() -> [u8; 32] {
         // Switches that change a translation away from the default one:
         // each only when set, so the translations cached without them keep
         // their key.
-        for name in ["VICTORY_EARLY_DEPTH", "VICTORY_WAVE_LOOP_SKIPS", "VICTORY_NAN_GUARD"] {
+        for name in ["VICTORY_EARLY_DEPTH", "VICTORY_WAVE_LOOP_SKIPS", "VICTORY_NAN_GUARD", "VICTORY_WAVE_WIDE_ONLY"] {
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(name.as_bytes());
                 bytes.push(b'=');
@@ -221,9 +221,9 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 
 /// The translation of `container`, tagged with the first 16 hex digits of its
 /// BLAKE3 hash for `VICTORY_NATIVE_RT_FILTER` (only looked at with
-/// `VICTORY_NATIVE_RT=1`).
+/// `VICTORY_NATIVE_RT=1`) and `VICTORY_WAVE_WIDE_ONLY`.
 fn translate_tagged(container: &[u8]) -> Result<HostShader, String> {
-    if !victory_shader::emit::native_rt() {
+    if !victory_shader::emit::native_rt() && !victory_shader::emit::wave_wide_only() {
         return victory_shader::emit::translate(container).map_err(|e| e.to_string());
     }
     let hash = blake3::hash(container).to_hex()[..16].to_owned();

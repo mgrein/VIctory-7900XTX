@@ -303,6 +303,47 @@ pub fn native_rt_matches(hash_hex: &str) -> bool {
     needles.iter().any(|n| hay.contains(n.as_str()))
 }
 
+/// The programs `VICTORY_WAVE_WIDE_ONLY=<hash>[,<hash>...]` names (parts
+/// of the 16 hex digits of their container's BLAKE3, as the pipeline logs
+/// print them): empty when unset.
+fn wave_wide_only_list() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY` names any program: translations are
+/// then tagged with their container's hash ([`with_shader_id`]), and the
+/// shader cache keys on the switch. Off by default.
+pub fn wave_wide_only() -> bool {
+    !wave_wide_only_list().is_empty()
+}
+
+/// Whether the wave64 program being translated on this thread takes the
+/// exact wave-wide form before the approximate ones, as `VICTORY_WAVE_WIDE=1`
+/// gives every program: `VICTORY_WAVE_WIDE_ONLY` names it (after fxceless
+/// e4245f3c: one program, e.g. an underwater one whose approximate form
+/// shows wrong, moved to the exact form without moving the two particle
+/// programs that lost the card in it).
+fn wave_wide_for_this() -> bool {
+    let list = wave_wide_only_list();
+    !list.is_empty()
+        && CURRENT_SHADER_ID.with(|cell| {
+            cell.borrow()
+                .as_deref()
+                .is_some_and(|id| list.iter().any(|n| id.to_ascii_lowercase().contains(n.as_str())))
+        })
+}
+
 thread_local! {
     static CURRENT_SHADER_ID: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static CURRENT_NATIVE_RT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -862,7 +903,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: for the programs it names only.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wave_wide_for_this();
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the barrier-free forms already take keep them (fork PR #1141, after
