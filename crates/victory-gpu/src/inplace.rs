@@ -182,6 +182,32 @@ fn most() -> u64 {
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
 
+/// `VICTORY_IN_PLACE_SYSTEM_PERCENT=<1-100>` (unset: no such bound): title
+/// memory opened from its address is copied instead while the process's
+/// use of the PC's memory shared with the card, with the new heap, is past
+/// that share of its budget. A heap opened in place is accounted there, and
+/// so is what the system moves off a full card; past the budget the system
+/// demotes more (Belobug PR #161, RodrigoTorreao, whose default was 50).
+/// Off by default: a copy costs the refreshes the title's own pages do not.
+fn system_percent() -> Option<u64> {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_IN_PLACE_SYSTEM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| (1..=100).contains(p))
+    })
+}
+
+/// Asks turned down by [`system_percent`] since the start.
+static SYSTEM_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `len` more bytes on top of `used` are past `percent` of
+/// `budget` (a budget not known, 0, bounds nothing).
+fn over_system_budget(budget: u64, used: u64, len: u64, percent: u64) -> bool {
+    budget != 0 && used.saturating_add(len) > budget / 100 * percent
+}
+
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
@@ -262,6 +288,21 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
+    if let Some(percent) = system_percent()
+        && let Some([_, _, budget, used]) = host.video_memory()
+        && over_system_budget(budget, used, len, percent)
+    {
+        if SYSTEM_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::info!(
+                system_budget_mb = budget >> 20,
+                system_used_mb = used >> 20,
+                percent,
+                "title memory is copied, not opened in place, while the PC's memory shared with the card is past its share (VICTORY_IN_PLACE_SYSTEM_PERCENT)"
+            );
+        }
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let placed = if stretch { place_beside(&host.device, start, len) } else { place_part(&host.device, start, len) };
     match placed {
         Ok(placed) => {
@@ -1884,5 +1925,21 @@ pub(crate) mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+}
+
+#[cfg(test)]
+mod system_budget_tests {
+    /// Under the share: in place; past it with the new heap: a copy; an
+    /// unknown budget bounds nothing.
+    #[test]
+    fn title_memory_is_copied_past_a_share_of_the_shared_budget() {
+        use super::over_system_budget;
+        const GIB: u64 = 1 << 30;
+        assert!(!over_system_budget(16 * GIB, 7 * GIB, GIB / 2, 50));
+        assert!(over_system_budget(16 * GIB, 7 * GIB, 2 * GIB, 50));
+        assert!(over_system_budget(16 * GIB, 9 * GIB, 0, 50));
+        assert!(!over_system_budget(16 * GIB, 9 * GIB, GIB, 100));
+        assert!(!over_system_budget(0, 9 * GIB, GIB, 50));
     }
 }
