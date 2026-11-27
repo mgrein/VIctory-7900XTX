@@ -209,6 +209,21 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// The list's flight has landed (the card finished it): the dynamic
+    /// descriptor slots its tables were made in are given back now, as a
+    /// waited-for submission's are ([`tables_done`]), and not when the list
+    /// is reset [`crate::host`]'s bury lag later (16 to 64 submissions):
+    /// held that long, flights in the air and landed ran the slots out and
+    /// draws went without their tables (cool_fox f4b48ad7, codec_d; Belobug
+    /// e9428969). Nothing the card still runs names them: the detached list
+    /// is run by its one flight, and a list cut at waits keeps its slots
+    /// with its last part. `VICTORY_LAND_TABLES=0`: at the reset, as before.
+    pub(crate) fn release_tables(&mut self) {
+        if crate::toggled!("VICTORY_LAND_TABLES") {
+            self._state.tables_done();
+        }
+    }
 }
 
 /// A host list that has run and waits to be used again, the bytes of

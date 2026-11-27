@@ -149,12 +149,22 @@ impl Front {
         let schedule = {
             let mut inner = held(&recording.inner);
             inner.chunks.push_back(words);
+            inner.handed += 1;
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
+    }
+
+    /// Hands over what is written and waits until it is translated: the
+    /// calls made so far are on the list of ours when this returns.
+    fn flush(&mut self) {
+        let Some(recording) = self.recording.clone() else { return };
+        self.hand_over();
+        let upto = held(&recording.inner).handed;
+        recording.flush_to(upto);
     }
 
     fn close(&mut self) {
@@ -206,6 +216,9 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Streams handed over, and streams translated ([`Recording::flush_to`]).
+    handed: u64,
+    translated: u64,
 }
 
 impl Recording {
@@ -227,6 +240,14 @@ impl Recording {
     pub(crate) fn wait(&self) {
         let mut inner = held(&self.inner);
         while !self.done() {
+            inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits until stream `upto` (counted from 1) has been translated.
+    fn flush_to(&self, upto: u64) {
+        let mut inner = held(&self.inner);
+        while inner.translated < upto {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -263,6 +284,8 @@ impl Recording {
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
+            inner.translated += 1;
+            self.moved.notify_all();
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
@@ -386,12 +409,13 @@ pub(crate) fn line(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
+        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}; video frame copies waited for {:.2}",
         s[0],
         s[1] / 1000.0,
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
-        s[3]
+        s[3],
+        VIDEO_FLUSHES.swap(0, Relaxed) as f64 / frames
     );
 }
 
@@ -699,7 +723,27 @@ extern "system" fn copy_texture_region(
         &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
         &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
     );
+    // A copy into a full-screen single-mip image (a decoded video frame,
+    // whose source the title fills again for the next frame) is translated
+    // before the call returns: left to our threads it read the next
+    // frame's bytes or the one before, and the opening video stopped and
+    // went on (cool_fox 22d4a742, starnotes-xj). Every other call stays
+    // with the threads. `VICTORY_THIN_VIDEO_FLUSH=0`: not, as before.
+    // SAFETY: the title passes the location; a plain read.
+    if crate::resource::is_video_frame(unsafe { (*dst).resource }) && video_flush() {
+        VIDEO_FLUSHES.fetch_add(1, Relaxed);
+        front(this).flush();
+    }
 }
+
+/// Whether copies into video frames flush the recording ([`copy_texture_region`]).
+fn video_flush() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_VIDEO_FLUSH").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line of the log: copies into video frames that flushed.
+static VIDEO_FLUSHES: AtomicU64 = AtomicU64::new(0);
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 extern "system" fn copy_texture_region_x(
     this: This,
@@ -927,6 +971,25 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
+    }
+
+    /// A flush waits for the streams handed over so far to be translated,
+    /// not for later ones.
+    #[test]
+    fn a_flush_waits_for_the_streams_handed_over() {
+        let recording = Arc::new(Recording::new(0));
+        held(&recording.inner).handed = 2;
+        let r = recording.clone();
+        let translator = std::thread::spawn(move || {
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                held(&r.inner).translated += 1;
+                r.moved.notify_all();
+            }
+        });
+        recording.flush_to(2);
+        assert!(held(&recording.inner).translated >= 2);
+        translator.join().unwrap();
     }
 
     /// Arguments come out of a stream as they went in.

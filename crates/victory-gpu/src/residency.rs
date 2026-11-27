@@ -146,6 +146,7 @@ pub(crate) fn refresh() {
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+                by_address_card_mib = crate::shadow::by_address_card_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,

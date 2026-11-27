@@ -228,6 +228,17 @@ pub(crate) fn ram_pressure() -> bool {
     limit > 0 && commit_headroom().is_some_and(|h| h < limit)
 }
 
+/// How short of memory the PC is: 0 not ([`ram_pressure`] is false), 1 with
+/// the commit headroom under [`ram_trim_bytes`], 2 under half of it.
+pub(crate) fn ram_pressure_level() -> u8 {
+    let limit = ram_trim_bytes();
+    match commit_headroom() {
+        Some(h) if limit > 0 && h < limit / 2 => 2,
+        Some(h) if limit > 0 && h < limit => 1,
+        _ => 0,
+    }
+}
+
 /// At the sweep, with `pressed` ([`ram_pressure`]) and the idle host lists
 /// it let go: under pressure the pooled snapshot buffers
 /// (`crate::shadow::drain_pool`) and the spare scratch chunks
@@ -245,6 +256,10 @@ fn press(pressed: bool, lists: usize) {
     }
     let (snaps, snap_bytes) = crate::shadow::drain_pool();
     let (chunks, chunk_bytes) = drain_spare_chunks();
+    let (sends, send_bytes) = send::trim_spare();
+    if sends > 0 {
+        trail(|| format!("memory pressure: {sends} send buffers ({} MiB) let go", send_bytes >> 20));
+    }
     if !was {
         tracing::info!(
             "memory pressure: {headroom} MiB of commit headroom, under {} MiB (VICTORY_RAM_TRIM_MB): let go of {snaps} \
@@ -1570,6 +1585,9 @@ pub(crate) struct HostList {
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
+    /// The views of twins its depth-plane passes read, its own until it
+    /// forgets its recording ([`PlaneSlots`]).
+    plane_slots: Mutex<PlaneSlots>,
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
@@ -1782,10 +1800,47 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
+/// Views of twins the pass reads, in a heap of ours used as a ring, for a
+/// list that found none of [`PLANE_OWNED`] free.
 /// shortcut: a view must last until its list has run; with one or two
 /// passes a frame the ring is far from coming round.
 const PLANE_VIEWS: u32 = 256;
+
+/// Views of twins after the ring's in the same heap, each a list's own from
+/// the pass it records to the list's reset ([`PlaneSlots`]): with many
+/// lists recorded ahead and in flight the ring could come round to a view a
+/// list that has not run yet still names (after fxceless/victory-fork
+/// PR #1377, spk-c).
+const PLANE_OWNED: u32 = 1024;
+
+/// The views of [`PLANE_OWNED`] a host list's recording took; they are free
+/// again when this goes, which is when the list forgets its recording (it
+/// has run by then) or goes itself.
+#[derive(Default)]
+struct PlaneSlots(Vec<u32>);
+
+impl Drop for PlaneSlots {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        if let Some(pass) = plane_pass() {
+            pass.free.lock().unwrap_or_else(|e| e.into_inner()).append(&mut self.0);
+        }
+    }
+}
+
+/// A view's slot for a pass recorded now: one of the free ones, noted in
+/// `mine` (the list's own), or with none free the ring's next.
+fn plane_slot(free: &Mutex<Vec<u32>>, next: &AtomicU32, mine: &mut Vec<u32>) -> u32 {
+    match free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        Some(slot) => {
+            mine.push(slot);
+            slot
+        }
+        None => next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS,
+    }
+}
 
 /// What the pass draws with: the heap of its views of twins, and per kind
 /// of twin (16-bit steps or floats) and depth format the root signature
@@ -1796,6 +1851,8 @@ struct PlanePass {
     gpu: u64,
     step: u32,
     next: AtomicU32,
+    /// The slots of [`PLANE_OWNED`] no list holds.
+    free: Mutex<Vec<u32>>,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
 }
 
@@ -1819,7 +1876,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                 .device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
+                    NumDescriptors: PLANE_VIEWS + PLANE_OWNED,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })
@@ -1830,6 +1887,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                 step: host.device.GetDescriptorHandleIncrementSize(kind),
                 views,
                 next: AtomicU32::new(0),
+                free: Mutex::new((PLANE_VIEWS..PLANE_VIEWS + PLANE_OWNED).rev().collect()),
                 made: Mutex::default(),
             })
         }
@@ -1960,11 +2018,13 @@ impl PlanePass {
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// records nothing of the title's after it. The views it makes are noted in
+/// `mine`, which lives until `list` has run.
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
+    mine: &mut Vec<u32>,
 ) {
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
@@ -1985,7 +2045,7 @@ fn record_plane_pass(
     };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+            let slot = plane_slot(&pass.free, &pass.next, mine);
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -2697,6 +2757,102 @@ struct CardRange {
     picked: bool,
 }
 
+/// One compare pass over joined pieces of one copy, in one mode.
+struct CardCompareRun {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
+    /// Its first piece's dword in the compare's results.
+    at: u32,
+    picked: bool,
+}
+
+/// The compared ranges of a submission, as passes over pieces: ranges of one
+/// copy and one mode (declared, or only looked at) whose pieces overlap or
+/// touch are one pass, and each range points at its pieces' results in it.
+/// Always (a fix, not a knob): two declared ranges of a copy that lay in one
+/// piece had a pass each, and the first, which also takes the piece's new
+/// hash as its baseline, left the second nothing to find; what the card
+/// wrote there for the second never came back. The ranges keep the bytes
+/// they declared, for what is fetched. The results start at `first`; the
+/// end of those taken is returned.
+/// (cool_fox f2dd4508 by Xyzstk, compact_card_compares.)
+fn compact_card_compares(ranges: &mut [CardRange], first: u32) -> (Vec<CardCompareRun>, u32) {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut by_copy = std::collections::HashMap::<(usize, bool), usize>::new();
+    for (i, range) in ranges.iter().enumerate().filter(|(_, r)| r.compared) {
+        let key = (std::sync::Arc::as_ptr(&range.shadow) as usize, range.picked);
+        let group = *by_copy.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(i);
+    }
+    let mut runs: Vec<CardCompareRun> = Vec::new();
+    let mut at = first;
+    for group in groups {
+        let start = runs.len();
+        for span in crate::shadow::joined_piece_runs(group.iter().map(|&i| ranges[i].span).collect()) {
+            let range = &ranges[group[0]];
+            runs.push(CardCompareRun { shadow: range.shadow.clone(), span, at, picked: range.picked });
+            at += span.pieces;
+        }
+        let joined = &runs[start..];
+        for i in group {
+            let range = &mut ranges[i];
+            let run = &joined[joined.partition_point(|run| run.span.first <= range.span.first) - 1];
+            debug_assert!(range.span.first + range.span.pieces <= run.span.first + run.span.pieces);
+            range.at = run.at + range.span.first - run.span.first;
+        }
+    }
+    (runs, at)
+}
+
+#[cfg(test)]
+mod compare_coalescing_tests {
+    use super::*;
+
+    fn shadow(start: u64) -> std::sync::Arc<crate::shadow::Shadow> {
+        crate::shadow::Shadow::unbacked(start, std::ptr::null_mut(), 4 * 65536, false)
+    }
+
+    fn range(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, picked: bool, compared: bool) -> CardRange {
+        CardRange { shadow: shadow.clone(), declared: (from, to), span: shadow.card_run(from, to), at: u32::MAX, compared, picked }
+    }
+
+    #[test]
+    fn ranges_in_one_piece_share_its_result_and_keep_their_bytes() {
+        let a = shadow(0x7a10_0000);
+        let b = shadow(0x7b10_0000);
+        let mut ranges = vec![
+            range(&a, 64, 80, false, true),
+            range(&a, 4096, 4112, false, true),
+            range(&a, 65536 + 128, 65536 + 144, false, true),
+            range(&a, 3 * 65536 + 64, 3 * 65536 + 80, false, true),
+            range(&b, 64, 80, false, true),
+            range(&a, 64, 80, true, true),
+            range(&a, 2 * 65536, 2 * 65536 + 16, false, false),
+        ];
+        let before: Vec<_> = ranges.iter().map(|r| (r.declared, r.span)).collect();
+        let (runs, end) = compact_card_compares(&mut ranges, 17);
+        assert_eq!(runs.len(), 4);
+        assert_eq!(end, 22);
+        assert_eq!(ranges[0].at, ranges[1].at);
+        assert_eq!(ranges[2].at, ranges[0].at + 1);
+        assert_ne!(ranges[4].at, ranges[0].at, "other copies keep their results");
+        assert_ne!(ranges[5].at, ranges[0].at, "what is looked at keeps its results");
+        assert_eq!(ranges[6].at, u32::MAX, "what is not compared is not given results");
+        assert_eq!(ranges.iter().map(|r| (r.declared, r.span)).collect::<Vec<_>>(), before);
+        assert!(
+            !runs
+                .iter()
+                .filter(|r| std::sync::Arc::ptr_eq(&r.shadow, &a) && !r.picked)
+                .any(|r| r.span.first <= 2 && 2 < r.span.first + r.span.pieces),
+            "no piece nothing declared is compared"
+        );
+        assert_eq!(compact_card_compares(&mut [], 29).1, 29);
+    }
+}
+
 impl CardPlan {
     /// `crate::picked` is told where what it looked at changed, by the
     /// compare's results.
@@ -3050,6 +3206,27 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
+/// Whether a fence that was to reach `sent` did: `Err` when it stands
+/// short of it or at `u64::MAX`, which is what the system sets every fence
+/// of a removed device to (and it wakes the waits on them). A fetch's
+/// buffer is then not what the card wrote and must not be merged into
+/// title memory (after Belobug PR #249, and VIctory b58b779 by way of
+/// VItoriaBr c1689786).
+fn fence_ran(completed: u64, sent: u64) -> bool {
+    completed != u64::MAX && completed >= sent
+}
+
+/// [`fence_ran`] for a relay fetch's fence, as a host error.
+#[cfg(windows)]
+fn fetch_ran(fence: &ID3D12Fence, sent: u64) -> windows::core::Result<()> {
+    // SAFETY: a plain query.
+    if fence_ran(unsafe { fence.GetCompletedValue() }, sent) {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_hresult(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED))
+    }
+}
+
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
@@ -3096,6 +3273,20 @@ fn relay_copy_runs<T>(pieces: &[(std::sync::Arc<T>, usize, usize, u64)], join: b
             let (copy, start, _, at) = &run[0];
             (copy.as_ref(), *start, run[run.len() - 1].2, *at)
         })
+}
+
+#[cfg(test)]
+mod fence_ran_tests {
+    /// The removed device's fence value is not a completion, nor is a
+    /// value short of the one sent.
+    #[test]
+    fn a_removed_device_s_fence_is_not_a_fetch_that_ran() {
+        use super::fence_ran;
+        assert!(fence_ran(5, 5));
+        assert!(fence_ran(6, 5));
+        assert!(!fence_ran(4, 5));
+        assert!(!fence_ran(u64::MAX, 5));
+    }
 }
 
 #[cfg(test)]
@@ -3182,11 +3373,63 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+///
+/// With [`settle_room`] the number is doubled.
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        let most: usize =
+            std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1);
+        if settle_room() { most.saturating_mul(2) } else { most }
     })
+}
+
+/// More room before the flights are settled (`VICTORY_SETTLE_ROOM=1`; off
+/// by default): twice the host lists in the air ([`late_most`]) and eight
+/// times the changed runs of title bytes put in under the flights' writes
+/// ([`merge_runs`]), each of which is otherwise a settle: a wait for the
+/// card on the submitting thread. The lists in the air hold their dynamic
+/// descriptor slots, upload memory and scratch chunks that much longer
+/// (watch "tables asked, N refused"). fxceless/victory-fork 06702fe8
+/// measured the submitting thread's waits from 17.7 to 4.6 ms a frame.
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v != "0"))
+}
+
+/// The most changed runs of title bytes one submission puts in under the
+/// flights' writes ([`stale_under_flights`]) before it settles instead:
+/// `VICTORY_MERGE_RUNS=<n>` (unset: 512, and 4096 with [`card_steps`]),
+/// times eight with [`settle_room`] (fxceless/victory-fork 06702fe8).
+fn merge_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        let set = std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        merge_runs_for(set, card_steps::stage() > 0, settle_room())
+    })
+}
+
+/// [`merge_runs`] for a value set, with [`card_steps`] or not, with
+/// [`settle_room`] or not.
+fn merge_runs_for(set: Option<usize>, card_steps: bool, room: bool) -> usize {
+    let runs = set.filter(|n| *n > 0).unwrap_or(if card_steps { 4096 } else { 512 });
+    if room { runs.saturating_mul(8) } else { runs }
+}
+
+#[cfg(test)]
+mod merge_runs_tests {
+    /// Unset: the numbers there were; a value set replaces them; the room
+    /// is eight times either.
+    #[test]
+    fn the_runs_put_in_under_flights_are_as_before_unless_asked() {
+        use super::merge_runs_for;
+        assert_eq!(merge_runs_for(None, false, false), 512);
+        assert_eq!(merge_runs_for(None, true, false), 4096);
+        assert_eq!(merge_runs_for(Some(0), true, false), 4096);
+        assert_eq!(merge_runs_for(Some(2000), true, false), 2000);
+        assert_eq!(merge_runs_for(None, true, true), 32768);
+        assert_eq!(merge_runs_for(Some(100), false, true), 800);
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3701,7 +3944,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
@@ -4819,6 +5062,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
+                plane_slots: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 stale: std::sync::atomic::AtomicBool::new(false),
@@ -5197,8 +5441,9 @@ impl Host {
                 at += span.pieces;
             }
         }
+        let (compare_runs, at) = compact_card_compares(&mut plan.ranges, work.taken);
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !compare_runs.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -5223,7 +5468,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in &compare_runs {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -5493,6 +5738,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    fetch_ran(&fence, sent)?;
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -5508,6 +5754,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                fetch_ran(&fence, sent)?;
                 Ok(after)
             })()
         };
@@ -5672,7 +5919,9 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
-                    landed.push((flight.lists, flight.order));
+                    let mut flight_lists = flight.lists;
+                    flight_lists.iter_mut().for_each(crate::list::Detached::release_tables);
+                    landed.push((flight_lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -6153,7 +6402,9 @@ impl Host {
                         if let Some(dxr) = flight.dxr {
                             crate::dxr::finish_submission(dxr);
                         }
-                        landed.push((flight.lists, flight.order));
+                        let mut flight_lists = flight.lists;
+                        flight_lists.iter_mut().for_each(crate::list::Detached::release_tables);
+                        landed.push((flight_lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
@@ -7257,6 +7508,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Every submission of the list has run: its passes' views are free.
+        drop(std::mem::take(&mut *self.plane_slots.lock().unwrap_or_else(|e| e.into_inner())));
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7445,7 +7698,9 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        let mut mine = self.plane_slots.lock().unwrap_or_else(|e| e.into_inner());
+        record_plane_pass(&self.list, &depth.texture, &plane.texture, &mut mine.0);
+        drop(mine);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -8826,6 +9081,81 @@ struct Batch {
     front: bool,
     /// The most entries `index` held ([`MapHint`]).
     most: usize,
+    /// With [`refresh_spans_kept`]: per copy (by address) whose refreshes
+    /// lie apart, the disjoint spans in it, sorted; its entry in
+    /// `refreshes` holds their union's bounds.
+    spans: ByCopy<Vec<(usize, usize)>>,
+}
+
+/// Whether a submission's refreshes of one copy are kept as up to
+/// [`SPANS_MOST`] disjoint spans (`VICTORY_REFRESH_SPANS=1`; off by
+/// default) instead of one from the lowest to the highest: two far ranges
+/// of the heap's buffer asked for and walked everything between them.
+/// Each refresh still brings the bytes it names up to date; only what lies
+/// between the ranges, which no step of the submission asked for, is left
+/// out. Refreshes in front of the steps (`refresh_front`, the copies
+/// shaders write) are not changed by it. (After DexNom PR #20, Batushn.)
+fn refresh_spans_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_SPANS"))
+}
+
+/// The most disjoint spans kept per copy ([`refresh_spans_kept`]).
+const SPANS_MOST: usize = 64;
+
+/// Ranges closer than this are kept as one span ([`add_span`]).
+const SPANS_GAP: usize = 64 << 10;
+
+/// Puts `[from, to)` into `spans` (sorted, disjoint, never nearer than
+/// [`SPANS_GAP`] to each other): joined with those it overlaps or nears,
+/// and with more than [`SPANS_MOST`] the two nearest joined.
+fn add_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let (mut from, mut to) = (from, to);
+    // The first span that ends at or after `from - gap`.
+    let first = spans.partition_point(|&(_, e)| e.saturating_add(SPANS_GAP) < from);
+    let mut last = first;
+    while last < spans.len() && spans[last].0 <= to.saturating_add(SPANS_GAP) {
+        from = from.min(spans[last].0);
+        to = to.max(spans[last].1);
+        last += 1;
+    }
+    spans.splice(first..last, [(from, to)]);
+    if spans.len() > SPANS_MOST {
+        let i = (1..spans.len()).min_by_key(|&i| spans[i].0 - spans[i - 1].1).unwrap_or(1);
+        spans[i - 1].1 = spans[i].1;
+        spans.remove(i);
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{SPANS_GAP, SPANS_MOST, add_span};
+
+    /// Far ranges stay apart, near and overlapping ones join, and past the
+    /// most the nearest two join; the spans stay sorted and disjoint and
+    /// cover every range put in.
+    #[test]
+    fn far_refreshes_of_a_copy_stay_apart() {
+        let mut s = Vec::new();
+        add_span(&mut s, 0, 16);
+        add_span(&mut s, 100 << 20, (100 << 20) + 16);
+        assert_eq!(s, [(0, 16), (100 << 20, (100 << 20) + 16)], "nothing between is asked for");
+        add_span(&mut s, 8, 32);
+        add_span(&mut s, 32 + SPANS_GAP - 1, 40 + SPANS_GAP);
+        assert_eq!(s[0], (0, 40 + SPANS_GAP), "near ones join");
+        add_span(&mut s, 10, 100 << 20);
+        assert_eq!(s, [(0, (100 << 20) + 16)], "one over both joins them");
+        let mut s = Vec::new();
+        for i in (0..=SPANS_MOST).rev() {
+            add_span(&mut s, i << 24, (i << 24) + 1);
+        }
+        add_span(&mut s, (3 << 24) + 2, (3 << 24) + 3);
+        assert_eq!(s.len(), SPANS_MOST);
+        assert!(s.windows(2).all(|w| w[0].1 < w[1].0));
+        for i in 0..=SPANS_MOST {
+            assert!(s.iter().any(|&(a, e)| a <= i << 24 && (i << 24) + 1 <= e), "{i} is still covered");
+        }
+    }
 }
 
 /// [`MapHint`] of [`Batch`]'s `index`.
@@ -9248,6 +9578,12 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
+                if refresh_spans_kept()
+                    && (self.spans.contains_key(&key) || end.saturating_add(SPANS_GAP) < r.1 || r.2.saturating_add(SPANS_GAP) < address)
+                {
+                    let spans = self.spans.entry(key).or_insert_with(|| vec![(r.1, r.2)]);
+                    add_span(spans, address, end);
+                }
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
@@ -9269,6 +9605,7 @@ impl Batch {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let spans = self.spans.remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
@@ -9276,7 +9613,7 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         if !(crate::watch::light() && known_nothing(&shadow, from, to)) {
-            Self::update(&shadow, from, to);
+            Self::update_spans(&shadow, from, to, spans.as_deref());
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9284,6 +9621,19 @@ impl Batch {
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
             SPLIT[10].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Batch::update`] of each of `spans` if given (the refreshes of
+    /// the copy that lie apart, [`refresh_spans_kept`]), else of `[from, to)`.
+    fn update_spans(shadow: &crate::shadow::Shadow, from: usize, to: usize, spans: Option<&[(usize, usize)]>) {
+        match spans {
+            Some(spans) => {
+                for &(a, e) in spans {
+                    Self::update(shadow, a, e);
+                }
+            }
+            None => Self::update(shadow, from, to),
         }
     }
 
@@ -9620,6 +9970,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
+        let spans = std::mem::take(&mut self.spans);
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
@@ -9627,7 +9978,10 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| match spans.get(&(std::sync::Arc::as_ptr(&r.0) as usize)) {
+                    Some(apart) => apart.clone(),
+                    None => vec![(r.1, r.2)],
+                })
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -9655,13 +10009,16 @@ impl Batch {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    Self::update_spans(shadow, *from, *to, spans.get(&(std::sync::Arc::as_ptr(shadow) as usize)).map(Vec::as_slice));
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
                     .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|(shadow, from, to)| {
+                        let apart = spans.get(&(std::sync::Arc::as_ptr(&shadow) as usize)).cloned();
+                        Box::new(move || Self::update_spans(&shadow, from, to, apart.as_deref())) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
@@ -9671,7 +10028,7 @@ impl Batch {
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+                Self::update_spans(&shadow, from, to, spans.get(&(std::sync::Arc::as_ptr(&shadow) as usize)).map(Vec::as_slice));
             }
         }
         if ahead {
@@ -11316,6 +11673,38 @@ pub(crate) fn list_buffers_let_go() {
     };
     for buffer in kept {
         retire_resource(buffer);
+    }
+}
+
+#[cfg(test)]
+mod plane_slot_tests {
+    use super::{PLANE_VIEWS, plane_slot};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    /// A pass's view is a free slot, kept by its list; no two passes share
+    /// one while both hold theirs, however many there are; with none free
+    /// the ring's slots serve, none of them a list's own.
+    #[test]
+    fn a_depth_plane_pass_takes_a_view_of_its_own_while_one_is_free() {
+        let free = Mutex::new((PLANE_VIEWS..PLANE_VIEWS + 3).rev().collect::<Vec<u32>>());
+        let next = AtomicU32::new(0);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let first = plane_slot(&free, &next, &mut a);
+        let second = plane_slot(&free, &next, &mut b);
+        let third = plane_slot(&free, &next, &mut a);
+        assert_eq!((first, second, third), (PLANE_VIEWS, PLANE_VIEWS + 1, PLANE_VIEWS + 2));
+        assert_eq!((a.clone(), b.clone()), (vec![first, third], vec![second]));
+        // None free: the ring, and nothing noted.
+        for i in 0..PLANE_VIEWS + 2 {
+            let slot = plane_slot(&free, &next, &mut b);
+            assert_eq!(slot, i % PLANE_VIEWS);
+        }
+        assert_eq!(b, vec![second]);
+        // A list that ran gives its own back; the next pass takes one.
+        free.lock().unwrap().append(&mut a);
+        let again = plane_slot(&free, &next, &mut b);
+        assert!(again == first || again == third);
     }
 }
 
