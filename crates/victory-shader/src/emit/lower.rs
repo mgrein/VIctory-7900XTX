@@ -4312,14 +4312,17 @@ impl<'a> Lower<'a> {
         // The builder's threads read what others of the dispatch wrote (a
         // refit climbs from children to parents): globally coherent. With
         // `VICTORY_BVH_COHERENT=glc` only the accesses that say so
-        // ([`super::builder_coherent_glc`]).
-        let coherent = if crate::spill::is_spilled(self.x.native)
-            && (coherent || !super::builder_coherent_glc() || self.invalidates_caches())
-        {
-            0x4000
+        // ([`super::builder_coherent_glc`]). Another compute program's
+        // accesses that say so, with `VICTORY_COMPUTE_WINDOW_COHERENCE=1`
+        // ([`super::compute_window_coherence`]).
+        let coherent = if crate::spill::is_spilled(self.x.native) {
+            coherent || !super::builder_coherent_glc() || self.invalidates_caches()
         } else {
-            0
+            self.x.native.stage == HwStage::Cs
+                && super::compute_window_coherence()
+                && (coherent || self.invalidates_caches())
         };
+        let coherent = if coherent { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
@@ -14806,6 +14809,54 @@ mod tests {
             .map(|p| p.0)
             .filter(|p| p & 0xFF == 11 && p & 0x1000 != 0)
             .collect()
+    }
+
+    /// The properties of the heap handles of title memory by address that a
+    /// compute program without a spilled table makes for a plain global
+    /// load, a global load with `glc` and a global store, with
+    /// `VICTORY_COMPUTE_WINDOW_COHERENCE=1` or without; with `invalidate`,
+    /// the program invalidates the console's caches first.
+    fn window_memory_handles(on: bool, invalidate: bool) -> Vec<u32> {
+        use super::super::{TEST_WINDOW_COHERENCE, shader::HEAP_HANDLES};
+        let mut words = vec![
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0xDC30_8000,    // global_load_dword v3, v[0:1], off
+            0x037D_0000,
+            0xDC31_8000, // global_load_dword v4, v[0:1], off glc
+            0x047D_0000,
+            0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+            0xDC70_8000, // global_store_dword v[0:1], v3, off
+            0x007D_0300,
+            S_ENDPGM,
+        ];
+        if invalidate {
+            words.splice(0..0, [0xE1C4_0000, 0]); // buffer_gl0_inv
+        }
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        TEST_WINDOW_COHERENCE.set(Some(on));
+        HEAP_HANDLES.with(|made| made.borrow_mut().clear());
+        let lowered = lower_with(&words, layout, vec![]);
+        TEST_WINDOW_COHERENCE.set(None);
+        lowered.expect("lowers");
+        HEAP_HANDLES
+            .with(|made| made.take())
+            .into_iter()
+            .map(|p| p.0)
+            .filter(|p| p & 0xFF == 11 && p & 0x1000 != 0)
+            .collect()
+    }
+
+    /// A compute program's accesses by address: plain views as before, or
+    /// with `VICTORY_COMPUTE_WINDOW_COHERENCE=1` globally coherent views for
+    /// the load with `glc` and the store (every access in a program that
+    /// invalidates the console's caches itself). From
+    /// stellarr-studio/kelvaroq patch 0049.
+    #[test]
+    fn compute_window_coherence_marks_only_accesses_other_groups_see() {
+        assert_eq!(window_memory_handles(false, false), [0x1000 | 11; 3]);
+        assert_eq!(window_memory_handles(false, true), [0x1000 | 11; 3]);
+        assert_eq!(window_memory_handles(true, false), [0x1000 | 11, 0x5000 | 11, 0x5000 | 11]);
+        assert_eq!(window_memory_handles(true, true), [0x5000 | 11; 3]);
     }
 
     /// The builder's loads by address through globally coherent views: all

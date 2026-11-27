@@ -202,6 +202,7 @@ const SET_ONLY: &[&str] = &[
     "VICTORY_RESINFO_SHAPE",
     "VICTORY_RESINFO_MSAA",
     "VICTORY_RESINFO_D16",
+    "VICTORY_COMPUTE_WINDOW_COHERENCE",
 ];
 
 /// What tells one set of translations from another ([`build`]).
