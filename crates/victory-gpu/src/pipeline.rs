@@ -275,7 +275,10 @@ struct Builder {
     pipelines: Vec<std::sync::Weak<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    /// One could not be made, of so many (0: none).
+    /// One could not be made, of so many (0: none): the builder is off while
+    /// this is the number of `pipelines`, and looked at again once the title
+    /// creates another. `usize::MAX`: it was off, and a stage was created
+    /// since (see [`off_after_prune`]).
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
@@ -286,14 +289,29 @@ impl Builder {
     /// Lets go of the stages the title released. A builder kept off stays
     /// off for what is left, as it would until the title creates another.
     fn prune(&mut self) {
-        if live_only(&mut self.pipelines) && self.off != 0 {
-            self.off = self.pipelines.len();
-        }
+        let before = self.pipelines.len();
+        live_only(&mut self.pipelines);
+        self.off = off_after_prune(self.off, before, self.pipelines.len());
     }
 
     /// The stages the title still holds.
     fn live(&self) -> Vec<Arc<make::Pending>> {
         self.pipelines.iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+}
+
+/// What [`Builder::off`] becomes when its group goes from `before` stages to
+/// `after`. A builder that is off stays off; one that is to be looked at
+/// again (a stage was created since it went off) still is, whatever the
+/// count is now, so a stage released meanwhile does not keep it off.
+#[cfg(windows)]
+fn off_after_prune(off: usize, before: usize, after: usize) -> usize {
+    if after == before || off == 0 {
+        off
+    } else if off == before {
+        after
+    } else {
+        usize::MAX
     }
 }
 
@@ -898,6 +916,28 @@ mod tests {
         drop(kept);
         assert!(super::live_only(&mut list));
         assert!(list.is_empty());
+    }
+
+    /// A builder that is off stays off as stages go; one a new stage is to
+    /// have looked at again still is.
+    #[cfg(windows)]
+    #[test]
+    fn released_builder_stages_keep_what_the_builder_waits_for() {
+        use super::off_after_prune as after;
+        // Nothing released, or never off: unchanged.
+        assert_eq!(after(3, 4, 4), 3);
+        assert_eq!(after(0, 4, 2), 0);
+        // Off (of 4): stays off for the 2 left.
+        assert_eq!(after(4, 4, 2), 2);
+        assert_eq!(after(4, 4, 0), 0);
+        // Off at 3, a fourth created since, two released: looked at again,
+        // not off because 2 left happened to look like the old count.
+        let off = after(3, 4, 2);
+        assert_ne!(off, 2);
+        assert_ne!(off, 0);
+        assert_ne!(off, 3);
+        let off = after(2, 4, 2);
+        assert_ne!(off, 2);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
