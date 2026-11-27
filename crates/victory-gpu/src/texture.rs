@@ -167,7 +167,7 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// with what the host wrote to `source`: the texels of every level and
 /// layer are copied as they are, through a buffer (the host copies between
 /// two formats of one texel width in no other way). Recorded the first time
-/// the list reads the view
+/// the list reads the view from that source
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
@@ -271,7 +271,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // The view's first use in the list does not say the copy is owed: an
+    // upload of the same view from title memory earlier in the list has
+    // used it, and the shader then read those bytes, not what the card
+    // wrote (a lighting buffer read as 0). Owed is what the list has not
+    // copied from this source yet. (After fxceless 19a45d19 / PR #1241,
+    // kesku, and Belobug PR #231, pokces.)
+    list.first_use(placed as usize);
+    let first = list.alias_source_changed(placed as usize, source as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
