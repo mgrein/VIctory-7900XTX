@@ -2749,6 +2749,102 @@ struct CardRange {
     picked: bool,
 }
 
+/// One compare pass over joined pieces of one copy, in one mode.
+struct CardCompareRun {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    span: crate::shadow::CardSpan,
+    /// Its first piece's dword in the compare's results.
+    at: u32,
+    picked: bool,
+}
+
+/// The compared ranges of a submission, as passes over pieces: ranges of one
+/// copy and one mode (declared, or only looked at) whose pieces overlap or
+/// touch are one pass, and each range points at its pieces' results in it.
+/// Always (a fix, not a knob): two declared ranges of a copy that lay in one
+/// piece had a pass each, and the first, which also takes the piece's new
+/// hash as its baseline, left the second nothing to find; what the card
+/// wrote there for the second never came back. The ranges keep the bytes
+/// they declared, for what is fetched. The results start at `first`; the
+/// end of those taken is returned.
+/// (cool_fox f2dd4508 by Xyzstk, compact_card_compares.)
+fn compact_card_compares(ranges: &mut [CardRange], first: u32) -> (Vec<CardCompareRun>, u32) {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut by_copy = std::collections::HashMap::<(usize, bool), usize>::new();
+    for (i, range) in ranges.iter().enumerate().filter(|(_, r)| r.compared) {
+        let key = (std::sync::Arc::as_ptr(&range.shadow) as usize, range.picked);
+        let group = *by_copy.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(i);
+    }
+    let mut runs: Vec<CardCompareRun> = Vec::new();
+    let mut at = first;
+    for group in groups {
+        let start = runs.len();
+        for span in crate::shadow::joined_piece_runs(group.iter().map(|&i| ranges[i].span).collect()) {
+            let range = &ranges[group[0]];
+            runs.push(CardCompareRun { shadow: range.shadow.clone(), span, at, picked: range.picked });
+            at += span.pieces;
+        }
+        let joined = &runs[start..];
+        for i in group {
+            let range = &mut ranges[i];
+            let run = &joined[joined.partition_point(|run| run.span.first <= range.span.first) - 1];
+            debug_assert!(range.span.first + range.span.pieces <= run.span.first + run.span.pieces);
+            range.at = run.at + range.span.first - run.span.first;
+        }
+    }
+    (runs, at)
+}
+
+#[cfg(test)]
+mod compare_coalescing_tests {
+    use super::*;
+
+    fn shadow(start: u64) -> std::sync::Arc<crate::shadow::Shadow> {
+        crate::shadow::Shadow::unbacked(start, std::ptr::null_mut(), 4 * 65536, false)
+    }
+
+    fn range(shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize, picked: bool, compared: bool) -> CardRange {
+        CardRange { shadow: shadow.clone(), declared: (from, to), span: shadow.card_run(from, to), at: u32::MAX, compared, picked }
+    }
+
+    #[test]
+    fn ranges_in_one_piece_share_its_result_and_keep_their_bytes() {
+        let a = shadow(0x7a10_0000);
+        let b = shadow(0x7b10_0000);
+        let mut ranges = vec![
+            range(&a, 64, 80, false, true),
+            range(&a, 4096, 4112, false, true),
+            range(&a, 65536 + 128, 65536 + 144, false, true),
+            range(&a, 3 * 65536 + 64, 3 * 65536 + 80, false, true),
+            range(&b, 64, 80, false, true),
+            range(&a, 64, 80, true, true),
+            range(&a, 2 * 65536, 2 * 65536 + 16, false, false),
+        ];
+        let before: Vec<_> = ranges.iter().map(|r| (r.declared, r.span)).collect();
+        let (runs, end) = compact_card_compares(&mut ranges, 17);
+        assert_eq!(runs.len(), 4);
+        assert_eq!(end, 22);
+        assert_eq!(ranges[0].at, ranges[1].at);
+        assert_eq!(ranges[2].at, ranges[0].at + 1);
+        assert_ne!(ranges[4].at, ranges[0].at, "other copies keep their results");
+        assert_ne!(ranges[5].at, ranges[0].at, "what is looked at keeps its results");
+        assert_eq!(ranges[6].at, u32::MAX, "what is not compared is not given results");
+        assert_eq!(ranges.iter().map(|r| (r.declared, r.span)).collect::<Vec<_>>(), before);
+        assert!(
+            !runs
+                .iter()
+                .filter(|r| std::sync::Arc::ptr_eq(&r.shadow, &a) && !r.picked)
+                .any(|r| r.span.first <= 2 && 2 < r.span.first + r.span.pieces),
+            "no piece nothing declared is compared"
+        );
+        assert_eq!(compact_card_compares(&mut [], 29).1, 29);
+    }
+}
+
 impl CardPlan {
     /// `crate::picked` is told where what it looked at changed, by the
     /// compare's results.
@@ -5270,8 +5366,9 @@ impl Host {
                 at += span.pieces;
             }
         }
+        let (compare_runs, at) = compact_card_compares(&mut plan.ranges, work.taken);
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if !compare_runs.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -5296,7 +5393,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in &compare_runs {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
