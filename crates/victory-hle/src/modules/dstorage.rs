@@ -1544,11 +1544,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    // Decoded before (`VICTORY_DSTORAGE_CACHE`): the bytes are read back.
+    let key = decoded_cache::dir().map(|_| decoded_cache::key(request, &source));
+    if let Some(key) = &key
+        && let Some(bytes) = decoded_cache::get(key, size)
+    {
+        return into_destination(request, size, |out| {
+            out[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        })
+        .map_err(|hr| fail(hr, "copying a decoded request from the cache"));
+    }
+    into_destination(request, size, |out| {
+        let n = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))?,
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?,
+        };
+        if let Some(key) = &key {
+            decoded_cache::put(key, &out[..n]);
+        }
+        Ok(n)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1557,6 +1574,168 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// `VICTORY_DSTORAGE_CACHE=<dir>` (off without it): compressed requests
+/// (zlib, BCPack or both) decoded once are kept in that folder and read back
+/// the next time the same compressed bytes come with the same options and
+/// sizes, instead of being inflated and BCPack-decoded again on the CPU the
+/// title shares. The key is two 64-bit SipHashes of the compressed bytes
+/// (with different salts) plus their length, the options and the
+/// destination and intermediate sizes, so a file changed on disk is simply
+/// another key. `VICTORY_DSTORAGE_CACHE_MB` caps the folder (default 4096):
+/// past it the oldest files go. (An idea of XCL PR #2864; our own code.)
+mod decoded_cache {
+    use super::Request;
+    use std::hash::Hasher;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) fn dir() -> Option<&'static Path> {
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = PathBuf::from(std::env::var_os("VICTORY_DSTORAGE_CACHE").filter(|v| !v.is_empty())?);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!(dir = %dir.display(), mb = cap() >> 20, "dstorage: decoded requests are cached on disk");
+                    Some(dir)
+                }
+                Err(error) => {
+                    tracing::warn!(dir = %dir.display(), %error, "dstorage: VICTORY_DSTORAGE_CACHE cannot be made; not cached");
+                    None
+                }
+            }
+        })
+        .as_deref()
+    }
+
+    fn cap() -> u64 {
+        static CAP: OnceLock<u64> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_CACHE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096).max(16) << 20
+        })
+    }
+
+    /// The file name for a request whose compressed bytes are `source`.
+    pub(super) fn key(request: &Request, source: &[u8]) -> String {
+        let hash = |salt: u64| {
+            let mut h = std::hash::DefaultHasher::new();
+            h.write_u64(salt);
+            h.write(source);
+            h.finish()
+        };
+        format!(
+            "{:016x}{:016x}-{:x}-{:x}-{:x}-{:x}.bin",
+            hash(0x5eed_0001),
+            hash(0x5eed_0002),
+            source.len(),
+            request.options,
+            request.destination_size,
+            request.intermediate_size
+        )
+    }
+
+    /// Hits and misses since the start, for the log.
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The decoded bytes kept for `key`, if any and no longer than `size`.
+    pub(super) fn get(key: &str, size: usize) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(dir()?.join(key)).ok().filter(|b| b.len() <= size);
+        let n = if bytes.is_some() { HITS.fetch_add(1, Relaxed) + 1 } else { MISSES.fetch_add(1, Relaxed) + 1 };
+        if n.is_power_of_two() && n >= 64 {
+            tracing::info!(hits = HITS.load(Relaxed), misses = MISSES.load(Relaxed), "dstorage: decoded request cache");
+        }
+        bytes
+    }
+
+    /// Bytes in the folder, counted at the first write; then what we add.
+    static USED: OnceLock<AtomicU64> = OnceLock::new();
+
+    /// Keeps `bytes` for `key`: written aside and renamed, so a reader sees
+    /// all of it or nothing.
+    pub(super) fn put(key: &str, bytes: &[u8]) {
+        let Some(dir) = dir() else { return };
+        let used = USED.get_or_init(|| AtomicU64::new(files(dir).iter().map(|f| f.1).sum()));
+        let path = dir.join(key);
+        let aside = dir.join(format!("{key}.{}.{:?}.part", std::process::id(), std::thread::current().id()));
+        if std::fs::write(&aside, bytes).is_err() || std::fs::rename(&aside, &path).is_err() {
+            let _ = std::fs::remove_file(&aside);
+            return;
+        }
+        if used.fetch_add(bytes.len() as u64, Relaxed) + bytes.len() as u64 > cap() {
+            trim(dir, used, cap());
+        }
+    }
+
+    /// The cached files: path, bytes, last written.
+    fn files(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+        entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((e.path(), m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)))
+            })
+            .collect()
+    }
+
+    /// Removes the oldest files until the folder is at three quarters of
+    /// `cap`. One thread at a time; the others go on.
+    fn trim(dir: &Path, used: &AtomicU64, cap: u64) {
+        static TRIMMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let Ok(_one) = TRIMMING.try_lock() else { return };
+        let mut all = files(dir);
+        all.sort_unstable_by_key(|f| f.2);
+        let mut total: u64 = all.iter().map(|f| f.1).sum();
+        for (path, len, _) in &all {
+            if total <= cap / 4 * 3 {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total -= len;
+            }
+        }
+        used.store(total, Relaxed);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn keys_follow_every_input_and_files_trim_oldest_first() {
+            // SAFETY: a zeroed request is plain data (null pointers, zeros).
+            let mut request: Request = unsafe { std::mem::zeroed() };
+            request.options = 1;
+            request.destination_size = 100;
+            let a = key(&request, b"compressed");
+            assert_eq!(a, key(&request, b"compressed"));
+            assert_ne!(a, key(&request, b"compresseD"));
+            request.destination_size = 101;
+            assert_ne!(a, key(&request, b"compressed"));
+            request.destination_size = 100;
+            request.options = 3;
+            assert_ne!(a, key(&request, b"compressed"));
+            let dir = tempfile::tempdir().unwrap();
+            for (i, name) in ["a.bin", "b.bin", "c.bin", "d.bin"].into_iter().enumerate() {
+                let path = dir.path().join(name);
+                std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+                let t = std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i as u64 * 10);
+                std::fs::File::options().write(true).open(&path).unwrap().set_modified(t).unwrap();
+            }
+            assert_eq!(files(dir.path()).len(), 4);
+            let used = AtomicU64::new(4 << 20);
+            // A cap of 3 MiB: down to 2.25 MiB, the two oldest gone.
+            trim(dir.path(), &used, 3 << 20);
+            assert_eq!(used.load(Relaxed), 2 << 20);
+            let mut left: Vec<_> = files(dir.path()).into_iter().map(|f| f.0.file_name().unwrap().to_owned()).collect();
+            left.sort();
+            assert_eq!(left, ["c.bin", "d.bin"]);
+        }
+    }
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
