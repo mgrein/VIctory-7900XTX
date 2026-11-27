@@ -93,6 +93,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod memstat;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;

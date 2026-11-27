@@ -91,6 +91,12 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
     RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Objects in [`RETIRED`] now, for the memory summary line
+/// (`crate::memstat`): each part's lock held for a length only.
+pub(crate) fn retired_waiting() -> usize {
+    RETIRED.iter().map(|part| part.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -10762,6 +10768,7 @@ impl Host {
                 p.panel.frame(p.meter.line_due());
             }
             let presented = p.meter.record_present(p.hwnd, status);
+            crate::memstat::presented(self);
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
