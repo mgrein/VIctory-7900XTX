@@ -124,9 +124,112 @@ impl Target {
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 }
 
+/// Megabytes of read-back buffers kept idle for the next list that copies a
+/// texture back (`VICTORY_READBACK_POOL_MB`, default 64; 0: none are kept,
+/// every record makes a committed buffer of its own and frees it, as
+/// before: 14,200 allocations in about a minute were measured).
+///
+/// A buffer comes back only once every submission that was running or
+/// queued when its list was reset has finished (`crate::host::retire`), so
+/// the card is never still writing one that another list is given, and a
+/// list is given only a buffer of exactly the bytes it asked for: what the
+/// card writes and what [`land`] reads are the same with and without the
+/// pool. (After cool_fox PR #27, rafaconvaitis, and fxceless PR #1359;
+/// written anew for our tree.)
+fn pool_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_READBACK_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(64)
+            << 20
+    })
+}
+
+/// Idle things by their size in bytes, at most `limit` bytes of them.
+struct Idle<T> {
+    by_size: std::collections::HashMap<u64, Vec<T>>,
+    bytes: u64,
+}
+
+impl<T> Idle<T> {
+    fn take(&mut self, size: u64) -> Option<T> {
+        let item = self.by_size.get_mut(&size)?.pop()?;
+        self.bytes -= size;
+        Some(item)
+    }
+
+    /// Keeps `item` if there is room under `limit`; gives it back if not.
+    fn give(&mut self, size: u64, item: T, limit: u64) -> Option<T> {
+        if self.bytes.saturating_add(size) > limit {
+            return Some(item);
+        }
+        self.by_size.entry(size).or_default().push(item);
+        self.bytes += size;
+        None
+    }
+}
+
+/// An idle read-back buffer.
+struct Buffer(ID3D12Resource);
+// SAFETY: a D3D12 resource (free-threaded), handed from the thread that
+// drops it to the one that takes it.
+unsafe impl Send for Buffer {}
+
+static IDLE: Mutex<Option<Idle<Buffer>>> = Mutex::new(None);
+
+/// Read-back buffers made, taken from the pool, and dropped because the
+/// pool was full, since the start.
+pub(crate) static POOL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A read-back buffer of `size` bytes: an idle one of that size, or new.
+fn buffer(host: &crate::host::Host, size: u64) -> Option<ID3D12Resource> {
+    if pool_bytes() != 0 {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|idle| idle.take(size));
+        if let Some(buffer) = idle {
+            POOL[1].fetch_add(1, Ordering::Relaxed);
+            return Some(buffer.0);
+        }
+    }
+    POOL[0].fetch_add(1, Ordering::Relaxed);
+    host.read_back_buffer(size)
+}
+
+/// A read-back buffer on its way back to the pool: retired with the list
+/// that held it, it becomes idle when it is dropped, which is once no
+/// submission that could still write it runs.
+struct Returning(Option<ID3D12Resource>, u64);
+
+impl Drop for Returning {
+    fn drop(&mut self) {
+        let Some(buffer) = self.0.take() else { return };
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = idle.get_or_insert_with(|| Idle { by_size: Default::default(), bytes: 0 });
+        if let Some(over) = idle.give(self.1, Buffer(buffer), pool_bytes()) {
+            POOL[2].fetch_add(1, Ordering::Relaxed);
+            drop(over);
+        }
+    }
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        if pool_bytes() == 0 {
+            return;
+        }
+        if let Some(buffer) = self.buffer.take() {
+            crate::host::retire(Returning(Some(buffer), self.size));
+        }
+    }
+}
+
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    /// (Taken only when it is dropped: back to the pool.)
+    buffer: Option<ID3D12Resource>,
+    /// The buffer's bytes.
+    size: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -177,7 +280,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -194,7 +297,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer: Some(buffer), size: total, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -217,10 +320,11 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    let Some(buffer) = back.buffer.as_ref() else { return };
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -235,12 +339,12 @@ pub(crate) fn land(back: &Back) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { buffer.Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
@@ -252,6 +356,26 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle set gives back only a thing of exactly the size asked for,
+    /// each one once, and keeps no more bytes than its limit.
+    #[test]
+    fn idle_read_back_buffers_are_reused_by_exact_size_within_the_limit() {
+        let mut idle = Idle::<u32> { by_size: Default::default(), bytes: 0 };
+        assert_eq!(idle.take(4096), None, "nothing idle yet");
+        assert_eq!(idle.give(4096, 1, 10_000), None);
+        assert_eq!(idle.give(4096, 2, 10_000), None);
+        assert_eq!(idle.give(4096, 3, 10_000), Some(3), "over the limit: not kept");
+        assert_eq!(idle.give(1024, 4, 10_000), None, "a smaller one still fits");
+        assert_eq!(idle.bytes, 2 * 4096 + 1024);
+        assert_eq!(idle.take(2048), None, "no other size will do");
+        assert_eq!(idle.take(4096), Some(2));
+        assert_eq!(idle.take(4096), Some(1));
+        assert_eq!(idle.take(4096), None, "each one once");
+        assert_eq!(idle.take(1024), Some(4));
+        assert_eq!(idle.bytes, 0);
+        assert_eq!(idle.give(1, 5, 0), Some(5), "a limit of nothing keeps nothing");
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {
