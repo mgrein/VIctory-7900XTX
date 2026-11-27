@@ -3221,6 +3221,56 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         }
     }
 
+    /// A direct dispatch wider than 65,535 groups in x runs every group once
+    /// under its own number on a card that runs wide indirect dispatches
+    /// ([`wide_card`]): the title's direct dispatches are passed on as asked,
+    /// so no spreading of x over y or z is needed there. On an RTX 4070 this
+    /// saw 67,440, 115,200 and 2^20 groups run whole.
+    #[test]
+    fn card_runs_wide_direct_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        if !wide_card(&gpu.device) {
+            return;
+        }
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        for asked in [67_440u32, 115_200, 1 << 20] {
+            let size = 16 + (4 << 20) + 16;
+            let seen = gpu.default_uav(size);
+            let (back, back_ptr, _) = gpu.shared_buffer(size);
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                gpu.list.SetComputeRootSignature(&worker.root);
+                gpu.list.SetPipelineState(&worker.pso);
+                gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                gpu.list.Dispatch(asked, 1, 1);
+                gpu.list.ResourceBarrier(&[uav_barrier()]);
+                gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+            }
+            gpu.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+            assert_eq!([word(0), word(1), word(2)], [asked, asked - 1, asked - 1], "asked for {asked}");
+            let wrong = (0..asked as usize).find(|&g| word(4 + g) != 1);
+            assert_eq!((wrong, word(4 + asked as usize)), (None, 0), "every group once, asked for {asked}");
+        }
+    }
+
     /// The vendor of a device is its adapter's, kept per adapter: WARP is
     /// neither AMD's nor NVIDIA's however often it is asked, and the card
     /// beside it in the same process keeps its own answer.
