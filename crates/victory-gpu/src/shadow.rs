@@ -299,6 +299,14 @@ fn resolve_card_limits(
 /// budget (64 KiB / 1280 MiB on `<= 12 GiB` budgets, 4 MiB / 2048 MiB on
 /// 16 GB cards, 1 MiB / up to 8192 MiB on `>= 20 GiB` budgets:
 /// [`default_card_limits`]), and explicit env vars always override.
+/// `VICTORY_CARD_BUFFERS_MAX_MB` is another name for
+/// `VICTORY_CARD_BUFFERS_MB` (which wins when both are set).
+///
+/// `VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB=<n>` (unset: no such ceiling)
+/// keeps the copies under the card's budget less `n` MiB whatever the cap
+/// says, so that with ray tracing structures and textures on the card the
+/// copies do not push the rest into the PC's memory ([`under_headroom`];
+/// VIctory-DXR ce9c8118, 965e0927). The line says which of the two bounds.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -308,19 +316,35 @@ fn card_limits() -> (u64, u64) {
             vram_budget,
             env_num("VICTORY_CARD_BUFFERS_MIN_KB"),
             env_num("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_num("VICTORY_CARD_BUFFERS_MB"),
+            env_num("VICTORY_CARD_BUFFERS_MB").or_else(|| env_num("VICTORY_CARD_BUFFERS_MAX_MB")),
         );
         if card_all() {
             min_bytes = 0;
         }
+        let headroom_mb = env_num("VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB");
+        let cap = max_bytes;
+        let max_bytes = under_headroom(cap, vram_budget, headroom_mb);
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
+            cap_mb = cap >> 20,
+            headroom_mb,
+            bound = if max_bytes < cap { "the VRAM ceiling (budget less headroom)" } else { "the cap" },
             "card buffer limits"
         );
         (min_bytes, max_bytes)
     })
+}
+
+/// The most bytes of card copies: `cap`, or with a headroom asked and the
+/// card's budget known, what the budget less that headroom leaves if that
+/// is less ([`card_limits`]).
+fn under_headroom(cap: u64, budget: Option<u64>, headroom_mb: Option<u64>) -> u64 {
+    match (budget, headroom_mb) {
+        (Some(budget), Some(mb)) => cap.min(budget.saturating_sub(mb.saturating_mul(1 << 20))),
+        _ => cap,
+    }
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
@@ -6566,6 +6590,19 @@ mod window_tests {
         assert!(at - WINDOW > start);
         assert_eq!(placed_from(0x1000, 8 << 20), 0);
         assert_eq!(placed_from(at, 0), at);
+    }
+
+    /// The headroom is a ceiling only when asked and the budget is known;
+    /// the cap holds when it is the lower of the two.
+    #[test]
+    fn card_copies_stay_under_the_budget_less_a_headroom_asked() {
+        use super::under_headroom;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(under_headroom(1280 * MIB, Some(11264 * MIB), None), 1280 * MIB);
+        assert_eq!(under_headroom(1280 * MIB, None, Some(10240)), 1280 * MIB);
+        assert_eq!(under_headroom(1280 * MIB, Some(11264 * MIB), Some(4096)), 1280 * MIB);
+        assert_eq!(under_headroom(1280 * MIB, Some(11264 * MIB), Some(10752)), 512 * MIB);
+        assert_eq!(under_headroom(1280 * MIB, Some(11264 * MIB), Some(20000)), 0);
     }
 
     #[test]
