@@ -1051,15 +1051,31 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut bytes = 0u64;
+    let mut rows = vec![0u32; count as usize];
+    let mut total = 0u64;
     // SAFETY: outputs for `count` subresources.
     unsafe {
-        host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut total),
+        );
     }
-    if bytes == 0 || bytes == u64::MAX {
+    if total == 0 || total == u64::MAX {
         return;
     }
+    // Every copy reads the same zeros: one span as large as the largest
+    // subresource, not a buffer of the whole texture (a 2048x2048 BC7
+    // texture with all its levels: 5.3 MiB of upload memory written with
+    // zeros, 4 MiB now). (After the idea of XCL PR #2573.)
+    let Some(bytes) = zero_span(&mut footprints, &rows) else {
+        return;
+    };
     let Some((buffer, data)) = list.upload(host, bytes) else {
         return;
     };
@@ -1081,6 +1097,21 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+}
+
+/// Points every footprint at offset 0 of one shared span of zeros and
+/// returns the bytes that span needs: the largest of the subresources
+/// (`rows` rows of `RowPitch` bytes, `Depth` slices). `None` if a size
+/// does not fit.
+fn zero_span(footprints: &mut [D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) -> Option<u64> {
+    let mut bytes = 0u64;
+    for (footprint, &rows) in footprints.iter_mut().zip(rows) {
+        let f = footprint.Footprint;
+        let size = u64::from(f.RowPitch).checked_mul(u64::from(rows))?.checked_mul(u64::from(f.Depth))?;
+        bytes = bytes.max(size);
+        footprint.Offset = 0;
+    }
+    (bytes != 0).then_some(bytes)
 }
 
 /// Levels on demand (`crate::tiles`): the card itself is about to write
@@ -1986,6 +2017,27 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod zero_span_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// All footprints read from offset 0, and the span is as large as the
+    /// largest subresource, so every copy stays inside it.
+    #[test]
+    fn every_subresource_reads_from_one_span_as_large_as_the_largest() {
+        let footprint = |offset, pitch, depth| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: pitch, Depth: depth, ..Default::default() },
+        };
+        let mut footprints = [footprint(0, 1024, 1), footprint(262_144, 512, 1), footprint(327_680, 256, 4)];
+        let rows = [256, 128, 16];
+        assert_eq!(super::zero_span(&mut footprints, &rows), Some(262_144));
+        assert!(footprints.iter().all(|f| f.Offset == 0));
+        assert_eq!(super::zero_span(&mut [footprint(0, 256, 1)], &[0]), None);
+        assert_eq!(super::zero_span(&mut [footprint(0, u32::MAX, u32::MAX)], &[u32::MAX]), None);
+    }
 }
 
 #[cfg(test)]
