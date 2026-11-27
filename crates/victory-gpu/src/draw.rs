@@ -180,6 +180,60 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+/// Frames of fewer host draws than this count as a loading screen or a 2D
+/// menu for [`loading_drain`].
+const LOADING_DRAWS: u64 = 150;
+
+/// The budget of a frame's early texture pass on a loading screen
+/// ([`loading_drain`]): milliseconds and bytes. Well below the 2 s the
+/// host gives a submission before it removes the device, as the bake's
+/// 1,500 ms is.
+const LOADING_DRAIN: (u64, u64) = (400, 256 << 20);
+
+/// Whether the frame's early texture pass ([`State::early_textures`]) takes
+/// [`LOADING_DRAIN`] in place of its plain 12 ms and 64 MiB on a frame
+/// after one of fewer than [`LOADING_DRAWS`] host draws while the queue of
+/// textures picked by index had slots due at its last pass. The title fills
+/// thousands of textures while a loading screen or a menu draws a handful
+/// of things; the plain budget left them to the first world frames, which
+/// then showed blank surfaces for tens of frames. Only uploads happen
+/// earlier: what the card shows is the same. The residency limits and the
+/// card's room still apply. On by default; `VICTORY_LOADING_DRAIN=0`: the
+/// plain budget, as before.
+fn loading_drain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOADING_DRAIN").is_none_or(|v| v != "0"))
+}
+
+/// The host draws of the last frame before `frame` that drew (an average
+/// over frames that passed without a draw), counted from [`drawn`]. Only
+/// the first call in a frame moves the count.
+fn last_frame_draws(frame: u64) -> u64 {
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static AT_START: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let before = FRAME.load(Ordering::Relaxed);
+    if before != frame && FRAME.compare_exchange(before, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let now = drawn();
+        let start = AT_START.swap(now, Ordering::Relaxed);
+        if before != u64::MAX {
+            LAST.store(now.saturating_sub(start) / frame.saturating_sub(before).max(1), Ordering::Relaxed);
+        }
+    }
+    LAST.load(Ordering::Relaxed)
+}
+
+/// The budget of a frame's plain early texture pass: [`LOADING_DRAIN`]
+/// after a frame of fewer than [`LOADING_DRAWS`] draws (`u64::MAX`: none
+/// known yet) while slots were due, else `early_ms` and 64 MiB.
+fn early_pass_budget(early_ms: u64, drain: bool, last_draws: u64, due: u64) -> (u64, u64) {
+    if drain && last_draws < LOADING_DRAWS && due > 0 {
+        (LOADING_DRAIN.0.max(early_ms).min(1500), LOADING_DRAIN.1)
+    } else {
+        (early_ms, 64 << 20)
+    }
+}
+
 /// Whether a draw of the title's bake finds the textures it picks by index
 /// as title memory has them at that moment (`VICTORY_BAKE_EXACT=0`: as the
 /// pass leaves them, as before). The pass looks at a slot whose memory was
@@ -224,6 +278,10 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Since the start: early texture passes given a loading screen's budget
+/// ([`loading_drain`]).
+static LOADING_PASSES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
@@ -2194,6 +2252,8 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
+        // (Moved at every frame's first draw, whatever is done here.)
+        let last_draws = last_frame_draws(crate::frame::current());
         let bake = bake_ms > 0
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -2210,7 +2270,21 @@ impl State {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            let due = HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed);
+            let budget = early_pass_budget(early_ms, loading_drain(), last_draws, due);
+            if budget.1 != 64 << 20 {
+                let n = LOADING_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        frame,
+                        passes = n,
+                        last_frame_draws = last_draws,
+                        due_at_the_last_pass = due,
+                        "a frame of few draws: textures picked by index get a loading screen's budget (VICTORY_LOADING_DRAIN=0: not)"
+                    );
+                }
+            }
+            budget
         } else {
             return;
         };
@@ -2501,6 +2575,8 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
+        // Bytes this run has uploaded (for the gate before each texture).
+        let mut uploaded = 0u64;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -2653,6 +2729,21 @@ impl State {
             // (`VICTORY_RESIDENCY=1`: no new host texture or staging while
             // commit is short; after the unmapped slots above were let go.)
             if !crate::residency::admit_texture_pass(required) {
+                served = false;
+                break;
+            }
+            // A run with a budget of its own (early, a loading screen's or a
+            // bake's) stops before a texture whose mapped bytes would take it
+            // past its bytes, once it has uploaded something: the bytes were
+            // asked only after the upload, and one large texture more could
+            // take the run far past them (and its time with it). The first
+            // goes whatever its size, so a large texture is not left behind
+            // for good. (`VICTORY_LOADING_DRAIN=0`: asked after, as before.)
+            if loading_drain()
+                && PASS_BUDGET.get().is_some()
+                && uploaded > 0
+                && there.is_some_and(|bytes| SPENT.load(Ordering::Relaxed).saturating_add(bytes) > bytes_at_most)
+            {
                 served = false;
                 break;
             }
@@ -2835,6 +2926,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            uploaded += bytes;
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
@@ -5100,6 +5192,26 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod loading_drain_tests {
+    use super::{LOADING_DRAIN, LOADING_DRAWS, early_pass_budget};
+
+    #[test]
+    fn a_frame_of_few_draws_with_due_slots_gets_the_loading_budget() {
+        let plain = (12, 64 << 20);
+        assert_eq!(early_pass_budget(12, true, 10, 500), LOADING_DRAIN);
+        assert_eq!(early_pass_budget(12, true, LOADING_DRAWS - 1, 1), LOADING_DRAIN);
+        // A world frame, nothing due, no frame known yet, or the switch off.
+        assert_eq!(early_pass_budget(12, true, LOADING_DRAWS, 500), plain);
+        assert_eq!(early_pass_budget(12, true, 10, 0), plain);
+        assert_eq!(early_pass_budget(12, true, u64::MAX, 500), plain);
+        assert_eq!(early_pass_budget(12, false, 10, 500), plain);
+        // A longer plain budget is kept, within 1,500 ms.
+        assert_eq!(early_pass_budget(900, true, 10, 1).0, 900);
+        assert_eq!(early_pass_budget(5000, true, 10, 1).0, 1500);
     }
 }
 
