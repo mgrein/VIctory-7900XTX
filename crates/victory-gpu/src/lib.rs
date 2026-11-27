@@ -117,6 +117,14 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// NVIDIA's shader-code heap: the driver profile that sizes it (`victory nv-profile`).
+#[cfg(windows)]
+pub mod nvprofile {
+    pub use crate::host::reflex::{
+        SHADER_HEAP_DEFAULT_MB, SHADER_HEAP_MB, ShaderHeap, install_shader_heap, remove_shader_heap, shader_heap,
+    };
+}
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
