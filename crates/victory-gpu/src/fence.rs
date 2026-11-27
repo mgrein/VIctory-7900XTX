@@ -44,6 +44,60 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// A fence that a wait or signal held back for later (in a queue's line,
+/// behind flights in the air) refers to: a reference of ours, so the title
+/// releasing its last one meanwhile does not free it under us. Null stands
+/// for none (a placeholder) and holds nothing.
+pub(crate) struct FenceRef(usize);
+
+impl FenceRef {
+    /// A placeholder that refers to no fence.
+    pub(crate) const NONE: Self = Self(0);
+
+    /// Takes a reference on `this` (a fence of ours).
+    pub(crate) fn retain(this: This) -> Self {
+        if !this.is_null() {
+            object::add_ref(this);
+        }
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+impl Clone for FenceRef {
+    fn clone(&self) -> Self {
+        Self::retain(self.as_this())
+    }
+}
+
+impl PartialEq for FenceRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl std::fmt::Debug for FenceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fence {:#x}", self.0)
+    }
+}
+
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            release(self.as_this());
+        }
+    }
+}
+
+// SAFETY: a fence is ours and free-threaded (an atomic value, a locked list
+// of waiters); the reference count is atomic.
+unsafe impl Send for FenceRef {}
+unsafe impl Sync for FenceRef {}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
@@ -209,6 +263,25 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[test]
+    fn held_reference_keeps_a_released_fence() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 2, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let held = FenceRef::retain(f);
+        let copy = held.clone();
+        assert_eq!(copy, held);
+        // The title lets its own reference go: ours remain.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 2);
+        set(held.as_this(), 7);
+        assert_eq!(completed(copy.as_this()), 7);
+        drop(copy);
+        assert_eq!(completed(held.as_this()), 7);
+        // The last one, ours, frees it; a placeholder holds nothing.
+        drop(held);
+        drop(FenceRef::NONE);
+        assert!(FenceRef::NONE.as_this().is_null());
     }
 
     #[test]

@@ -3,6 +3,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::Arc;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -38,29 +40,75 @@ struct Queue {
     kind: u32,
     desc: QueueDesc,
     /// What the queue was given after a wait for a fence that had not been
-    /// reached, in order; it runs when the fence gets there.
+    /// reached, in order; it runs when the fence gets there. Shared with
+    /// [`WAITING`], so [`release_held`] can go on looking at it after the
+    /// title has released the queue.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: Arc<QueueLine>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value (a reference of
+    /// ours: the title may release its own meanwhile).
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
-/// The queues that hold something (their addresses).
+/// What a queue holds, apart from the queue: [`release_held`] works on it
+/// with no lock on [`WAITING`], so the title may release the queue
+/// meanwhile.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+#[derive(Default)]
+struct QueueLine {
+    commands: std::sync::Mutex<Vec<Held>>,
+    /// The title released the queue: what it still holds is dropped, as it
+    /// was when the queue's memory went with it.
+    retired: AtomicBool,
+}
+// SAFETY: what is held (host lists taken from the title's, D3D12 objects,
+// which are free-threaded) is touched under the lock only, by the thread
+// that submits and by whichever runs it, as when it lived in the queue.
+#[cfg(windows)]
+unsafe impl Send for QueueLine {}
+#[cfg(windows)]
+unsafe impl Sync for QueueLine {}
+
+/// The queues that hold something: their addresses (for the diagnostics
+/// only; a released queue's address may be used again) and what they hold.
+#[cfg(windows)]
+static WAITING: std::sync::Mutex<Vec<(usize, Arc<QueueLine>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Puts queue `this` among those that hold something, once.
+#[cfg(windows)]
+fn register(this: This) {
+    let line = &queue(this).held;
+    let mut waiting = lock(&WAITING);
+    if !waiting.iter().any(|(_, other)| Arc::ptr_eq(other, line)) {
+        waiting.push((this as usize, line.clone()));
+    }
+}
+
+#[cfg(windows)]
+fn unregister(line: &Arc<QueueLine>) {
+    lock(&WAITING).retain(|(_, other)| !Arc::ptr_eq(other, line));
+}
+
+#[cfg(windows)]
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.held.retired.store(true, Ordering::Release);
+        unregister(&self.held);
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,7 +182,7 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    let first = if lock(&queue(this).held.commands).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -190,16 +238,13 @@ fn submit_cut(this: This, lists: &[This]) {
             );
         }
         {
-            let mut held = lock(&queue(this).held);
+            let mut held = lock(&queue(this).held.commands);
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -216,7 +261,7 @@ fn submit_split(this: This, lists: &[This]) {
     };
     let by = crate::list::waits_by_list(lists);
     // Behind what the queue already holds, nothing runs now.
-    let cut = if lock(&queue(this).held).is_empty() {
+    let cut = if lock(&queue(this).held.commands).is_empty() {
         (0..lists.len())
             .find(|&i| by[i].iter().any(|w| !w.met()))
             .unwrap_or(lists.len())
@@ -277,11 +322,8 @@ fn submit_split(this: This, lists: &[This]) {
             pieces.push(Held::Run(taken, order));
             from = to;
         }
-        lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        lock(&queue(this).held.commands).extend(pieces);
+        register(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -295,7 +337,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     if this.is_null() {
         return false;
     }
-    let mut held = lock(&queue(this).held);
+    let mut held = lock(&queue(this).held.commands);
     if held.is_empty() {
         return false;
     }
@@ -325,15 +367,15 @@ pub(crate) fn release_held(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
-        for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
-            loop {
+        for (q, line) in queues {
+            // (The queue itself may have been released since the list was
+            // copied: only what it holds is looked at.)
+            let mut held = lock(&line.commands);
+            while !line.retired.load(Ordering::Acquire) {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
                         break;
                     }
@@ -415,15 +457,15 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.as_this(), value) {
+                            crate::fence::set(fence.as_this(), value);
                         }
                     }
                 }
                 moved = true;
             }
-            if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+            if held.is_empty() || line.retired.load(Ordering::Acquire) {
+                unregister(&line);
             }
         }
         if !moved {
@@ -555,12 +597,9 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
-    #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
-    }
-    left
+    // (A queue that holds something leaves the waiting ones when it is
+    // dropped: `Drop for Queue`.)
+    object::release_boxed::<Queue>(this)
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
@@ -597,11 +636,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
-                lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                lock(&queue(this).held.commands).extend(unmet.into_iter().map(Held::Value));
+                register(this);
             }
         }
         let kept = hold(this, || {
@@ -737,13 +773,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::retain(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -778,10 +814,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             return S_OK;
         }
         let behind = {
-            let mut held = lock(&queue(this).held);
+            let mut held = lock(&queue(this).held.commands);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::retain(fence), value));
             }
             behind
         };
@@ -798,12 +834,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            register(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1345,6 +1376,37 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A queue released while it holds something: what it holds outlives
+    /// it for whoever copied the waiting list, and it leaves the list.
+    #[cfg(windows)]
+    #[test]
+    fn what_a_queue_holds_outlives_its_release() {
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        // A wait that is never met, so nothing else runs past it.
+        lock(&queue(q).held.commands).push(Held::Wait(crate::fence::FenceRef::retain(fence), u64::MAX));
+        register(q);
+        register(q);
+        let copied = {
+            let waiting = lock(&WAITING);
+            let mut ours = waiting.iter().filter(|(_, line)| Arc::ptr_eq(line, &queue(q).held));
+            let line = ours.next().expect("registered").1.clone();
+            assert!(ours.next().is_none(), "registered once");
+            line
+        };
+        assert!(!copied.retired.load(Ordering::Acquire));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        assert!(copied.retired.load(Ordering::Acquire));
+        assert!(!lock(&WAITING).iter().any(|(_, line)| Arc::ptr_eq(line, &copied)));
+        assert!(matches!(&lock(&copied.commands)[..], [Held::Wait(..)]));
+        drop(copied);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
