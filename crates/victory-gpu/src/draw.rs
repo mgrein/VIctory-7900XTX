@@ -1269,6 +1269,16 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A host library (`crate::external`) bound its own pipeline, root
+    /// signature and descriptor heaps on the list: each is bound again
+    /// before the list's next draw or dispatch.
+    pub(crate) fn external_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.host_heaps_set = false;
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.

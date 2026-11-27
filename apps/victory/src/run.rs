@@ -4,6 +4,12 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// The host FidelityFX upscaler's profiles (`VICTORY_FSR_4K`,
+/// `VICTORY_FSR_1440P`, `VICTORY_FSR`; off without them).
+#[cfg(windows)]
+#[path = "fsr_4k.rs"]
+mod fsr_4k;
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -53,8 +59,9 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    let fsr = fsr_4k::FsrProfile::requested()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -63,7 +70,34 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let image = if let Some(profile) = fsr {
+        anyhow::ensure!(
+            matches!(console, Console::SeriesX),
+            "FSR {} requires Series X mode",
+            profile.output.label()
+        );
+        fsr_4k::prepare_fsr(&mut prepared, profile)?;
+        let dir = fsr_4k::fidelityfx_dir()?;
+        // The provider is chosen before the first lookup builds the import
+        // registry, which then serves the title's FidelityFX loader.
+        let version = victory_hle::modules::fidelityfx::use_host_dir(&dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading the FidelityFX upscaler from {}", dir.display()))?;
+        let [rw, rh] = profile.render_size();
+        let [ow, oh] = profile.output_size();
+        println!(
+            "fidelityfx     FSR {version} ({}) {rw}x{rh} -> {ow}x{oh} (scale {:.4}, mode {})",
+            profile.preset.name(),
+            profile.render_scale(),
+            profile.mode(),
+        );
+        // SAFETY: no title code has run or asked DXGI anything yet.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", profile.output.display_mode()) };
+        let cache = cfg.cache_subdir(&profile.cache_subdir())?;
+        victory_loader::load(&prepared, &cache)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -206,8 +240,9 @@ pub fn run(
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it).
+    // An FSR profile patched its own output size and render scale.
     #[cfg(windows)]
-    if execute {
+    if execute && fsr.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
