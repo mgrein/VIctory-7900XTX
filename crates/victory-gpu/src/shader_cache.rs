@@ -195,7 +195,11 @@ fn build() -> [u8; 32] {
 }
 
 /// Translator switches in the key only when set ([`build`]).
-const SET_ONLY: &[&str] = &["VICTORY_WAVE_ZERO_MASK", "VICTORY_WAVE_ENTRY_COPY"];
+const SET_ONLY: &[&str] = &[
+    "VICTORY_WAVE_ZERO_MASK",
+    "VICTORY_WAVE_ENTRY_COPY",
+    "VICTORY_RESINFO_MIP_BOUNDS",
+];
 
 /// What tells one set of translations from another ([`build`]).
 pub(crate) fn translation() -> [u8; 32] {

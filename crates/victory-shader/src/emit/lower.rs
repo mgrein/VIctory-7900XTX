@@ -1623,6 +1623,44 @@ fn entry_copy_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ENTRY_COPY").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_RESINFO_MIP_BOUNDS=0`: an image size query at a level past the
+/// view's last returns what the host's dimensions query gives (undefined in
+/// D3D12; some drivers clamp the level) as before. Otherwise all three sizes
+/// are 0 there, as on the console, and the level count stays (views of
+/// textures; a UAV's query keeps its one level's sizes).
+fn resinfo_mip_bounds_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_MIP_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+/// The four results of an image size query (`image_get_resinfo`) of a view of
+/// DXIL resource kind `kind` from the host's `dimensions` (width, height,
+/// depth or layers, levels): a size DXIL leaves out reads 1. With
+/// `mip_to_check`, all three sizes are 0 for a level at or past the count.
+pub(super) fn resinfo_sizes(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    kind: u32,
+    dimensions: [V; 4],
+    mip_to_check: Option<V>,
+) -> [V; 4] {
+    let [width, height, depth, levels] = dimensions;
+    let one = m.i32(1);
+    let mut sizes = match kind {
+        1 => [width, one, one],
+        2 | 5 | 6 => [width, height, one],
+        _ => [width, height, depth],
+    };
+    if let Some(mip) = mip_to_check {
+        let zero = m.i32(0);
+        let exists = m.cmp(block, pred::IULT, mip, levels);
+        for size in &mut sizes {
+            *size = m.select(block, exists, *size, zero);
+        }
+    }
+    [sizes[0], sizes[1], sizes[2], levels]
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -12641,35 +12679,27 @@ impl<'a> Lower<'a> {
         };
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            // in the first address: DXIL's dimensions ([`resinfo_sizes`]; UAVs:
+            // one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
-                self.s.m.undef(self.s.t.i32)
-            } else {
-                addr_val(self, 0)?
-            };
+            // A UAV is a view of one level: its query keeps that level's
+            // sizes whatever the first address says.
+            let requested = if uav { None } else { Some(addr_val(self, 0)?) };
+            let mip = requested.unwrap_or_else(|| self.s.m.undef(self.s.t.i32));
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-            let one = self.s.m.i32(1);
-            let present = match kind {
-                1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
-                _ => [true, true, true, true],
-            };
+            let dimensions: [V; 4] = std::array::from_fn(|ch| {
+                if uav && ch == 3 { self.s.m.i32(1) } else { self.s.m.extract(c, d, ch as u32) }
+            });
+            let sizes = resinfo_sizes(&mut self.s.m, c, kind, dimensions, requested.filter(|_| resinfo_mip_bounds_on()));
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
-            for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
-                    one
-                } else {
-                    self.s.m.extract(c, d, ch)
-                };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            for (k, ch) in (0..4usize).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), sizes[ch], guard);
             }
             return Ok(());
         }

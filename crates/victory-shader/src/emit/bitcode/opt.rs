@@ -1406,6 +1406,33 @@ mod tests {
         m.write();
     }
 
+    /// The instructions an image size query emits ([`crate::emit::lower::resinfo_sizes`]),
+    /// folded over constant dimensions: a level at or past the count reads all
+    /// sizes 0 even where a driver returns the clamped level's. From
+    /// stellarr-studio/kelvaroq patch 0049.
+    #[test]
+    fn resinfo_sizes_are_zero_past_the_last_level() {
+        for (kind, mip, expected) in [
+            (2, Some(2), [8, 4, 1, 3]),
+            (2, Some(3), [0, 0, 0, 3]),
+            (2, Some(u32::MAX), [0, 0, 0, 3]),
+            (2, None, [8, 4, 1, 3]),
+            (1, None, [8, 1, 1, 3]),
+            (7, Some(0), [8, 4, 2, 3]),
+        ] {
+            let Kit { mut m, b, writes, .. } = kit();
+            let dimensions = [8, 4, 2, 3].map(|v| m.i32(v));
+            let mip = mip.map(|v| m.i32(v));
+            let result = crate::emit::lower::resinfo_sizes(&mut m, b, kind, dimensions, mip);
+            m.call(b, writes, result[..2].to_vec());
+            m.call(b, writes, result[2..].to_vec());
+            m.terminate(b, Term::Ret);
+            m.optimise(FOLD | DEAD);
+            let expected = expected.map(|v| m.i32(v));
+            assert_eq!(stores(&m, b), [expected[..2].to_vec(), expected[2..].to_vec()], "kind {kind}");
+        }
+    }
+
     #[test]
     fn float_arithmetic_is_not_folded() {
         let Kit {
