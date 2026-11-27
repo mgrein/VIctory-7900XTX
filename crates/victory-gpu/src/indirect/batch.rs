@@ -85,6 +85,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             cost = record[0] * record[1];
         } else if (kind == 2) {
             uint3 g = uint3(record[0], record[1], record[2]);
+            // Diagnostics, as `super::SOURCE` notes it (the budget's word 20).
+            uint widest_asked = max(g.x, max(g.y, g.z));
+            if (widest_asked > 65535u) {
+                uint told;
+                budget.InterlockedMax(20, widest_asked, told);
+            }
             g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);

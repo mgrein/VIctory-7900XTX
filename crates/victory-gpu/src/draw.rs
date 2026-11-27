@@ -4148,17 +4148,18 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), &mut self.host_roots[1])
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), &mut self.host_roots[1])
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                // (The clamp noted its own compute root signature in
+                // `host_roots[1]`: the next one finds it bound.)
                 self.host_pipeline = 0;
-                self.host_roots[1] = 0;
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
