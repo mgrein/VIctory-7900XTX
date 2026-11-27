@@ -439,6 +439,47 @@ pub(crate) fn twin_plane_resource<'a>(
         .map(|p| unsafe { &*std::ptr::from_ref(&p.texture) })
 }
 
+/// A buffer of at least `bytes` for a stencil plane and its twin to be
+/// copied through ([`Twin::through`]): one shared by every twin of its size
+/// class, a power of two from 64 KiB on, kept for good. Sharing is safe
+/// because every such copy (`record_twin_copy`) is recorded into a list of
+/// the one drawing queue, begins and ends with the buffer in the common
+/// state, and fills the buffer before reading it back behind barriers: the
+/// copies of different twins never overlap on the card. Each twin had a
+/// buffer of its own, as big as its plane, for its life.
+/// `VICTORY_TWIN_SCRATCH=0`: a buffer per twin, as before.
+#[cfg(windows)]
+fn twin_scratch(
+    host: &crate::host::Host,
+    bytes: u64,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_SCRATCH").is_none_or(|v| v != "0")) {
+        return host.uav_buffer(bytes);
+    }
+    struct Classes(Vec<(u64, ID3D12Resource)>);
+    // SAFETY: D3D12 resources are free-threaded.
+    unsafe impl Send for Classes {}
+    static SHARED: std::sync::Mutex<Classes> = std::sync::Mutex::new(Classes(Vec::new()));
+    let class = twin_scratch_class(bytes);
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = shared.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = host.uav_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
+    shared.0.push((class, buffer.clone()));
+    Some(buffer)
+}
+
+/// The size class of a buffer of `bytes` shared by stencil twins
+/// ([`twin_scratch`]): the next power of two, 64 KiB at least.
+fn twin_scratch_class(bytes: u64) -> u64 {
+    let at_least = bytes.max(1 << 16);
+    at_least.checked_next_power_of_two().unwrap_or(at_least)
+}
+
 /// The colour twin for a texture described by `desc` whose host copy is
 /// `depth`, if the title asks for depth and unordered access both and the
 /// host can copy between the two: the same size, mips and slices in the
@@ -540,7 +581,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = twin_scratch(host, bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -3590,6 +3631,17 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Shared stencil twin buffers come in powers of two from 64 KiB.
+    #[test]
+    fn twin_scratch_classes_are_powers_of_two_from_64_kib() {
+        assert_eq!(super::twin_scratch_class(0), 1 << 16);
+        assert_eq!(super::twin_scratch_class(1), 1 << 16);
+        assert_eq!(super::twin_scratch_class(1 << 16), 1 << 16);
+        assert_eq!(super::twin_scratch_class((1 << 16) + 1), 1 << 17);
+        assert_eq!(super::twin_scratch_class(3 << 20), 4 << 20);
+        assert_eq!(super::twin_scratch_class(u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
