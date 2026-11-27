@@ -21,6 +21,8 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod error_record;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
@@ -217,12 +219,19 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let mut lane = Lane::new(desc.priority, desc.capacity);
+    if error_record::enabled() {
+        let Some(errors) = error_record::Errors::new() else {
+            return E_OUTOFMEMORY;
+        };
+        lane.errors = Some(Arc::new(errors));
+    }
+    let errors = lane.errors.clone();
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", queue_vtable()), Queue { id }),
+        Instance::create(Object::new("dstorage queue", queue_vtable()), Queue { id, errors }),
     )
 }
 
@@ -565,6 +574,8 @@ static STATUS_VTABLE: Methods<5> = Methods([
 /// A queue object: its lane in the scheduler.
 struct Queue {
     id: u64,
+    /// Its error record ([`error_record`]), shared with its lane.
+    errors: Option<Arc<error_record::Errors>>,
 }
 
 impl Drop for Queue {
@@ -629,6 +640,8 @@ struct Lane {
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
+    /// The queue's error record, if kept ([`error_record::enabled`]).
+    errors: Option<Arc<error_record::Errors>>,
     closed: bool,
 }
 
@@ -926,6 +939,9 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                if let Some(errors) = &lane.errors {
+                    errors.note(&job.request, hr);
+                }
             }
             lane.flush();
         }
@@ -980,6 +996,7 @@ impl Lane {
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
+            errors: None,
             closed: false,
         }
     }
@@ -1940,13 +1957,15 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Option<Vec<usize>
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-/// One table for each choice of the switches ([`cancel_reads`]).
+/// One table for each choice of the switches ([`cancel_reads`],
+/// [`error_record::enabled`]).
 fn queue_vtable() -> &'static Methods<12> {
-    static TABLES: [Methods<12>; 2] = [queue_methods(false), queue_methods(true)];
-    &TABLES[usize::from(cancel_reads())]
+    static TABLES: [Methods<12>; 4] =
+        [queue_methods(false, false), queue_methods(true, false), queue_methods(false, true), queue_methods(true, true)];
+    &TABLES[usize::from(cancel_reads()) + 2 * usize::from(error_record::enabled())]
 }
 
-const fn queue_methods(cancel_reads: bool) -> Methods<12> {
+const fn queue_methods(cancel_reads: bool, errors: bool) -> Methods<12> {
     Methods([
         missing::<0> as *const (),
         add_ref_instance::<Queue> as *const (),
@@ -1957,8 +1976,8 @@ const fn queue_methods(cancel_reads: bool) -> Methods<12> {
         submit as *const (),          // 0x30
         if cancel_reads { cancel as *const () } else { missing::<7> as *const () }, // 0x38
         close as *const (),           // 0x40
-        missing::<9> as *const (),    // 0x48 (2020: error event)
-        missing::<10> as *const (),   // 0x50 (2020: error record)
+        if errors { error_record::event as *const () } else { missing::<9> as *const () }, // 0x48
+        if errors { error_record::retrieve as *const () } else { missing::<10> as *const () }, // 0x50
         missing::<11> as *const (),   // 0x58 (2020: queue info)
     ])
 }
