@@ -2448,6 +2448,59 @@ impl Drop for Compared {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        let n = now.len().min(was.len());
+        // SAFETY: the processor has AVX2, and both are `n` bytes long.
+        return unsafe { changed_runs_avx2(&now[..n], &was[..n]) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+/// [`changed_runs`], 32 bytes at a time: a block's differing bytes are a
+/// 32-bit mask, and its runs are the mask's runs of ones, joined to the run
+/// before where they touch. The same runs as [`changed_runs_scalar`]
+/// (after fxceless PR #1298: changed runs found with AVX2).
+///
+/// # Safety
+/// AVX2, and two slices of one length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, m)) if *a + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: inside both slices (`i + 32 <= n`).
+        let same = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(now.as_ptr().add(i).cast()), _mm256_loadu_si256(was.as_ptr().add(i).cast())) };
+        let mut differ = !(_mm256_movemask_epi8(same) as u32);
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            differ &= u32::MAX << (first + count);
+        }
+        i += 32;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            push(i, 1);
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// [`changed_runs`] without AVX2.
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -3087,6 +3140,33 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn changed_runs_avx2_are_the_scalar_runs() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..400 {
+            let n = [PAGE, 4096, 31, 32, 33, 64, 0, 1, 1000, 255][round % 10];
+            let was: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..(next() % 300) as usize {
+                if n == 0 {
+                    break;
+                }
+                let at = (next() as usize) % n;
+                let len = [1, 2, 31, 32, 33, 100][(next() % 6) as usize].min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b = b.wrapping_add(1 + (next() % 255) as u8);
+                }
+            }
+            assert_eq!(changed_runs(&now, &was), crate::shadow::changed_runs_scalar(&now, &was), "round {round}");
+        }
     }
 }
 
