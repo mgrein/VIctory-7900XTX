@@ -1738,15 +1738,21 @@ impl<'a> Analyzer<'a> {
         cmp.reads.iter().any(|&(_, x)| x == root_val)
     }
 
-    /// Collects `root` and all SSA values in `nodes` reachable from it via PHIs or `v_mov_b32`
-    /// (needed when a mutually-exclusive branch like the box-node branch clobbers the same VGPRs).
-    fn forward_phi_closure(&self, root: Value, nodes: &HashSet<usize>) -> HashSet<Value> {
+    /// Collects `root` and all SSA values in `nodes` (skipping any block in `exclude`) reachable
+    /// from it via PHIs or `v_mov_b32` (needed when a mutually-exclusive branch like the box-node
+    /// branch clobbers the same VGPRs).
+    fn forward_phi_closure(
+        &self,
+        root: Value,
+        nodes: &HashSet<usize>,
+        exclude: Option<&HashSet<usize>>,
+    ) -> HashSet<Value> {
         let mut seen = HashSet::new();
         let mut work = vec![root];
         seen.insert(root);
         while let Some(v) = work.pop() {
             for &(b, idx_opt) in &self.uses[v.0 as usize] {
-                if !nodes.contains(&b) {
+                if !nodes.contains(&b) || exclude.is_some_and(|ex| ex.contains(&b)) {
                     continue;
                 }
                 match idx_opt {
@@ -1790,10 +1796,10 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         let (t_num, det, bary_u_num, bary_v_num) = (bvh_res[0], bvh_res[1], bvh_res[2], bvh_res[3]);
-        let det_vals = self.forward_phi_closure(det, nodes);
-        let t_num_vals = self.forward_phi_closure(t_num, nodes);
-        let bary_u_vals = self.forward_phi_closure(bary_u_num, nodes);
-        let bary_v_vals = self.forward_phi_closure(bary_v_num, nodes);
+        let det_vals = self.forward_phi_closure(det, nodes, None);
+        let t_num_vals = self.forward_phi_closure(t_num, nodes, None);
+        let bary_u_vals = self.forward_phi_closure(bary_u_num, nodes, None);
+        let bary_v_vals = self.forward_phi_closure(bary_v_num, nodes, None);
 
         // Find `v_rcp_f32 rcp_det, det` inside `nodes`.
         let mut rcp_det_site: Option<(Site, Value)> = None;
@@ -3566,7 +3572,7 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         // Also collect any forward PHI/copy of `phi.value` in `nodes \ anyhit_set` before `anyhit_set`.
-        let fwd = self.forward_phi_closure(phi.value, nodes);
+        let fwd = self.forward_phi_closure(phi.value, nodes, Some(anyhit_set));
         for v in fwd {
             if self
                 .def_block(v)
@@ -8585,5 +8591,190 @@ mod tests {
             loops_mixed[0].rq_group, loops_mixed[1].rq_group,
             "two-pass group must not coalesce with non-two-pass group"
         );
+    }
+
+    #[test]
+    fn forward_phi_closure_excludes_anyhit_set_from_state_vars() {
+        use crate::ir::{Block, Phi};
+
+        // Decode real GFX10 instructions for `v_mov_b32` with literal/reg operands.
+        let decode_one = |words: &[u32]| {
+            let mut bytes = Vec::with_capacity((words.len() + 1) * 4);
+            for &w in words {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0xBF81_0000u32.to_le_bytes()); // s_endpgm
+            let list = crate::gfx10::decode(&bytes).expect("valid GFX10 inst");
+            assert_eq!(list.len(), 2);
+            let m = list.into_iter().next().unwrap();
+            let fields = m.fields(false);
+            (m, fields)
+        };
+        let make_inst = |words: &[u32], reads: Vec<(Reg, Value)>, writes: Vec<(Reg, Value)>| {
+            let (machine, fields) = decode_one(words);
+            Inst {
+                machine,
+                fields,
+                reads,
+                writes,
+            }
+        };
+
+        // CFG:
+        //   0 (pre-loop): v10 = 10000.0f (min_t init), v11 = 0 (dead local temp init)
+        //   1 (loop entry): phi_min_t (v10) = phi(v10_init, v10_commit),
+        //                   phi_tmp   (v11) = phi(v11_init, v11_commit)
+        //   2 (anyhit_set): v_mov_b32 v10, v11 (inside anyhit_set, copies dead temp into min_t),
+        //                   v_mov_b32 v11, 0   (updates dead local temp)
+        //   3 (commit_block, in nodes \ anyhit_set): merges (1, 2) -> back-edge to 1, exit to 4
+        //   4 (exit)
+        // Without excluding `anyhit_set` in `forward_phi_closure`, tracing forward from `phi_tmp`
+        // enters block 2, follows `v_mov_b32 v10, v11` to `v10_next`, exits to block 3's `v10_commit`
+        // PHI and block 1's `phi_min_t`, polluting `phi_tmp`'s `scaff_vals` with `phi_min_t`!
+        let min_t_bits = 10_000.0f32.to_bits();
+        let v10_init = Value(0);
+        let v11_init = Value(1);
+        let phi_min_t = Value(2);
+        let phi_tmp = Value(3);
+        let v10_next = Value(4);
+        let v11_next = Value(5);
+        let v10_commit = Value(6);
+        let v11_commit = Value(7);
+
+        // VOP1 `v_mov_b32 vdst, src0`: 0x7E00_0200 | (vdst << 17) | (1 << 9) | src0
+        // src0 = 0xFF (literal) for v10 = 10000.0f, src0 = 0x80 (inline 0) for v11 = 0,
+        // src0 = 0x10B (v11) for `v_mov_b32 v10, v11`.
+        let inst_init_min_t = make_inst(
+            &[0x7E00_02FF | (10 << 17), min_t_bits],
+            vec![],
+            vec![(Reg::V(10), v10_init)],
+        );
+        let inst_init_tmp = make_inst(
+            &[0x7E00_0280 | (11 << 17)],
+            vec![],
+            vec![(Reg::V(11), v11_init)],
+        );
+        let inst_ah_copy_to_min_t = make_inst(
+            &[0x7E00_030B | (10 << 17)],
+            vec![(Reg::V(11), phi_tmp)],
+            vec![(Reg::V(10), v10_next)],
+        );
+        let inst_ah_write_tmp = make_inst(
+            &[0x7E00_0280 | (11 << 17)],
+            vec![],
+            vec![(Reg::V(11), v11_next)],
+        );
+
+        let blocks = vec![
+            Block {
+                offset: 0,
+                preds: vec![],
+                phis: vec![],
+                insts: vec![inst_init_min_t, inst_init_tmp],
+                exit: Exit::Jump(1),
+            },
+            Block {
+                offset: 12,
+                preds: vec![0, 3],
+                phis: vec![
+                    Phi {
+                        reg: Reg::V(10),
+                        value: phi_min_t,
+                        args: vec![v10_init, v10_commit],
+                    },
+                    Phi {
+                        reg: Reg::V(11),
+                        value: phi_tmp,
+                        args: vec![v11_init, v11_commit],
+                    },
+                ],
+                insts: vec![],
+                exit: Exit::Branch {
+                    taken: 2,
+                    not_taken: 3,
+                },
+            },
+            Block {
+                offset: 16,
+                preds: vec![1],
+                phis: vec![],
+                insts: vec![inst_ah_copy_to_min_t, inst_ah_write_tmp],
+                exit: Exit::Jump(3),
+            },
+            Block {
+                offset: 24,
+                preds: vec![1, 2],
+                phis: vec![
+                    Phi {
+                        reg: Reg::V(10),
+                        value: v10_commit,
+                        args: vec![phi_min_t, v10_next],
+                    },
+                    Phi {
+                        reg: Reg::V(11),
+                        value: v11_commit,
+                        args: vec![phi_tmp, v11_next],
+                    },
+                ],
+                insts: vec![],
+                exit: Exit::Branch {
+                    taken: 1,
+                    not_taken: 4,
+                },
+            },
+            Block {
+                offset: 28,
+                preds: vec![3],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::End,
+            },
+        ];
+        let prog = Program {
+            wave64: false,
+            vgprs: 32,
+            blocks,
+            inputs: vec![],
+        };
+        let st = crate::structure::structure(&prog).unwrap();
+        let res = crate::resource::track(&prog, &[], crate::native::HwStage::Cs, Some(&st)).unwrap();
+        let scalar = HashMap::new();
+        let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
+
+        let nodes: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        let anyhit_set: HashSet<usize> = [2].into_iter().collect();
+
+        // Confirm `forward_phi_closure` with `exclude = None` would have crossed block 2 into `phi_min_t`,
+        // while `exclude = Some(&anyhit_set)` stays strictly within `nodes \ anyhit_set`.
+        let leaked = analyzer.forward_phi_closure(phi_tmp, &nodes, None);
+        assert!(leaked.contains(&phi_min_t));
+        let clean = analyzer.forward_phi_closure(phi_tmp, &nodes, Some(&anyhit_set));
+        assert!(!clean.contains(&phi_min_t));
+        assert!(!clean.contains(&v10_commit));
+
+        // Verify `match_anyhit_state_var` for the dead temp does NOT capture `phi_min_t` or `v10_commit`,
+        // and `phi_min_t` keeps its real `init = 10000.0f` cleanly separated.
+        let (tmp_init, tmp_next, tmp_scaff) = analyzer
+            .match_anyhit_state_var(&prog.blocks[1].phis[1], &nodes, 1, &anyhit_set, 2)
+            .expect("tmp matches state var shape");
+        assert_eq!(tmp_init, RayInput::Val(v11_init));
+        assert_eq!(analyzer.eval_const(v11_init, 0), Some(0));
+        assert_eq!(tmp_next, v11_next);
+        assert!(tmp_scaff.contains(&phi_tmp));
+        assert!(tmp_scaff.contains(&v11_commit));
+        assert!(
+            !tmp_scaff.contains(&phi_min_t) && !tmp_scaff.contains(&v10_commit),
+            "dead local temp inside anyhit_set must not pollute min_t scaffolding values: {tmp_scaff:?}"
+        );
+
+        let (min_init, min_next, min_scaff) = analyzer
+            .match_anyhit_state_var(&prog.blocks[1].phis[0], &nodes, 1, &anyhit_set, 2)
+            .expect("min_t matches state var shape");
+        assert_eq!(min_init, RayInput::Val(v10_init));
+        assert_eq!(analyzer.eval_const(v10_init, 0), Some(min_t_bits));
+        assert_eq!(min_next, v10_next);
+        assert!(min_scaff.contains(&phi_min_t));
+        assert!(min_scaff.contains(&v10_commit));
+        assert!(!min_scaff.contains(&phi_tmp));
     }
 }
