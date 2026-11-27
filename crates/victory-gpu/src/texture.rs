@@ -466,6 +466,20 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
     })
 }
 
+/// Whether a refresh that reads a texture through the kernel's copy (a
+/// partly mapped one, or with `VICTORY_TEXTURE_COPY=1`) lets the runtime
+/// remap title memory as soon as the bytes are copied, before they are
+/// hashed and detiled (`VICTORY_SHORT_REMAP_LOCK=0`: held to the end, as
+/// before). The lock ([`crate::watch::title_memory_reading`]) keeps what is
+/// mapped mapped while it is read; the hash and the detiling read only the
+/// copy, and a runtime that waits to remap waited for them too (a large
+/// partly mapped texture: its whole detiling). Levels on demand keep it
+/// held: their detiling asks which levels are mapped.
+fn short_remap_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHORT_REMAP_LOCK").is_none_or(|v| v != "0"))
+}
+
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1304,7 +1318,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mut mapped = Some(if no_wait() {
             // Not waited for while the staging buffer holds a detiling: it
             // is kept and the texture read at its next refresh (`no_wait`).
             match crate::watch::title_memory_reading_now() {
@@ -1320,8 +1334,12 @@ impl Staging {
             }
         } else {
             waited(2, crate::watch::title_memory_reading)
-        };
+        });
         last.deferred = false;
+        // Read through the copy, the bytes are ours: the runtime may remap
+        // while they are hashed and detiled ([`short_remap_lock`]). Not for
+        // levels on demand, whose detiling looks at which levels are mapped.
+        let release_early = short_remap_lock() && !self.on_demand;
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1339,6 +1357,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if release_early {
+                    drop(mapped.take());
+                }
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1361,6 +1382,9 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
+                if release_early {
+                    drop(mapped.take());
+                }
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1377,7 +1401,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
