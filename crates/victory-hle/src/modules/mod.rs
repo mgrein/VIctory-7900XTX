@@ -19,6 +19,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -81,5 +83,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // `amd_fidelityfx_loader_xbox.dll` is served by the host's PC upscaler
+    // only with an FSR profile asked for (`fidelityfx::use_host_dir`, before
+    // this first runs): otherwise the title's own DLLs load as before.
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }
