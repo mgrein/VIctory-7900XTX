@@ -3694,11 +3694,133 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// By address ranges (after DexNom 5f4c3df4): a read pins the addresses it
+/// reads, a change says every address it may take away for its moment (the
+/// whole of each view it unmaps, and what it maps), and the two wait for
+/// each other only where they overlap. Before, any change kept every read
+/// out: a texture's staging waited 846 ms for one in a sample, and with
+/// `VICTORY_TEXTURE_NO_WAIT=1` read every texture through the kernel
+/// instead for as long as any change went on. Who names no range holds
+/// everything, as before. `VICTORY_RANGE_LOCK=0`: everybody holds
+/// everything ([`range_lock`]).
+static MAPPING: MapLock = MapLock::new();
+
+/// Whether reads in place and changes of mapping hold only their own
+/// address ranges (`VICTORY_RANGE_LOCK=0`: all of memory, each of them, as
+/// before; read here).
+fn range_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGE_LOCK").is_none_or(|v| v != "0"))
+}
+
+/// All of memory, as a range to hold.
+const ALL_MEMORY: (usize, usize) = (0, usize::MAX);
+
+/// The ranges under a change of mapping and those being read in place
+/// ([`MAPPING`]).
+struct MapLock {
+    held: Mutex<MapHeld>,
+    moved: Condvar,
+    /// One change at a time.
+    changer: Mutex<()>,
+}
+
+struct MapHeld {
+    /// What the change under way, or the one waiting for its readers, may
+    /// take away: `(start, end)` in order and apart.
+    changing: Vec<(usize, usize)>,
+    /// What is being read in place, one for each [`MapRead`].
+    reading: Vec<(usize, usize)>,
+}
+
+impl MapHeld {
+    fn changes(&self, range: (usize, usize)) -> bool {
+        // The first that ends past its start: the only one that can begin
+        // before its end.
+        let i = self.changing.partition_point(|c| c.1 <= range.0);
+        self.changing.get(i).is_some_and(|c| c.0 < range.1)
+    }
+}
+
+/// A change of mapping under way in a [`MapLock`], until dropped.
+struct MapChange {
+    lock: &'static MapLock,
+    #[allow(dead_code)]
+    alone: std::sync::MutexGuard<'static, ()>,
+}
+
+/// A read in place of a range of a [`MapLock`], until dropped.
+struct MapRead {
+    lock: &'static MapLock,
+    range: (usize, usize),
+}
+
+impl MapLock {
+    const fn new() -> MapLock {
+        MapLock {
+            held: Mutex::new(MapHeld { changing: Vec::new(), reading: Vec::new() }),
+            moved: Condvar::new(),
+            changer: Mutex::new(()),
+        }
+    }
+
+    /// Begins a change of `ranges`: no read of any of them is under way
+    /// when it returns, and none begins until it is dropped. Said before it
+    /// waits for the reads under way, so that reads which keep coming do
+    /// not keep it out.
+    fn change(&'static self, ranges: &[(usize, usize)]) -> MapChange {
+        let alone = self.changer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = ranges.iter().copied().filter(|r| r.0 < r.1).collect();
+        coalesce(&mut ranges);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.changing = ranges;
+        while held.reading.iter().any(|&r| held.changes(r)) {
+            held = self.moved.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(held);
+        MapChange { lock: self, alone }
+    }
+
+    /// Pins `range` for a read in place, when no change of any of it is
+    /// under way or waiting; with `wait` false, `None` instead of waiting.
+    fn read(&'static self, range: (usize, usize), wait: bool) -> Option<MapRead> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.changes(range) {
+            if !wait {
+                return None;
+            }
+            held = self.moved.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.reading.push(range);
+        Some(MapRead { lock: self, range })
+    }
+}
+
+impl Drop for MapChange {
+    fn drop(&mut self) {
+        self.lock.held.lock().unwrap_or_else(|e| e.into_inner()).changing.clear();
+        self.lock.moved.notify_all();
+    }
+}
+
+impl Drop for MapRead {
+    fn drop(&mut self) {
+        let mut held = self.lock.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.reading.iter().position(|&r| r == self.range) {
+            held.reading.swap_remove(i);
+        }
+        let waited_for = held.changes(self.range);
+        drop(held);
+        if waited_for {
+            self.lock.moved.notify_all();
+        }
+    }
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] MapChange);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3843,6 +3965,16 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_ranges(&[ALL_MEMORY])
+}
+
+/// [`title_memory_remapping`] by a runtime that knows what it changes:
+/// `ranges` (start, end) hold every address that may be unmapped, or mapped
+/// and not yet committed, at any moment of the change. That is the whole of
+/// every view the change unmaps, also where it maps the rest of one again,
+/// and everything it maps. Reads in place of other addresses go on
+/// ([`title_memory_reading_range`]).
+pub fn title_memory_remapping_ranges(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3853,32 +3985,47 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let changing = MAPPING.change(if range_lock() { ranges } else { &[ALL_MEMORY] });
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] MapRead);
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(ALL_MEMORY.0, ALL_MEMORY.1)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    title_memory_reading_range_now(ALL_MEMORY.0, ALL_MEMORY.1)
+}
+
+/// [`title_memory_reading`] for a caller that reads `[start, end)` and
+/// nothing else of title memory in place: the runtime changes no mapping
+/// of those addresses until what it returns is dropped; changes elsewhere
+/// neither wait for it nor are waited for.
+pub fn title_memory_reading_range(start: usize, end: usize) -> Reading {
+    let range = if range_lock() { (start, end) } else { ALL_MEMORY };
+    match MAPPING.read(range, true) {
+        Some(read) => Reading(read),
+        None => unreachable!("a read that waits is given"),
     }
+}
+
+/// [`title_memory_reading_range`] if it can be had at once
+/// ([`title_memory_reading_now`]).
+pub fn title_memory_reading_range_now(start: usize, end: usize) -> Option<Reading> {
+    let range = if range_lock() { (start, end) } else { ALL_MEMORY };
+    MAPPING.read(range, false).map(Reading)
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -5570,6 +5717,67 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// (A lock of the test's own: other tests change the mapping of
+    /// everything meanwhile.)
+    #[test]
+    fn a_change_of_mapping_keeps_out_only_reads_of_what_it_changes() {
+        use super::MapLock;
+        static LOCK: MapLock = MapLock::new();
+        const K: usize = 0x1_0000;
+        // A change of two ranges, given out of order and touching.
+        let changing = LOCK.change(&[(8 * K, 9 * K), (K, 2 * K), (2 * K, 3 * K), (5 * K, 5 * K)]);
+        // Reads elsewhere are had at once, also between and beside them.
+        let started = std::time::Instant::now();
+        let beside = [(0, K), (3 * K, 8 * K), (9 * K, 20 * K), (5 * K, 5 * K + 1)].map(|r| LOCK.read(r, false).expect("not under the change"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(beside);
+        // Reads of what it changes are not, nor a read of everything.
+        for r in [(K, K + 1), (3 * K - 1, 3 * K), (0, 9 * K), (8 * K + 5, 30 * K), (0, usize::MAX)] {
+            assert!(LOCK.read(r, false).is_none(), "{r:x?} read under its change");
+        }
+        // One that waits gets through when the change is done.
+        let (began, wait) = mpsc::channel();
+        let read = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let read = read.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _reading = LOCK.read((2 * K, 2 * K + 1), true);
+                read.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!read.load(Ordering::SeqCst), "a read in place began under a change of its range");
+        drop(changing);
+        reader.join().unwrap();
+        // A read held: a change elsewhere begins at once, one of its range
+        // waits for it, and while that one waits no new read of the range
+        // begins (reads that keep coming would keep the change out).
+        let reading = LOCK.read((4 * K, 5 * K), true).unwrap();
+        drop(LOCK.change(&[(0, 4 * K), (5 * K, 6 * K)]));
+        let changed = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _changing = LOCK.change(&[(4 * K + 100, 4 * K + 200)]);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!changed.load(Ordering::SeqCst), "the mapping changed under a read in place");
+        assert!(LOCK.read((4 * K + 150, 4 * K + 160), false).is_none());
+        assert!(LOCK.read((6 * K, 7 * K), false).is_some());
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        let held = LOCK.held.lock().unwrap();
+        assert!(held.changing.is_empty() && held.reading.is_empty());
     }
 }
 
