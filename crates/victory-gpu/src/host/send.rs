@@ -119,8 +119,43 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
+/// While the PC is short of memory (`super::ram_pressure_level`) less is:
+/// a third at the first level and a twelfth at the second, so the pool
+/// gives its upload memory back to the system's commit instead of holding
+/// 768 MiB of it (after Belobug PR #319 by mynzjerko, 768 -> 256 -> 64 MiB).
+/// `VICTORY_SEND_SPARE_TRIM=0` keeps the whole amount, as before. What is in
+/// the pool has run already (`give_back`), so nothing the card may still
+/// read is let go; a later submission makes a new one if it needs it.
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    let most: u64 = if on_card() { 256 << 20 } else { 768 << 20 };
+    if !spare_trim() {
+        return most;
+    }
+    match super::ram_pressure_level() {
+        0 => most,
+        1 => most / 3,
+        _ => most / 12,
+    }
+}
+
+/// [`kept`]: whether the pool shrinks while the PC is short of memory
+/// (`VICTORY_SEND_SPARE_TRIM=0`: no; on by default).
+fn spare_trim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_SPARE_TRIM").is_none_or(|v| v != "0"))
+}
+
+/// At the sweep while the PC is short of memory: the pool down to [`kept`],
+/// the biggest first. Returns the buffers and bytes let go.
+pub(super) fn trim_spare() -> (usize, u64) {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
+    let (mut n, mut bytes) = (0, 0);
+    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
+        bytes += spare.remove(0).size;
+        n += 1;
+    }
+    (n, bytes)
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

@@ -256,6 +256,10 @@ fn press(pressed: bool, lists: usize) {
     }
     let (snaps, snap_bytes) = crate::shadow::drain_pool();
     let (chunks, chunk_bytes) = drain_spare_chunks();
+    let (sends, send_bytes) = send::trim_spare();
+    if sends > 0 {
+        trail(|| format!("memory pressure: {sends} send buffers ({} MiB) let go", send_bytes >> 20));
+    }
     if !was {
         tracing::info!(
             "memory pressure: {headroom} MiB of commit headroom, under {} MiB (VICTORY_RAM_TRIM_MB): let go of {snaps} \
