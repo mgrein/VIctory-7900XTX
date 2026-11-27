@@ -4089,6 +4089,9 @@ impl State {
             && args.offset(arguments).is_multiple_of(4)
             && list.budget().is_some()
         {
+            // Ends the window as every other writing path does: the mesh
+            // stage may store into the arguments a window clamped ahead.
+            self.window = None;
             args.refresh(list, arguments, len);
             if !self.prepare_for(list, false, true) {
                 why("prepare failed");
