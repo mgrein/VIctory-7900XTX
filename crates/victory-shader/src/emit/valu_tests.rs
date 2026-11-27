@@ -2288,3 +2288,26 @@ fn legacy_mad_takes_a_subnormal_factor_as_zero() {
         assert_eq!(got, want[i], "{backend}: case {i} {inp:x?}: got {got:#x}, want {:#x}", want[i]);
     });
 }
+
+/// SDWA `v_add_f16 v0, v1, v2` writing WORD_0: dst_unused 1 (sext) copies
+/// bit 15 of the result upward, dst_unused 0 (pad) clears the high word
+/// (a 16-bit -1.0 written with sext came out as 0x0000BC00).
+#[test]
+fn sdwa_word_0_sign_extends_a_16_bit_result() {
+    let sdwa = |dst_unused: u32| {
+        [
+            vop2(0x32, 0, 0xF9, 2),
+            1 | 4 << 8 | dst_unused << 11 | 6 << 16 | 6 << 24,
+        ]
+    };
+    // -1.0 + 0, 1.0 + 0, -2.0 + 1.0 (high words of the sources are not read).
+    let cases = [[0xBC00u32, 0, 0, 0], [0x3C00, 0, 0, 0], [0x1234_C000, 0xFFFF_3C00, 0, 0]];
+    for (dst_unused, name) in [(1, "sext"), (0, "pad")] {
+        let shader = build_valu_cs(&sdwa(dst_unused));
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let sum = [0xBC00u32, 0x3C00, 0xBC00][i];
+            let want = if dst_unused == 1 { sum as u16 as i16 as i32 as u32 } else { sum };
+            assert_eq!(got, want, "{backend}: {name} case {i} {inp:x?}: got {got:#x}, want {want:#x}");
+        });
+    }
+}
