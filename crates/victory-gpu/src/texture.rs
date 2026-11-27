@@ -10,7 +10,9 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! shortcut: a change detiles the whole texture, not the pages written
+//! (with `VICTORY_PARTIAL_DETILE=1`, in write-watched memory, only the
+//! levels and slices the written pages reach: [`partial_detile`]).
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -75,6 +77,11 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// The parts of the staging buffer (a bit for each of its first 64
+    /// footprints) detiled alone since a submitted list last uploaded them
+    /// ([`partial_detile`]): a list uploads only these while `dirty` is not
+    /// set. Set after the part's bytes are written.
+    pending: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// How many bytes of the texture's memory were mapped when a list last
@@ -103,6 +110,11 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The staging buffer holds every part as the write watch's asking
+    /// `asked` found the memory: the pages written since are all that
+    /// changed ([`partial_detile`]). Not so after any other way of
+    /// refreshing.
+    watched_whole: bool,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -128,6 +140,76 @@ const HOT_FRAMES: u64 = 64;
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a change of a write-watched texture detiles and uploads only the
+/// levels and array slices whose memory the pages written since the last
+/// detiling reach (`VICTORY_PARTIAL_DETILE=1`; off by default until it has
+/// been compared in the title; `check`: as `1`, and every such refresh is
+/// followed by a whole detiling that is compared with it, a difference
+/// said in the log and uploaded whole).
+///
+/// A texture's memory holds each level of each slice in a span of its own
+/// (`victory_formats::texture::Layout::subresource_span`; the smallest
+/// levels share the first block and go together), and the write watch
+/// names the pages written since the last asking. So far one written page
+/// read, detiled and uploaded all of the texture: a 22 MB texture for 64
+/// KiB written. With the switch only the spans a written page lies in are
+/// read and detiled into the kept staging buffer, and the next list copies
+/// only those subresources. Whole as before: a staging buffer's first
+/// filling, textures with levels on demand, 3D textures, more than 64
+/// subresources, memory that is not write-watched (hashed whole), and any
+/// refresh that came another way since.
+///
+/// (After DexNom PR #72, 3cvil, and the idea of fxceless PR #1018/#1130
+/// and of XCL PR #2484; written anew for our tree.)
+fn partial_detile() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PARTIAL_DETILE").as_deref() {
+        Ok("1") => 1,
+        Ok("check") => 2,
+        _ => 0,
+    })
+}
+
+/// With [`partial_detile`], since the start: refreshes that detiled some
+/// parts only, the parts they detiled, the parts they left, the bytes of
+/// title memory they did not read, and (`check`) those a whole detiling
+/// differed from.
+pub(crate) static PARTIAL: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The parts of a staging buffer (bit `i`: its footprint `i`, which holds
+/// level `first + i % (mips - first)` of slice `i / (mips - first)`) that
+/// have a byte in one of `pages` (4 KiB page numbers), for a texture whose
+/// memory starts at `start`. `None` if that cannot be told part by part:
+/// the whole texture is taken.
+fn parts_written(
+    layout: &victory_formats::texture::Layout,
+    first: u32,
+    mips: u32,
+    parts: usize,
+    start: usize,
+    pages: impl Iterator<Item = usize>,
+) -> Option<u64> {
+    let levels = mips.checked_sub(first).filter(|&levels| levels != 0)?;
+    if parts == 0 || parts > 64 {
+        return None;
+    }
+    let mut spans = [(0usize, 0usize); 64];
+    for (i, span) in spans.iter_mut().enumerate().take(parts) {
+        let (from, to) = layout.subresource_span(first + i as u32 % levels, i as u32 / levels)?;
+        // (First and last page.)
+        *span = ((start + from as usize) >> 12, (start + to as usize - 1) >> 12);
+    }
+    let mut written = 0u64;
+    for page in pages {
+        for (i, &(from, to)) in spans.iter().enumerate().take(parts) {
+            if from <= page && page <= to {
+                written |= 1 << i;
+            }
+        }
+    }
+    Some(written)
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -832,12 +914,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    let pending = staging.pending.load(Relaxed);
+    let whole = !staging.uploaded.load(Relaxed) || staging.dirty.load(Relaxed);
+    if !whole && pending == 0 {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
         return;
     }
+    // The parts this list copies: all of them, or only the ones detiled
+    // alone since the last upload ([`partial_detile`]).
+    let take = if whole { u64::MAX } else { pending };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
@@ -878,6 +965,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if take != u64::MAX && (i >= 64 || take >> i & 1 == 0) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -934,7 +1024,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         let staging = staging.clone();
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            if take == u64::MAX {
+                staging.dirty.store(false, Relaxed);
+            }
+            // (A part detiled alone after this list was recorded and not
+            // among its copies stays owed to the next list.)
+            staging.pending.fetch_and(!take, Relaxed);
         });
     }
     // A host copy that took the place of one with fewer levels: the slots
@@ -1320,7 +1415,23 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            // Only the parts the pages written since reach, if the staging
+            // buffer holds the others as they still are.
+            let mode = partial_detile();
+            let parts = if mode != 0 && last.watched_whole && last.asked != 0 && !self.on_demand {
+                let since = written.iter().filter(|&&(_, w)| w > last.asked).map(|&(page, _)| page);
+                parts_written(&self.layout, self.first, self.mips, self.footprints.len(), start, since)
+            } else {
+                None
+            };
             last.asked = now;
+            last.watched_whole = true;
+            if let Some(parts) = parts {
+                let read = self.refresh_parts(parts, mode == 2);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+                return read;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -1331,6 +1442,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
+        // Any other way of refreshing: what the staging buffer holds is no
+        // longer told by the write watch's pages.
+        last.watched_whole = false;
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
         // where two textures change (run 58). It is guarded now, as buffers
@@ -1562,9 +1676,92 @@ impl Staging {
         crate::texstore::keep(self.shape, &self.layout, tiled, parts);
     }
 
+    /// [`partial_detile`]: reads and detiles the parts `parts` of the
+    /// texture (a bit a footprint) into the staging buffer, which holds
+    /// the others as they still are, and marks them for the next list's
+    /// upload. `check`: then detiles the whole texture and compares.
+    /// Returns the bytes of title memory read.
+    fn refresh_parts(&self, parts: u64, check: bool) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = self.read;
+        let levels = self.mips - self.first;
+        let count = self.footprints.len();
+        let chosen = (0..count.min(64)).filter(|&i| parts >> i & 1 != 0);
+        let mut taken = 0;
+        with_read(size, |read| {
+            if check {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                taken = size;
+            } else {
+                // Each part's span of the memory, at its place in the read
+                // buffer (the detiling of a part reads nothing outside its
+                // span); the levels of the tail share one, read once.
+                let mut last_span = None;
+                for i in chosen {
+                    let Some((from, to)) = self.layout.subresource_span(self.first + i as u32 % levels, i as u32 / levels) else {
+                        continue;
+                    };
+                    let (from, to) = ((from as usize).min(size), (to as usize).min(size));
+                    if last_span == Some((from, to)) || from >= to {
+                        continue;
+                    }
+                    last_span = Some((from, to));
+                    // SAFETY: inside the `size` bytes of the read buffer
+                    // and of the texture's memory (read through the copy,
+                    // which stands unmapped pages).
+                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(from) }, self.memory.wrapping_add(from), to - from, false);
+                    taken += to - from;
+                }
+            }
+            self.detile_parts(read, parts);
+            if check {
+                // SAFETY: the mapped staging buffer's bytes.
+                let staged = |s: &Self| unsafe { std::slice::from_raw_parts(s.data, s.bytes as usize) };
+                let partly = staged(self).to_vec();
+                self.detile_parts(read, u64::MAX);
+                if partly != staged(self) {
+                    PARTIAL[4].fetch_add(1, Relaxed);
+                    self.dirty.store(true, Relaxed);
+                    tracing::warn!(
+                        memory = ?self.memory,
+                        desc = ?self.layout.desc,
+                        parts = format_args!("{parts:#x}"),
+                        of = count,
+                        "VICTORY_PARTIAL_DETILE=check: a texture detiled in part differs from the same memory detiled whole (uploaded whole)"
+                    );
+                }
+            }
+        });
+        // (After the bytes are written: a list that clears the marks at
+        // its submission copies what is there by then.)
+        self.pending.fetch_or(parts, Relaxed);
+        let detiled = u64::from(parts.count_ones());
+        let n = PARTIAL[0].fetch_add(1, Relaxed) + 1;
+        PARTIAL[1].fetch_add(detiled, Relaxed);
+        PARTIAL[2].fetch_add(count as u64 - detiled, Relaxed);
+        PARTIAL[3].fetch_add((size - taken.min(size)) as u64, Relaxed);
+        if n.is_power_of_two() {
+            tracing::info!(
+                refreshes = n,
+                parts_detiled = PARTIAL[1].load(Relaxed),
+                parts_left = PARTIAL[2].load(Relaxed),
+                mb_not_read = PARTIAL[3].load(Relaxed) >> 20,
+                differing = PARTIAL[4].load(Relaxed),
+                "textures detiled in part (VICTORY_PARTIAL_DETILE)"
+            );
+        }
+        taken
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.detile_parts(tiled, u64::MAX);
+    }
+
+    /// Detiles the parts `only` (a bit a footprint; `u64::MAX`: all) of
+    /// `tiled` into the staging buffer.
+    fn detile_parts(&self, tiled: &[u8], only: u64) {
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1580,7 +1777,7 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if only == u64::MAX && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -1588,6 +1785,9 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            if only != u64::MAX && (i >= 64 || only >> i & 1 == 0) {
+                continue;
+            }
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
@@ -2008,6 +2208,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        pending: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
@@ -2017,6 +2218,131 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod partial_detile_tests {
+    use super::parts_written;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// Every part of the texture detiled from `tiled`, rows `pitch(part)`
+    /// apart; with `only`, just those parts, into what `linear` holds.
+    fn detile(layout: &Layout, mips: u32, tiled: &[u8], linear: &mut [Vec<u8>], only: u64) {
+        for (i, out) in linear.iter_mut().enumerate() {
+            if only >> i & 1 == 0 {
+                continue;
+            }
+            let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+            let m = layout.mips[mip as usize];
+            let pitch = (m.width as usize * layout.desc.element_bytes as usize).next_multiple_of(256);
+            out.resize(pitch * m.height as usize, 0);
+            layout.detile(tiled, mip, slice, out, pitch, pitch * m.height as usize).expect("detiled");
+        }
+    }
+
+    /// After writes to some pages of a texture's memory, detiling only the
+    /// parts those pages reach, each from its own span of the memory with
+    /// everything else unreadable, leaves the same bytes as detiling the
+    /// whole texture: in every swizzle mode, with levels in a tail, array
+    /// slices, and memory that does not begin on a page.
+    #[test]
+    fn parts_detiled_alone_equal_the_whole_texture_detiled() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut skipped = 0u32;
+        let mut cases = 0u32;
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            for (width, height, mips, bytes, block, slices) in
+                [(1024, 1024, 11, 16, 4, 1), (512, 256, 10, 8, 4, 6), (256, 256, 9, 4, 1, 2), (640, 360, 1, 4, 1, 1), (2048, 2048, 12, 16, 4, 1)]
+            {
+                let desc = Desc {
+                    dimension: Dimension::Tex2d,
+                    width,
+                    height,
+                    depth: slices,
+                    mips,
+                    element_bytes: bytes,
+                    block,
+                    samples: 1,
+                    swizzle,
+                };
+                let Ok(layout) = Layout::new(&desc) else { continue };
+                if !layout.addressable() {
+                    continue;
+                }
+                cases += 1;
+                let parts = (mips * slices) as usize;
+                let size = layout.size as usize;
+                let start = 0x7_0000 + (next() as usize % 4096 & !0xff);
+                let mut tiled: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+                let mut kept = vec![Vec::new(); parts];
+                detile(&layout, mips, &tiled, &mut kept, u64::MAX);
+                for round in 0..24 {
+                    // A write of a few bytes to a megabyte, somewhere.
+                    let len = 1 + next() as usize % if round % 3 == 0 { 1 << 20 } else { 3000 };
+                    let at = next() as usize % size;
+                    let end = (at + len).min(size);
+                    for b in &mut tiled[at..end] {
+                        *b = next() as u8;
+                    }
+                    let pages = (start + at) >> 12..=(start + end - 1) >> 12;
+                    let written = parts_written(&layout, 0, mips, parts, start, pages).expect("told part by part");
+                    // Only the spans of those parts can be read.
+                    let mut read = vec![0xeeu8; size];
+                    for i in (0..parts).filter(|&i| written >> i & 1 != 0) {
+                        let (from, to) = layout.subresource_span(i as u32 % mips, i as u32 / mips).expect("a span");
+                        read[from as usize..to as usize].copy_from_slice(&tiled[from as usize..to as usize]);
+                    }
+                    detile(&layout, mips, &read, &mut kept, written);
+                    let mut whole = vec![Vec::new(); parts];
+                    detile(&layout, mips, &tiled, &mut whole, u64::MAX);
+                    assert!(kept == whole, "{swizzle:?} {width}x{height} round {round}: write at {at:#x}+{len:#x}, parts {written:#x}");
+                    skipped += parts as u32 - written.count_ones();
+                }
+            }
+        }
+        assert!(cases >= 10, "layouts tried: {cases}");
+        assert!(skipped > 100, "parts left alone: {skipped}");
+    }
+
+    /// What cannot be told part by part is not: more than 64 parts, a 3D
+    /// texture, no levels.
+    #[test]
+    fn textures_that_cannot_be_told_part_by_part_are_taken_whole() {
+        let desc = |dimension, depth, mips| Desc {
+            dimension,
+            width: 256,
+            height: 256,
+            depth,
+            mips,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        };
+        let many = Layout::new(&desc(Dimension::Tex2d, 16, 9)).expect("a layout");
+        assert_eq!(parts_written(&many, 0, 9, 144, 0x1_0000, 0x10..0x11), None);
+        assert!(parts_written(&many, 0, 9, 63, 0x1_0000, 0x10..0x11).is_some());
+        assert_eq!(parts_written(&many, 9, 9, 9, 0x1_0000, 0x10..0x11), None);
+        if let Ok(volume) = Layout::new(&desc(Dimension::Tex3d, 16, 5)) {
+            assert_eq!(parts_written(&volume, 0, 5, 5, 0x1_0000, 0x10..0x11), None);
+        }
+        // No page written: no part.
+        assert_eq!(parts_written(&many, 0, 9, 18, 0x1_0000, 0..0), Some(0));
+    }
 }
 
 #[cfg(test)]

@@ -625,6 +625,30 @@ impl Layout {
             .min(self.size)
     }
 
+    /// The bytes of the texture's memory that hold mip `mip` of array slice
+    /// `slice`, as `[from, to)` from the texture's start: every element of
+    /// the subresource lies there, so memory written outside it leaves the
+    /// subresource as it was. The mips of the tail share one span (the
+    /// tail block), the others end where the next larger mip begins (mips
+    /// lie smallest first). `None` where this is not so simple (3D and
+    /// thick layouts, more than one sample) or the subresource does not
+    /// exist: the caller takes the whole texture then.
+    pub fn subresource_span(&self, mip: u32, slice: u32) -> Option<(u64, u64)> {
+        if self.thick || self.desc.dimension == Dimension::Tex3d || self.desc.samples != 1 || slice >= self.slices {
+            return None;
+        }
+        let m = self.mips.get(mip as usize)?;
+        let base = u64::from(slice) * self.slice_size;
+        let (from, to) = if m.tail.is_some() {
+            (0, self.alignment.min(self.slice_size))
+        } else if mip == 0 {
+            (m.offset, self.slice_size)
+        } else {
+            (m.offset, self.mips[mip as usize - 1].offset)
+        };
+        (from < to && to <= self.slice_size).then_some((base + from, base + to))
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
     /// into linear rows: mip `mip` of array slice
@@ -1134,6 +1158,58 @@ mod tests {
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to
     /// address bits 2, 3, 6, 9, 11, 13, 15 and y bits to 4, 5, 7, 8, 10, 12,
     /// 14; a 4 KiB `S` block of 16-byte elements is 16x16 with y first.
+    /// Every element of a subresource lies inside its span, in every
+    /// addressable mode, and the spans of two subresources are the same
+    /// (two mips of one tail) or apart.
+    #[test]
+    fn every_element_lies_in_its_subresources_span() {
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            for (w, h, mips, bpe, slices) in [(256, 256, 9, 16, 1), (300, 130, 6, 4, 3), (1024, 512, 11, 8, 2), (64, 64, 1, 1, 1), (17, 5, 3, 2, 2)] {
+                let mut d = desc(w, h, mips, bpe, swizzle);
+                d.depth = slices;
+                let Ok(layout) = Layout::new(&d) else { continue };
+                if !layout.addressable() {
+                    continue;
+                }
+                let mut spans = Vec::new();
+                for slice in 0..slices {
+                    for mip in 0..mips {
+                        let (from, to) = layout
+                            .subresource_span(mip, slice)
+                            .unwrap_or_else(|| panic!("{swizzle:?} {w}x{h} mip {mip} slice {slice}: a span"));
+                        assert!(to <= layout.size);
+                        let m = layout.mips[mip as usize];
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let at = layout.offset(mip, x, y, slice).unwrap();
+                                assert!(
+                                    from <= at && at + u64::from(bpe) <= to,
+                                    "{swizzle:?} {w}x{h} mip {mip} slice {slice} ({x}, {y}): {at:#x} outside {from:#x}..{to:#x}"
+                                );
+                            }
+                        }
+                        spans.push((from, to));
+                    }
+                }
+                for (i, a) in spans.iter().enumerate() {
+                    for b in &spans[i + 1..] {
+                        assert!(a == b || a.1 <= b.0 || b.1 <= a.0, "{swizzle:?} {w}x{h}: {a:x?} and {b:x?} overlap");
+                    }
+                }
+                assert_eq!(layout.subresource_span(mips, 0), None);
+                assert_eq!(layout.subresource_span(0, slices), None);
+            }
+        }
+    }
+
     #[test]
     fn hand_checked_addresses() {
         let l = Layout::new(&desc(128, 128, 1, 4, Swizzle::SW_64KB_D)).unwrap();
