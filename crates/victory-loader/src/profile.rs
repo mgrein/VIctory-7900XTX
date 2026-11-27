@@ -66,6 +66,24 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
     };
     let start = Instant::now();
     let all: Vec<_> = list.split(';').filter_map(asked).collect();
+    // Windows that overlap: the profiles run one after another, so a later one
+    // begins late or not at all; said so, not left to a short or missing file.
+    let windows: Vec<_> = all.iter().map(|(from, to, ..)| (*from, *to)).collect();
+    for (one, begins) in all.iter().zip(begins(&windows)) {
+        let (from, to, _, file) = one;
+        let (from, to) = (from.as_secs_f64(), to.as_secs_f64());
+        match begins {
+            Some(at) if at > one.0 => eprintln!(
+                "VIctory: VICTORY_PROFILE: {file} asks for {from} to {to} s, but the profile before it ends at {} s: it covers {} to {to} s only (the profiles run one after another)",
+                at.as_secs_f64(),
+                at.as_secs_f64()
+            ),
+            Some(_) => {}
+            None => eprintln!(
+                "VIctory: VICTORY_PROFILE: {file} asks for {from} to {to} s, all of it while a profile before it still runs: it is not made (the profiles run one after another)"
+            ),
+        }
+    }
     std::thread::spawn(move || {
         for one in all {
             profile(one, start, phase);
@@ -73,7 +91,29 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
     });
 }
 
+/// When each window of `VICTORY_PROFILE` (from, to) can begin, the profiles
+/// running one after another in the order given: its own `from`, or the end
+/// of the one before it if that is later; `None` for a window that is over
+/// by then.
+fn begins(windows: &[(Duration, Duration)]) -> Vec<Option<Duration>> {
+    let mut free = Duration::ZERO;
+    windows
+        .iter()
+        .map(|&(from, to)| {
+            let at = from.max(free);
+            (at < to).then(|| {
+                free = to;
+                at
+            })
+        })
+        .collect()
+}
+
 fn profile((from, to, every, file): (Duration, Duration, Duration, String), start: Instant, phase: fn() -> u32) {
+    // A window that is over when its turn comes: no file of no rounds.
+    if start.elapsed() >= to {
+        return;
+    }
     std::thread::sleep(from.saturating_sub(start.elapsed()));
     eprintln!("VIctory: the profile begins");
     let mut threads: HashMap<u32, Thread> = HashMap::new();
@@ -191,5 +231,18 @@ mod tests {
         assert_eq!(asked("a,160,5,x"), None);
         assert_eq!(asked("-1,160,5,x"), None);
         assert_eq!(asked("1,160,0,x"), None);
+    }
+
+    /// `0,60;30,90` gives the second its window from 60 s; `0,60;10,50` gives
+    /// it none; a window that waits for nothing begins at its own time, also
+    /// after one that was not made.
+    #[test]
+    fn a_window_begins_when_the_one_before_it_ends() {
+        let s = Duration::from_secs;
+        assert_eq!(begins(&[(s(0), s(60)), (s(30), s(90))]), [Some(s(0)), Some(s(60))]);
+        assert_eq!(begins(&[(s(0), s(60)), (s(10), s(50)), (s(55), s(70))]), [Some(s(0)), None, Some(s(60))]);
+        assert_eq!(begins(&[(s(5), s(10)), (s(10), s(20)), (s(40), s(50))]), [Some(s(5)), Some(s(10)), Some(s(40))]);
+        assert_eq!(begins(&[(s(100), s(110)), (s(0), s(20))]), [Some(s(100)), None]);
+        assert_eq!(begins(&[]), []);
     }
 }

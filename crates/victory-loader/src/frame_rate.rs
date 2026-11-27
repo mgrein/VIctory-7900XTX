@@ -71,6 +71,14 @@ pub fn title_rate(interval_ms: f64, title_fps: Option<&str>) -> Option<u32> {
     }
 }
 
+/// Whether `VICTORY_TITLE_FPS` says something [`title_rate`] can use: `off`
+/// or a rate from 0 to 1000. Anything else leaves the title as it is, as
+/// `off` does, and the caller says so.
+pub fn title_fps_usable(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec == "off" || spec.parse::<u32>().is_ok_and(|rate| rate <= 1000)
+}
+
 /// The frame time the title derives from a rate, in microseconds, as its
 /// code computes it (single-precision division, truncated).
 pub fn title_frame_us(rate: u32) -> u32 {
@@ -243,6 +251,11 @@ mod tests {
         assert_eq!(title_rate(16.667, Some("off")), None);
         assert_eq!(title_rate(0.0, Some("90")), Some(90));
         assert_eq!(title_rate(0.0, Some("lots")), None);
+        assert!(title_fps_usable(" off ") && title_fps_usable("60") && title_fps_usable("1000"));
+        for typo in ["6o", "60fps", "1200", "-30", ""] {
+            assert!(!title_fps_usable(typo), "{typo}");
+            assert_eq!(title_rate(16.667, Some(typo)), None, "{typo}");
+        }
     }
 
     /// The title's own arithmetic: its 30 is the 33,333 us the log shows,

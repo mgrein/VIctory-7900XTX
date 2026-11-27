@@ -187,8 +187,13 @@ pub fn run(
     // overrides it; `off` leaves the title alone).
     #[cfg(windows)]
     if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
-        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_fps_usable, title_interval_us, title_rate};
         let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        if let Some(spec) = asked.as_deref().filter(|spec| !title_fps_usable(spec)) {
+            eprintln!(
+                "VIctory: VICTORY_TITLE_FPS={spec}: expected `off` or a rate from 0 (no limit) to 1000; the title's own rate is left as it is"
+            );
+        }
         match title_rate(ms, asked.as_deref()) {
             Some(rate) => {
                 let size = image.info().size_of_image as usize;
