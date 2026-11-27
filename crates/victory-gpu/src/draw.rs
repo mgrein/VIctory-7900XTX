@@ -806,6 +806,21 @@ impl TargetSnapshot {
     }
 }
 
+/// `VICTORY_HEAP_RECHECK_EVERY=N` (off by default; try 30): a texture
+/// picked by index whose looks after its upload ([`RECHECK_FRAMES`]) all
+/// found it unchanged is looked at again every N frames from then on,
+/// instead of never again: a title that refills a texture's memory late in
+/// a run, with no view written and nothing mapped, had it shown stale for
+/// good. Each look hashes 48 KiB of the texture's memory. (After
+/// VIctory-DXR f906534f, from RyanCase94's 920423a9, and fxceless
+/// e4245f3c.)
+fn heap_recheck_every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u64| n > 0)
+    })
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -2511,7 +2526,11 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        None => match heap_recheck_every() {
+                            // Past the schedule: every N frames for good.
+                            Some(n) => host.texture_slot_recheck(index, write, frame + n, (at, len), print, looks, uploaded),
+                            None => host.texture_slot_done(index, write, None),
+                        },
                     }
                     continue;
                 }
