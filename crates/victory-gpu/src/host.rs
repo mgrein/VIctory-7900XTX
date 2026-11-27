@@ -4581,6 +4581,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
+    crate::watch::bridged_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
     crate::indirect::line(frames);
@@ -10677,14 +10678,12 @@ impl Meter {
                          hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                     );
                 }
-                let [through, left, filled, short] =
-                    [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-                if through + left + filled > 0.0 {
+                let [left, waited] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if left + waited > 0.0 {
                     tracing::info!(
-                        "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                         {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
-                         {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
-                         with less than was mapped (looked at again)"
+                        "texture refreshes that found title memory being remapped, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                         {left:.1} kept the picture they had for the next refresh, {waited:.1} waited (nothing kept yet, or \
+                         kept at the refresh before)"
                     );
                 }
             }
@@ -10751,6 +10750,12 @@ impl Meter {
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                if crate::resource::EVICTIONS.load(Ordering::Relaxed) != 0 {
+                    tracing::info!(
+                        "host copies of textures let go as uploads were refused for room (VICTORY_TEXTURE_EVICT_FRAMES), since the start: {}",
+                        crate::resource::EVICTIONS.load(Ordering::Relaxed)
+                    );
+                }
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
                 }

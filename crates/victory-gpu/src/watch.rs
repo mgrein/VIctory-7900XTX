@@ -1833,6 +1833,17 @@ pub(crate) fn port_guard_line(frames: f64) {
     );
 }
 
+/// The line of runs guarded across clean blocks ([`batch_guards`]), per
+/// frame.
+pub(crate) fn bridged_line(frames: f64) {
+    let [runs, blocks] = BRIDGED.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if batch_guards() {
+        tracing::info!(
+            "guarded runs that went on across clean blocks per frame (VICTORY_BATCH_GUARDS=1): {runs:.1} (a VirtualProtect saved each), {blocks:.1} clean blocks bridged"
+        );
+    }
+}
+
 /// The blocks known to be view memory (renderer port #6): guarded by us
 /// once, or found a view by [`guard`]. The kernel refuses to ask about them
 /// (its write watch is not kept for views), and with the switch such a
@@ -2605,6 +2616,22 @@ impl Guards {
         self.kernel.iter().chain(&self.changing).any(|&(first, last)| (first..last).contains(&block))
     }
 
+    /// Whether a refresh that finds view block `block` written makes it
+    /// read-only in a run ([`guard`]).
+    fn would_guard(&self, block: usize, rest: std::time::Duration) -> bool {
+        !self.protected.contains(block) && !self.foreign.contains(&block) && !self.left_alone(block) && !self.rests(block, rest)
+    }
+
+    /// Whether a run may go on across block `block` ([`batch_guards`]): it
+    /// is read-only by our hand, clean, there, and nothing else has it.
+    fn bridgeable(&self, block: usize) -> bool {
+        self.clean.contains(block)
+            && self.protected.contains(block)
+            && !self.absent.contains(block)
+            && !BESIDE.any(block, block + 1)
+            && !self.left_alone(block)
+    }
+
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
         if rest.is_zero() {
@@ -2977,16 +3004,32 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
     let mut run: Option<(usize, usize)> = None;
+    // Held while a run bridges clean blocks ([`batch_guards`]).
+    let mut mapping: Option<Reading> = None;
     for &block in &written {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&g, from, to);
-            run = None;
-            // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
-            drop(g);
-            g = guards_timed();
+            if batch_guards()
+                && block - to <= BRIDGE
+                && g.would_guard(block, rest)
+                && (to..block).all(|gap| g.bridgeable(gap))
+                && (mapping.is_some() || {
+                    mapping = title_memory_reading_now();
+                    mapping.is_some()
+                })
+            {
+                // One call for the run and the clean blocks in its way.
+                note_bridge(block - to);
+            } else {
+                protect(&g, from, to);
+                run = None;
+                mapping = None;
+                // Faults of the title's wait for the lock: each block is done
+                // on its own, and looked at anew below.
+                drop(g);
+                g = guards_timed();
+            }
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -3014,6 +3057,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if let Some((from, to)) = run {
         protect(&g, from, to);
     }
+    drop(mapping);
     drop(g);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
@@ -3046,12 +3090,29 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
     }
     let mut run: Option<(usize, usize)> = None;
+    // The claims of the clean blocks a run bridges, and what it holds
+    // meanwhile ([`batch_guards`]).
+    let mut gaps = Claims::none();
+    let mut mapping: Option<Reading> = None;
     for &block in &written {
         if let Some((from, to)) = run
             && to != block
         {
-            protect_claimed(&g, from, to);
-            run = None;
+            if batch_guards()
+                && block - to <= BRIDGE
+                && g.would_guard(block, rest)
+                && (mapping.is_some() || {
+                    mapping = title_memory_reading_now();
+                    mapping.is_some()
+                })
+                && claim_gap(&g, &mut gaps, to, block)
+            {
+                note_bridge(block - to);
+            } else {
+                protect_claimed_bridged(&g, from, to, std::mem::replace(&mut gaps, Claims::none()));
+                run = None;
+                mapping = None;
+            }
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -3059,7 +3120,8 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         }
         if g.protected.contains(block) {
             if let Some((from, to)) = run.take() {
-                protect_claimed(&g, from, to);
+                protect_claimed_bridged(&g, from, to, std::mem::replace(&mut gaps, Claims::none()));
+                mapping = None;
             }
             if g.clean.contains(block) {
                 continue;
@@ -3072,12 +3134,14 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect_claimed(&g, from, to);
+            protect_claimed_bridged(&g, from, to, std::mem::replace(&mut gaps, Claims::none()));
+            mapping = None;
         }
     }
     if let Some((from, to)) = run {
-        protect_claimed(&g, from, to);
+        protect_claimed_bridged(&g, from, to, gaps);
     }
+    drop(mapping);
     drop(g);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
@@ -3086,12 +3150,14 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
 
 /// [`protect`] of `[from, to)` with the lock shared: of the blocks whose
 /// claims can be had now, each run, its other views' blocks only where their
-/// claims can be had too.
-fn protect_claimed(g: &Guards, from: usize, to: usize) {
-    let mut claims = Claims::none();
+/// claims can be had too. `gaps` holds the claims of the clean blocks inside
+/// `[from, to)` that the run bridges ([`claim_gap`]).
+fn protect_claimed_bridged(g: &Guards, from: usize, to: usize, gaps: Claims) {
+    let bridged = gaps.0.clone();
+    let mut claims = gaps;
     let mut start = None;
     for block in from..to {
-        if claims.try_one(block) {
+        if bridged.contains(&block) || claims.try_one(block) {
             start.get_or_insert(block);
         } else if let Some(s) = start.take() {
             protect_run(g, s, block, &mut claims);
@@ -3164,6 +3230,47 @@ fn protect(g: &Guards, from: usize, to: usize) {
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
     protect_here(g, from, to);
     cover(g, from, to, None);
+}
+
+/// Whether a run of blocks a refresh guards goes on across a few clean
+/// blocks between it and the next written one, so that one `VirtualProtect`
+/// does both (`VICTORY_BATCH_GUARDS=1`; off by default). The blocks between
+/// are read-only by our hand already and clean, and made so again, which
+/// changes nothing for them; it is done only while the runtime changes no
+/// mapping (`title_memory_reading_now`, which never waits), so that the
+/// blocks between still show the pages they were guarded with. With the
+/// shared lock (renderer port #6) their claims are held from the look to
+/// the protection, so that no fault opens one in between.
+fn batch_guards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_GUARDS").is_some_and(|v| v == "1"))
+}
+
+/// The most clean blocks a run bridges at once ([`batch_guards`]).
+const BRIDGE: usize = 4;
+
+/// Since the last line ([`batch_guards`]): runs that went on across clean
+/// blocks (a `VirtualProtect` saved each), and the clean blocks.
+pub(crate) static BRIDGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn note_bridge(blocks: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BRIDGED[0].fetch_add(1, Relaxed);
+    BRIDGED[1].fetch_add(blocks as u64, Relaxed);
+}
+
+/// With the lock shared: the claims of the blocks `[from, to)` into `gaps`
+/// if all can be had now and each, looked at again with its claim, may be
+/// bridged ([`Guards::bridgeable`]). If not, none is added.
+fn claim_gap(g: &Guards, gaps: &mut Claims, from: usize, to: usize) -> bool {
+    let mut these = Claims::none();
+    for block in from..to {
+        if !g.bridgeable(block) || !these.try_one(block) || !g.bridgeable(block) {
+            return false;
+        }
+    }
+    gaps.0.append(&mut these.0);
+    true
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -3673,22 +3780,6 @@ pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> boo
         }
     }
     false
-}
-
-/// Returns when the change of a mapping that is under way, if one is, is
-/// over (or has been going on for 2 ms): pages it took away for its moment
-/// are back. Another may have begun.
-pub(crate) fn change_over() {
-    let now = changes();
-    if now.is_multiple_of(2) {
-        return;
-    }
-    let started = std::time::Instant::now();
-    while changes() == now && started.elapsed().as_millis() < 2 {
-        for _ in 0..50 {
-            std::hint::spin_loop();
-        }
-    }
 }
 
 /// [`changes`], when no change is under way (or one has been for a second).

@@ -1934,6 +1934,15 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    texture_headroom(memory) != 0
+}
+
+/// The bytes of host copies of textures the title fills that [`room`] lets
+/// be made now: none when it says no. Levels given tiles one group at a
+/// time (`VICTORY_TEXTURE_LEVEL_BUDGET=1`, `crate::tiles`) get only as many
+/// as fit in it.
+#[cfg(windows)]
+pub(crate) fn texture_headroom(memory: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1945,22 +1954,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return limit.saturating_sub(filled);
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
+    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget)).saturating_sub(filled);
     match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let held = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            floor.max((budget / 100 * room_percent()).saturating_sub(held))
         }
-        None => filled < WITHOUT_BUDGET,
+        None => floor.max(WITHOUT_BUDGET.saturating_sub(filled)),
     }
 }
 
@@ -2288,7 +2296,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
+    let (mut idle_ms, mut most) = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2297,6 +2305,11 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    let mut idle_frames = IDLE_FRAMES;
+    let pressed = take_pressure();
+    if let Some(frames) = pressed {
+        (idle_ms, idle_frames, most) = pressure_sweep(memory, idle_ms, frames, most);
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2308,7 +2321,7 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && sweeps(r) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0 && sweeps(r) && crate::host::long_ago(used, idle_ms, idle_frames) {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
@@ -2341,7 +2354,7 @@ pub(crate) fn let_go_idle() {
         }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
-        let Some(gone) = (unsafe { let_go_one(at, idle_ms, IDLE_FRAMES) }) else {
+        let Some(gone) = (unsafe { let_go_one(at, idle_ms, idle_frames) }) else {
             continue;
         };
         went += 1;
@@ -2429,10 +2442,14 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    if pressed.is_some() {
+        EVICTIONS.fetch_add(went, Relaxed);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep{}: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                if pressed.is_some() { " (uploads refused for room)" } else { "" },
                 bytes >> 10,
                 first.unwrap_or(0)
             )
@@ -2489,6 +2506,74 @@ fn sweeps(r: &Resource) -> bool {
         || (r.desc.dimension != BUFFER
             && r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
             && *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_TARGET_SWEEP").is_none_or(|v| v != "0")))
+}
+
+/// Whether uploads of textures were refused for want of card room since
+/// the last sweep ([`uploads_refused`]); only with
+/// `VICTORY_TEXTURE_EVICT_FRAMES` set.
+#[cfg(windows)]
+static PRESSURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Since the start: host copies let go by sweeps that uploads refused for
+/// room asked for ([`pressure_sweep`]).
+#[cfg(windows)]
+pub(crate) static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The frames a host copy of a texture the title fills must have gone
+/// unused before a sweep that refused uploads ask for lets it go
+/// (`VICTORY_TEXTURE_EVICT_FRAMES=N`; 0, the default: off, the sweep keeps
+/// its own pace, [`crate::host::vram_keep`]).
+#[cfg(windows)]
+fn evict_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_EVICT_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// `count` uploads of textures picked by index (or held levels of textures
+/// made level by level) were refused for want of card room: with
+/// `VICTORY_TEXTURE_EVICT_FRAMES` set the next sweep ([`let_go_idle`])
+/// frees unbound host copies until there is room for them.
+#[cfg(windows)]
+pub(crate) fn uploads_refused(count: u64) {
+    if count != 0 && evict_frames() != 0 {
+        PRESSURE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The frames of [`evict_frames`] if uploads were refused since the last
+/// look.
+#[cfg(windows)]
+fn take_pressure() -> Option<u64> {
+    let frames = evict_frames();
+    (frames != 0 && PRESSURE.swap(false, std::sync::atomic::Ordering::Relaxed)).then_some(frames)
+}
+
+/// How a sweep that refused uploads ask for looks ([`let_go_idle`]): the
+/// idle milliseconds, frames and the most bytes it lets go, from the
+/// sweep's own `idle_ms` and `most`. A copy unused for `frames` frames may
+/// go, but never one used within the last second: [`host_resource`] hands
+/// out the host texture without holding it, and that time is what protects
+/// a thread that has not yet recorded its use. It lets go of as much as
+/// brings the card under the line host copies are made up to ([`room`]),
+/// and a margin, longest idle first; never less than the sweep would.
+#[cfg(windows)]
+fn pressure_sweep(memory: Option<[u64; 4]>, idle_ms: u64, frames: u64, most: u64) -> (u64, u64, u64) {
+    const EVICT_MS: u64 = 1_000;
+    const MARGIN: u64 = 64 << 20;
+    let over = match memory {
+        Some([budget, used, ..]) => {
+            let held = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            held.saturating_sub(budget / 100 * room_percent())
+        }
+        None => 0,
+    };
+    let want = over + MARGIN;
+    let most = if most == u64::MAX { want } else { most.max(want) };
+    (idle_ms.min(EVICT_MS), frames, most)
 }
 
 /// For [`let_go_idle`]: lets go of the host copy of title texture `at` if it
@@ -3015,12 +3100,21 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let memory_now = crate::host::host().and_then(|h| h.video_memory());
+        let bytes = if crate::tiles::level_budget() {
+            texture_headroom(memory_now)
+        } else if room(memory_now) {
+            u64::MAX
+        } else {
+            0
+        };
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, bytes);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            uploads_refused(1);
         }
         waiting
     }
@@ -4026,6 +4120,22 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_sweep_for_refused_uploads_frees_toward_room_after_a_second_at_least() {
+        const MARGIN: u64 = 64 << 20;
+        // Without a budget: the margin, and the second that protects
+        // handed-out host textures.
+        assert_eq!(pressure_sweep(None, 600_000, 3, u64::MAX), (1_000, 3, MARGIN));
+        // Never more eager in time, nor less in bytes, than the sweep.
+        assert_eq!(pressure_sweep(None, 500, 3, 1 << 30), (500, 3, 1 << 30));
+        // Over the line: at least what brings the card under it.
+        let budget = 10_000u64 << 20;
+        let over = budget / 100 * room_percent() + (300 << 20);
+        let (_, _, most) = pressure_sweep(Some([budget, over, 0, 0]), 5_000, 3, u64::MAX);
+        assert!(most >= ((300 << 20) + MARGIN).saturating_sub(crate::pool::texture_room()), "{most}");
     }
 
     #[test]
