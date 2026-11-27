@@ -3116,11 +3116,63 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+///
+/// With [`settle_room`] the number is doubled.
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        let most: usize =
+            std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1);
+        if settle_room() { most.saturating_mul(2) } else { most }
     })
+}
+
+/// More room before the flights are settled (`VICTORY_SETTLE_ROOM=1`; off
+/// by default): twice the host lists in the air ([`late_most`]) and eight
+/// times the changed runs of title bytes put in under the flights' writes
+/// ([`merge_runs`]), each of which is otherwise a settle: a wait for the
+/// card on the submitting thread. The lists in the air hold their dynamic
+/// descriptor slots, upload memory and scratch chunks that much longer
+/// (watch "tables asked, N refused"). fxceless/victory-fork 06702fe8
+/// measured the submitting thread's waits from 17.7 to 4.6 ms a frame.
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v != "0"))
+}
+
+/// The most changed runs of title bytes one submission puts in under the
+/// flights' writes ([`stale_under_flights`]) before it settles instead:
+/// `VICTORY_MERGE_RUNS=<n>` (unset: 512, and 4096 with [`card_steps`]),
+/// times eight with [`settle_room`] (fxceless/victory-fork 06702fe8).
+fn merge_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        let set = std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        merge_runs_for(set, card_steps::stage() > 0, settle_room())
+    })
+}
+
+/// [`merge_runs`] for a value set, with [`card_steps`] or not, with
+/// [`settle_room`] or not.
+fn merge_runs_for(set: Option<usize>, card_steps: bool, room: bool) -> usize {
+    let runs = set.filter(|n| *n > 0).unwrap_or(if card_steps { 4096 } else { 512 });
+    if room { runs.saturating_mul(8) } else { runs }
+}
+
+#[cfg(test)]
+mod merge_runs_tests {
+    /// Unset: the numbers there were; a value set replaces them; the room
+    /// is eight times either.
+    #[test]
+    fn the_runs_put_in_under_flights_are_as_before_unless_asked() {
+        use super::merge_runs_for;
+        assert_eq!(merge_runs_for(None, false, false), 512);
+        assert_eq!(merge_runs_for(None, true, false), 4096);
+        assert_eq!(merge_runs_for(Some(0), true, false), 4096);
+        assert_eq!(merge_runs_for(Some(2000), true, false), 2000);
+        assert_eq!(merge_runs_for(None, true, true), 32768);
+        assert_eq!(merge_runs_for(Some(100), false, true), 800);
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3634,7 +3686,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
