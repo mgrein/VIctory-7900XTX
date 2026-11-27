@@ -448,6 +448,43 @@ impl Drop for State {
     }
 }
 
+/// The time the passes making textures picked by index ready may take
+/// ([`State::heap_textures`]): whether it is a slice of each frame that the
+/// recording threads' passes share (`VICTORY_TEXTURE_STAGE_PER_FRAME`, on
+/// unless `0`), and how long it is (`VICTORY_TEXTURE_STAGE_MS`: 6 ms a frame
+/// shared, 250 ms a pass otherwise).
+fn stage_span() -> (bool, std::time::Duration) {
+    static SPAN: std::sync::OnceLock<(bool, std::time::Duration)> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        let shared = std::env::var_os("VICTORY_TEXTURE_STAGE_PER_FRAME").is_none_or(|v| v != "0");
+        let ms = std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (shared, std::time::Duration::from_millis(ms.unwrap_or(if shared { 6 } else { 250 })))
+    })
+}
+
+/// The frame the shared texture slice was last spent in, and how much of it
+/// was ([`stage_span`]).
+static FRAME_SLICE: std::sync::Mutex<(u64, std::time::Duration)> =
+    std::sync::Mutex::new((0, std::time::Duration::ZERO));
+
+/// What is left of frame `frame`'s slice of `span` (`budget`: the frame it
+/// was last spent in and how much), starting it afresh in a new frame;
+/// `None` if nothing is, or `budget` is of a later frame.
+fn slice_left(
+    budget: &mut (u64, std::time::Duration),
+    frame: u64,
+    span: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if budget.0 > frame {
+        return None;
+    }
+    if budget.0 != frame {
+        *budget = (frame, std::time::Duration::ZERO);
+    }
+    let left = span.saturating_sub(budget.1);
+    (!left.is_zero()).then_some(left)
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -572,9 +609,12 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
-/// the spans and refreshes of their copies, the texture side.
+/// the spans and refreshes of their copies, the texture side; then of the
+/// first, waiting for the heap's sweep lock; and of every pass making
+/// textures picked by index ready (early ones too), the queue's upkeep up
+/// to the due slots, and making those ready.
 #[cfg(feature = "diagnostics")]
-pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static HEAP_SPLIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -862,6 +902,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    HEAP_SPLIT[3].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
@@ -1525,29 +1567,9 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a root SRV it reads
-    /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        let l = &list.list;
-        // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
-        if crate::host::walls_trace() {
-            self.walls_census(p, compute);
-        }
-        // A list without a view heap: one of the title's for the views the
-        // host itself puts into heap slots.
-        if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
-            && let Some(heap) = crate::descriptor::lent_heap()
-        {
-            once!("a dispatch without a view heap that needs one gets the title's");
-            self.heaps[0] = heap;
-        }
+    /// Sets the list's heaps on the host list if they changed since they
+    /// were last set there.
+    fn bind_heaps(&mut self, list: &HostList) {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
         // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
@@ -1587,12 +1609,68 @@ impl State {
             }
             if !heaps.is_empty() {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { list.list.SetDescriptorHeaps(&heaps) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// A dynamic slot of the bound view heap made the view `view`, for a
+    /// UAV clear of the title's slot `gpu` (which must name the same view):
+    /// D3D12 reads the shader-visible descriptor when the clear runs, so the
+    /// copy stays the recording's until it retires. Also gives the CPU-only
+    /// descriptor of the view (this thread's staging slot, valid until it
+    /// next makes a view) and the host resource it views. Binds the heaps.
+    #[cfg(windows)]
+    pub(crate) fn clear_slot(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        view: &View,
+    ) -> Option<(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        let address = self.heaps[0];
+        if address == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(address as This);
+        let index = heap.index(gpu)?;
+        if heap.handle(index)? != gpu || crate::descriptor::view(gpu).as_ref() != Some(view) {
+            return None;
+        }
+        let host = heap.host()?;
+        let slot = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        let (cpu, resource) = host.make_for_clear(slot, view)?;
+        self.bind_heaps(list);
+        Some((host.gpu_handle(slot), cpu, resource))
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a root SRV it reads
+    /// could not be given a view.
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let l = &list.list;
+        // Textures picked by index, before anything asks for them.
+        self.early_textures(list, p, compute);
+        if crate::host::walls_trace() {
+            self.walls_census(p, compute);
+        }
+        // A list without a view heap: one of the title's for the views the
+        // host itself puts into heap slots.
+        if self.heaps[0] == 0
+            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
+            && let Some(heap) = crate::descriptor::lent_heap()
+        {
+            once!("a dispatch without a view heap that needs one gets the title's");
+            self.heaps[0] = heap;
+        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2261,6 +2339,8 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let pass_began = std::time::Instant::now();
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2335,6 +2415,12 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        let queued = {
+            let now = std::time::Instant::now();
+            HEAP_SPLIT[4].fetch_add((now - pass_began).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2366,14 +2452,20 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
+        // Also within a time per frame: the pass runs on a thread that
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        // It was 250 ms a pass (750 while a backlog drains), and with
+        // thousands of slots due a pass could take all of it in every frame
+        // of the world: a frame could not be shorter. A game streams its
+        // textures in a slice of each frame: `VICTORY_TEXTURE_STAGE_MS` (6)
+        // is that slice, shared by the recording threads' passes, three
+        // times as long while a backlog drains.
+        // `VICTORY_TEXTURE_STAGE_PER_FRAME=0`: a budget per pass, 250 ms
+        // unless `VICTORY_TEXTURE_STAGE_MS` is set, as before. Early passes
+        // keep their own budgets.
+        let (shared, span) = stage_span();
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
@@ -2383,9 +2475,25 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
+        let mut slice = None;
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+            }
+            None if shared => {
+                // The slice is the frame's, not the pass's: a pass while
+                // another thread's runs leaves its slots due (no recording
+                // thread waits on another).
+                let mut budget = match FRAME_SLICE.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                };
+                let Some(remaining) = slice_left(&mut budget, frame, span) else {
+                    return;
+                };
+                slice = Some(budget);
+                (remaining, per_frame)
             }
             None => (span, per_frame),
         };
@@ -2756,6 +2864,11 @@ impl State {
         if baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
+        if let Some(mut budget) = slice {
+            budget.1 += began.elapsed();
+        }
+        #[cfg(feature = "diagnostics")]
+        HEAP_SPLIT[5].fetch_add(queued.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -4798,6 +4911,23 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn texture_slice_is_shared_within_a_frame_and_renewed_by_the_next() {
+        use super::slice_left;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut budget = (0, Duration::ZERO);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), Some(ms(6)));
+        budget.1 += ms(4);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), Some(ms(2)));
+        budget.1 += ms(3);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), None);
+        // A pass of an earlier frame, late: nothing.
+        assert_eq!(slice_left(&mut budget, 4, ms(6)), None);
+        assert_eq!(slice_left(&mut budget, 6, ms(18)), Some(ms(18)));
+        assert_eq!(budget, (6, Duration::ZERO));
     }
 }
 

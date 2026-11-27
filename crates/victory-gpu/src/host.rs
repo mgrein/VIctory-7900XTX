@@ -4323,13 +4323,17 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    crate::indirect::line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, unwatched, unasked, capped, unsnapped] =
+            crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; given up, the flights waited for instead: {unwatched:.1} copies not \
+             write-watched, {unasked:.1} ranges the journal did not answer, {capped:.1} over the cap of changed runs, \
+             {unsnapped:.1} copies with no snapshot",
             bytes / (1 << 20) as f64
         );
         let u = crate::shadow::under_stats().map(|n| n as f64 / frames);
@@ -8728,12 +8732,17 @@ fn split_line(frames: f64) {
         s[3],
     );
     tracing::info!(
-        "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
-         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
+        "the pass over the heap's views per frame: {:.1} ms looking at slots ({:.1} of it waiting for the sweep lock), {:.1} their \
+         copies' spans and refreshes, {:.1} textures; the first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for \
+         at the lists' close; every pass making textures picked by index ready (early ones too): {:.1} ms the queue's upkeep, {:.1} \
+         making the due slots ready",
         h[0],
+        h[3],
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+        h[4],
+        h[5],
     );
 }
 

@@ -21,6 +21,8 @@ use crate::resource::PAGEABLE_IIDS;
 #[cfg(windows)]
 pub(crate) mod thin;
 #[cfg(windows)]
+mod uav_clear;
+#[cfg(windows)]
 pub(crate) mod warm;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
@@ -798,8 +800,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
     let _ = thin;
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
-            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
-            (false, false) => Object::new(&LIST_FUNCTIONS),
+            (newer, false) => Object::new(list_functions(newer)),
             #[cfg(windows)]
             (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
             #[cfg(windows)]
@@ -2644,6 +2645,20 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+/// The same with the UAV clears (`uav_clear`).
+#[cfg(windows)]
+static CLEAR_LIST_FUNCTIONS: Table<160> = Table(uav_clear::with_clears(list_table(false)));
+#[cfg(windows)]
+static NEWER_CLEAR_LIST_FUNCTIONS: Table<160> = Table(uav_clear::with_clears(list_table(true)));
+
+/// The table of a list that records as its methods are called.
+fn list_functions(newer: bool) -> &'static Table<160> {
+    #[cfg(windows)]
+    if uav_clear::on() {
+        return if newer { &NEWER_CLEAR_LIST_FUNCTIONS } else { &CLEAR_LIST_FUNCTIONS };
+    }
+    if newer { &NEWER_LIST_FUNCTIONS } else { &LIST_FUNCTIONS }
+}
 /// Of lists whose calls are written down.
 #[cfg(windows)]
 static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
