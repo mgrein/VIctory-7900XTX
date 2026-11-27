@@ -345,12 +345,15 @@ pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
+/// (`VICTORY_INDIRECT_REST=1`; off by default: it takes nothing, runs
+/// empty, and the next one that fits runs). A list whose budget one
+/// oversized record emptied lost all its later draws, and which record
+/// that was could differ from frame to frame (objects far away that come
+/// and go). What a list runs stays bounded by its budget either way: a
+/// record runs only if it fits in what is left. The frame line says how
+/// many records a frame are refused. (After cool_fox f4b48ad7, codec_d.)
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -2753,8 +2756,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
 
     /// A group charges its records in lane order: with 300 left of the
     /// budget, the first draw (100) fits, the second (250) does not and
-    /// takes the rest, and the ones after it run empty. (Racing for the
-    /// word record by record, which of them fitted was up to the GPU.)
+    /// takes the rest (`VICTORY_INDIRECT_REST=1`), and the ones after it run
+    /// empty. (Racing for the word record by record, which of them fitted
+    /// was up to the GPU.)
     #[test]
     fn warp_a_group_charges_its_records_in_lane_order() {
         let Some((left, out)) = four_records_of_a_group(true) else {
@@ -2767,8 +2771,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_eq!(left, 0, "the record that did not fit took the rest");
     }
 
-    /// As above where a record that does not fit takes nothing
-    /// (`VICTORY_INDIRECT_REST=0`): those after it that fit run.
+    /// As above where a record that does not fit takes nothing (as it does
+    /// unless `VICTORY_INDIRECT_REST=1`): those after it that fit run.
     #[test]
     fn warp_a_record_that_does_not_fit_may_take_nothing() {
         let Some((left, out)) = four_records_of_a_group(false) else {
@@ -2784,7 +2788,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -3367,10 +3371,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+        // (`rest`: whether one that does not fit takes what is left.)
+        let cases = [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)];
+        for (rest, (times, records, filled)) in [true, false].into_iter().flat_map(|rest| cases.map(|c| (rest, c))) {
+            let source = batch::SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+            let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
@@ -3407,7 +3414,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let asked = (1 << 26) * times * records as u32;
+            let fitted = (1 << 26) * times * filled as u32;
+            assert_eq!(spent, if rest { BUDGET.min(asked) } else { fitted }, "{times} times {records}, rest {rest}");
         }
     }
 
