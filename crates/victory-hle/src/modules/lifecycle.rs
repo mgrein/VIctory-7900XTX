@@ -110,7 +110,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
+    let (ex_style, x, y) = hide(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +137,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, style, ex_style, x, y, width, height);
+    let (ex_style, x, y) = hide(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -147,27 +149,91 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
+/// `VICTORY_HIDDEN_WINDOW=1`: the title's top-level window is made off the
+/// screens (right of the virtual desktop), out of the taskbar and never
+/// activated by a click, for unattended runs on a machine in use. The swap
+/// chain presents to it as usual (it is visible, only not on any screen), so
+/// captures and scripted keys (`VICTORY_KEYS`) work. Off unless set; child
+/// windows are left alone. (VItoriaBr 043a06dd, Martin Hartfelder.)
+fn hide(parent: HWND, ex_style: u32, x: i32, y: i32) -> (u32, i32, i32) {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VICTORY_HIDDEN_WINDOW").is_ok_and(|v| v != "0"));
+    if !*ON || !parent.is_null() {
+        return (ex_style, x, y);
+    }
+    // SAFETY: plain metrics queries.
+    let right = unsafe {
+        wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) + wm::GetSystemMetrics(wm::SM_CXVIRTUALSCREEN)
+    };
+    tracing::info!(x = right + 64, "title window made off the screens (VICTORY_HIDDEN_WINDOW)");
+    (ex_style | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE, right + 64, 0)
+}
+
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
-/// A top-level window larger than the work area is shrunk to fit, keeping
-/// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
-/// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+/// That size is what the picture needs, so it becomes the window's client
+/// area: the frame (title bar, borders) goes around it rather than eating
+/// into it, or the swap chain, which stretches to the client area, squashes
+/// the picture (4 % at 125 % scaling). A top-level window larger than the
+/// work area is shrunk to fit, keeping the client area's proportions, and
+/// centred. `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller limit to the
+/// whole window without changing the title's render targets. (Frame around
+/// the client area: DexNom PR #84.)
+fn fit(
+    parent: HWND,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
+    if !parent.is_null() || width <= 0 || height <= 0 {
+        return (x, y, width, height);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let limit = window_limit();
-    let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    let mut frame = RECT::default();
+    // SAFETY: `frame` is a plain rectangle the call grows by the frame's size.
+    let framed = unsafe { wm::AdjustWindowRectEx(&mut frame, style, 0, ex_style) };
+    let frame = if framed == 0 {
+        (0, 0)
+    } else {
+        (frame.right - frame.left, frame.bottom - frame.top)
+    };
+    if known == 0 {
+        return (x, y, width + frame.0, height + frame.1);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
-    let (w, h) = fitted;
+    let limit = window_limit();
+    let (fits, w, h) = framed_fit(&area, frame, width, height, limit);
+    if fits {
+        return (x, y, w, h);
+    }
+    tracing::info!(width, height, to = ?(w - frame.0, h - frame.1), ?limit, "title window fitted to the screen");
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The outer size of a window whose client area is `width` x `height`
+/// (scaled down, proportions kept, until the window with its `frame` fits
+/// `area`, and `limit` if given), and whether it fitted unscaled.
+fn framed_fit(
+    area: &RECT,
+    frame: (i32, i32),
+    width: i32,
+    height: i32,
+    limit: Option<(i32, i32)>,
+) -> (bool, i32, i32) {
+    let (mut aw, mut ah) = (area.right - area.left, area.bottom - area.top);
+    if let Some((max_width, max_height)) = limit {
+        (aw, ah) = (aw.min(max_width), ah.min(max_height));
+    }
+    let inner = RECT { left: 0, top: 0, right: aw - frame.0, bottom: ah - frame.1 };
+    let (w, h) = fit_into(&inner, width, height);
+    ((w, h) == (width, height), w + frame.0, h + frame.1)
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -189,24 +255,6 @@ fn window_limit() -> Option<(i32, i32)> {
         }
         parsed
     })
-}
-
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
-    let Some((max_width, max_height)) = limit else {
-        return fit_into(area, width, height);
-    };
-    let bounded = RECT {
-        left: 0,
-        top: 0,
-        right: (area.right - area.left).min(max_width),
-        bottom: (area.bottom - area.top).min(max_height),
-    };
-    fit_into(&bounded, width, height)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -472,6 +520,27 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+    }
+
+    /// The outer size [`framed_fit`] gives a window without a frame.
+    fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
+        let (_, w, h) = framed_fit(area, (0, 0), width, height, limit);
+        (w, h)
+    }
+
+    #[test]
+    fn the_frame_goes_around_the_picture_not_into_it() {
+        // 1536x816 is a 1080p work area at 125% scaling; 16x39 an overlapped frame.
+        let area = RECT { left: 0, top: 0, right: 1536, bottom: 816 };
+        let (fits, w, h) = framed_fit(&area, (16, 39), 3840, 2160, None);
+        assert!(!fits);
+        let (cw, ch) = (w - 16, h - 39);
+        assert!(h <= 816 && w <= 1536);
+        assert!(((cw as f64 / ch as f64) - 16.0 / 9.0).abs() < 0.01, "{cw}x{ch}");
+        assert_eq!(framed_fit(&area, (16, 39), 1280, 720, None), (true, 1296, 759));
+        // The limit bounds the whole window, frame included.
+        let (_, w, h) = framed_fit(&area, (16, 39), 3840, 2160, Some((1296, 759)));
+        assert!(w <= 1296 && h <= 759, "{w}x{h}");
     }
 
     #[test]

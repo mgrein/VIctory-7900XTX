@@ -202,6 +202,19 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     Ok(Some((name, display, blobs)))
 }
 
+/// Removes a folder a crash or an older commit left behind. One that cannot go
+/// now (a virus scanner or an indexer holds a file in it) stays for a later
+/// load: it must not cost the title the newest version, which it did when the
+/// error was passed on and the title started without its saved settings.
+/// (fxceless 6a42ed27, VIctory-DXR 71630635.)
+fn remove_leftover(path: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %error, "xgamesave: an old folder could not be removed; kept for now");
+        }
+    }
+}
+
 /// The container's newest readable committed version, if any. Removes what
 /// a crash left: unfinished versions, and versions older than that one.
 /// An unreadable newer folder (a stray, or a broken manifest) is neither
@@ -213,7 +226,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            remove_leftover(&entry.path());
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +244,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            remove_leftover(&dir.join(format!("v{old}")));
         }
         return Ok(Some(Version {
             dir: version,
@@ -1042,6 +1055,29 @@ mod tests {
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
         Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+    }
+
+    /// An older version that cannot be removed (a scanner holds a file in it)
+    /// does not hide the newest one.
+    #[cfg(windows)]
+    #[test]
+    fn an_undeletable_old_version_keeps_the_newest() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(update(root.path(), "one", &[("a", Some("old a"))]), S_OK);
+        assert_eq!(update(root.path(), "two", &[("a", Some("new a"))]), S_OK);
+        let dir = container_dir(root.path(), "Slot");
+        let current = current_named(&dir, "Slot").unwrap().unwrap();
+        let older = dir.join("v1");
+        assert_ne!(current.dir, older);
+        std::fs::create_dir_all(&older).unwrap();
+        let held = older.join("held");
+        std::fs::write(&held, b"x").unwrap();
+        let _lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&held).unwrap();
+        let (display, blobs) = state(root.path()).unwrap();
+        assert_eq!(display, "two");
+        assert_eq!(blobs, vec![("a".to_string(), "new a".to_string())]);
+        assert!(older.exists());
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.

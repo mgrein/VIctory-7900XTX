@@ -268,7 +268,52 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    finest_timer();
     ahead_of_other_programs();
+}
+
+/// Asks for the system's finest timer (0.5 ms on current Windows), finer than
+/// `timeBeginPeriod`'s millisecond: the audio mixer's 4 ms sleeps, frame
+/// pacing and the low-latency sleeps wake closer to when they asked. Windows
+/// keeps the request per process and drops it when the process ends, however
+/// it ends, so nothing is restored by hand. On by default;
+/// `VICTORY_TIMER_FINEST=0`: the millisecond timer only, as before. (Idea from
+/// XCL 9507d054; our own code.)
+#[cfg(windows)]
+fn finest_timer() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    if std::env::var_os("VICTORY_TIMER_FINEST").is_some_and(|v| v == "0") {
+        return;
+    }
+    type Query = unsafe extern "system" fn(*mut u32, *mut u32, *mut u32) -> i32;
+    type Set = unsafe extern "system" fn(u32, u8, *mut u32) -> i32;
+    // SAFETY: lookups in ntdll, always loaded; both functions have had these
+    // signatures (100 ns units) since Windows NT.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return;
+        }
+        let (Some(query), Some(set)) = (
+            GetProcAddress(ntdll, c"NtQueryTimerResolution".as_ptr().cast()),
+            GetProcAddress(ntdll, c"NtSetTimerResolution".as_ptr().cast()),
+        ) else {
+            return;
+        };
+        let query: Query = std::mem::transmute(query);
+        let set: Set = std::mem::transmute(set);
+        let (mut coarsest, mut finest, mut now) = (0u32, 0u32, 0u32);
+        if query(&mut coarsest, &mut finest, &mut now) < 0 || finest == 0 {
+            return;
+        }
+        let status = set(finest, 1, &mut now);
+        tracing::info!(
+            asked_us = finest / 10,
+            now_us = now / 10,
+            ok = status >= 0,
+            "the system timer runs at its finest (VICTORY_TIMER_FINEST=0: 1 ms)"
+        );
+    }
 }
 
 /// The title's streaming thread runs below normal priority (on the console
@@ -292,6 +337,12 @@ fn ahead_of_other_programs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn the_finest_timer_can_be_asked_for() {
+        finest_timer();
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {

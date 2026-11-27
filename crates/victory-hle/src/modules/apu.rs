@@ -12,6 +12,7 @@ use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -127,6 +128,8 @@ pub struct Connection {
     event: HANDLE,
     options: u32,
     per_stream: u32,
+    /// `VICTORY_AV_SYNC`: per stream, when its next packet is due.
+    pace: Mutex<Vec<Option<Instant>>>,
     state: Mutex<State>,
 }
 
@@ -204,6 +207,7 @@ pub extern "system" fn XApuConnect(
         event,
         options: input.options,
         per_stream: input.commands_per_stream,
+        pace: Mutex::new(vec![None; streams]),
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
             queued: vec![0; streams],
@@ -238,6 +242,50 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     S_OK
 }
 
+/// `VICTORY_AV_SYNC` (victory_gpu::frame::av_sync_factor; 1 and nothing
+/// done when off): with the frames this many times slower than the title's
+/// rate, a stream's packets are taken as many times their length apart, the
+/// title's call waiting (at most 150 ms) for its packet's turn. A stream
+/// that is (re)started or reset starts its pacing again. From VItoriaBr PR
+/// #124 (ItzMeGamer).
+fn pace(connection: &Connection, id: CommandId, command: *const CommandId) {
+    let slow = victory_gpu::frame::av_sync_factor();
+    if slow <= 1.0 {
+        // Off, or the frames on time: nothing (an old due time is taken
+        // as at most 200 ms ago below).
+        return;
+    }
+    let kind = id.kind;
+    let mut pace = connection.pace.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(due) = pace.get_mut(id.stream as usize) else {
+        return;
+    };
+    if matches!(kind, ACTIVATE | DEACTIVATE | RESET) {
+        *due = None;
+        return;
+    }
+    if kind != PROCESS {
+        return;
+    }
+    // SAFETY: a process command is this struct.
+    let frames = unsafe { command.cast::<Process>().read_unaligned() }.frame_count;
+    if !(1..=MAX_FRAMES as u32).contains(&frames) {
+        return;
+    }
+    let now = Instant::now();
+    let wait = due
+        .and_then(|due| due.checked_duration_since(now))
+        .map_or(Duration::ZERO, |d| d.min(Duration::from_millis(150)));
+    // Opus runs at 48 kHz. Late by more than 200 ms: start again from now.
+    let packet = Duration::from_micros(u64::from(frames) * 1_000_000 / 48_000);
+    let base = due.unwrap_or(now).max(now.checked_sub(Duration::from_millis(200)).unwrap_or(now));
+    *due = Some(base + packet.mul_f64(slow));
+    drop(pace);
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+}
+
 pub extern "system" fn XApuEnqueueCommand(
     handle: *mut Connection,
     command: *const CommandId,
@@ -248,6 +296,7 @@ pub extern "system" fn XApuEnqueueCommand(
     }
     // SAFETY: a connection from `XApuConnect`; every command starts with an id.
     let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
+    pace(connection, id, command);
     let mut state = lock(connection);
     let stream = id.stream as usize;
     if stream >= state.streams.len() {

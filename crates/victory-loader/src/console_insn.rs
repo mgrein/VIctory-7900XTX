@@ -1,100 +1,72 @@
-//! Instructions the console's CPU (Zen 2) has and an Intel PC's lacks, emulated: the title's
-//! code raises STATUS_ILLEGAL_INSTRUCTION on them (the title zeroes memory with a `clzero` loop at
-//! its first frames), and the vectored handler steps over them here.
+//! Instructions the console's CPU (Zen 2) has and an Intel PC's lacks, replaced in the title's
+//! code the first time they fault, so that they never fault there again: a fault is a trip into
+//! Windows and back through every vectored handler, and the title runs some of them thousands of
+//! times a second (wait loops, `clzero` loops through a frame).
 //!
-//! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! Only replacing is done here. What a fault does when nothing is replaced (the first time, an
+//! instruction in a form not replaced, or with the switches off) is VIctory's own emulation in
+//! `crash.rs` (`emulate_amd_only`), which the vectored handler calls next.
+//!
+//! This fork's own code. (The emulation and decoder this module had before were ported from XCL,
+//! GPL-2.0-only, which cannot be combined with this GPL-3.0-or-later program; fxceless PR #1057
+//! took them out, and so does this.)
 
-#[path = "console_insn_decode.rs"]
-mod decode;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-use decode::ConsoleOnly;
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
-
-const CONTINUE_EXECUTION: i32 = -1;
-
-/// Whether what Windows said about memory is remembered per thread (the regions it found
-/// writable, the code bytes it found readable) and not asked again at every emulated
-/// instruction. A query walks the pages of the region it answers for: asked from outside, it
-/// took 2-9 ms in the title's heaps of 0.6-2.2 GB and 89 ms in its 6.2 GB page pool (run 30),
-/// and the title zeroes blocks of them with `clzero` loops all through a frame: six of its
-/// threads spent 25-78 % of their time inside that query (runs 29 and 30), about 27 s of
-/// processor time in Windows per 9 s frame. On by default; `VICTORY_CLZERO_ASK=1` asks every
-/// time, as before.
-fn remembers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
+/// What is at a faulting address, as far as replacing goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Site {
+    /// `monitorx` (`0f 01 fa`).
+    Monitorx,
+    /// `mwaitx` (`0f 01 fb`).
+    Mwaitx,
+    /// `clzero; add rax, 0x40; cmp rax, reg; jb` (12 bytes from the fault): the `cmp`'s bytes.
+    ClzeroLoop([u8; 3]),
+    /// `mov rax, a; add a, 0x40; clzero; cmp a, b; jb` (15 bytes, the fault 7 into them): the
+    /// `cmp`'s bytes.
+    ClzeroLoop15([u8; 3]),
+    /// A lone `clzero`.
+    Clzero,
+    /// `clwb` of this many bytes.
+    Clwb(usize),
+    /// `rdpru` (`0f 01 fd`).
+    Rdpru,
+    /// Something else.
+    Other,
 }
 
-/// Reads the switches above and below and starts the thread that logs what the handler saw:
-/// called before the vectored handler is installed. The handler runs on a title thread
-/// interrupted anywhere, perhaps inside the process environment lock or a lock the log takes:
-/// it reads no environment variable, waits for no lock and logs nothing itself (it counts in
-/// atomics, which that thread logs from).
+/// Reads the switches below and starts the thread that logs what the handler did: called
+/// before the vectored handler is installed. The handler runs on a title thread interrupted
+/// anywhere, perhaps inside the process environment lock or a lock the log takes: it reads no
+/// environment variable, waits for no lock and logs nothing itself (it counts in atomics, which
+/// that thread logs from).
 pub(crate) fn configure() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = (remembers(), patches_waits(), patches_clzero());
+        let _ = (patches_waits(), patches_clzero(), patches_clzero15(), patches_clwb());
         let _ = std::thread::Builder::new().name("console cpu log".into()).spawn(report);
     });
 }
 
-/// The kinds of [`ConsoleOnly`] as numbers, for what is kept in atomics.
-const KINDS: [&str; 9] = ["ud2", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "extrq/insertq", "rdpid"];
-
-fn kind(what: ConsoleOnly) -> usize {
-    use ConsoleOnly as C;
-    match what {
-        C::Ud2 => 0,
-        C::Clwb => 1,
-        C::Monitorx => 2,
-        C::Mwaitx => 3,
-        C::Clzero => 4,
-        C::ClzeroLoop { .. } => 5,
-        C::Rdpru => 6,
-        C::Extrq { .. } | C::Insertq { .. } => 7,
-        C::Rdpid(_) => 8,
-    }
-}
-
-/// Where each kind faulted first (0: not yet).
-static FIRST: [std::sync::atomic::AtomicUsize; KINDS.len()] = [const { std::sync::atomic::AtomicUsize::new(0) }; KINDS.len()];
-
-/// Logs, outside the handler, each kind of instruction the first time it is emulated, how
-/// often the handler ran at every power of two from 65,536 on, and (diagnostics) the busiest
-/// places every five seconds.
+/// Logs, outside the handler, the places replaced so far at every power of two, and
+/// (diagnostics) the busiest places every five seconds.
 fn report() {
-    let mut logged = [false; KINDS.len()];
-    let mut next_count = 1u64 << 16;
+    let mut next = 1u64;
     #[cfg(feature = "diagnostics")]
     let mut since = std::time::Instant::now();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        for (k, first) in FIRST.iter().enumerate() {
-            let at = first.load(Relaxed);
-            if at != 0 && !logged[k] {
-                logged[k] = true;
-                if k != 0 {
-                    tracing::warn!(
-                        instruction = KINDS[k],
-                        at = format_args!("{at:#x}"),
-                        "a console CPU instruction this CPU lacks: emulated (logged once)"
-                    );
-                }
-            }
-        }
-        let emulated = EMULATED.load(Relaxed);
-        if emulated >= next_count {
-            while next_count <= emulated {
-                next_count <<= 1;
+        let all: u64 = REPLACED.iter().map(|r| r.load(Relaxed)).sum();
+        if all >= next {
+            while next <= all {
+                next <<= 1;
             }
             tracing::info!(
-                emulated,
-                asked = ASKED.load(Relaxed),
-                zeroed_mb = ZEROED.load(Relaxed) >> 20,
-                "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
+                waits = REPLACED[0].load(Relaxed),
+                clzero_loops = REPLACED[1].load(Relaxed),
+                clzero_loops15 = REPLACED[2].load(Relaxed),
+                clwb = REPLACED[3].load(Relaxed),
+                "console CPU instructions replaced in the title's code so far"
             );
         }
         #[cfg(feature = "diagnostics")]
@@ -105,110 +77,46 @@ fn report() {
     }
 }
 
-/// Answers a remembered region gives before Windows is asked about it again: one freed or
-/// protected meanwhile is forgotten then.
-const ANSWERS: u32 = 4096;
-
-thread_local! {
-    /// The regions Windows last said are committed and writable (start, end), newest first,
-    /// and the answers they gave since they were emptied.
-    static WRITABLE: Cell<([(usize, usize); 4], u32)> = const { Cell::new(([(0, 0); 4], 0)) };
-    /// Faulting addresses and the code bytes found readable there, newest first.
-    static CODE: Cell<[(usize, usize); 8]> = const { Cell::new([(0, 0); 8]) };
-}
-
-#[link(name = "ntdll")]
-unsafe extern "system" {
-    fn NtReadVirtualMemory(process: isize, address: *const u8, buffer: *mut u8, size: usize, copied: *mut usize) -> i32;
-    fn NtWriteVirtualMemory(process: isize, address: *mut u8, buffer: *const u8, size: usize, copied: *mut usize) -> i32;
-}
-
-/// Zeroes this process's memory from `at` to `to` through the kernel, which checks the
-/// mapping and its protection as it copies (and, unlike `WriteProcessMemory`, does not make
-/// read-only pages writable for it): memory freed or protected since Windows said it was
-/// writable fails the copy instead of faulting inside the handler. The bytes zeroed from `at`.
-///
-/// A copy that fails forgets the remembered regions ([`writable_to`]). Where the memory is
-/// still there but now read-only (a page the GPU's write watch protected after the region was
-/// remembered), one byte of it is stored to the plain way, once: the watch's guard takes that
-/// fault and opens the page as it does for any of the title's stores (and memory read-only for
-/// another reason faults as the real instruction would), and the copy goes on.
-fn zero(at: usize, to: usize) -> usize {
-    static ZEROES: [u8; 65536] = [0; 65536];
-    let mut done = at;
-    let mut stored = false;
-    while done < to {
-        let n = (to - done).min(ZEROES.len());
-        let mut copied = 0usize;
-        // SAFETY: zeroes of our own for `n` bytes; -1 is the current process; the kernel
-        // checks the destination.
-        let status = unsafe { NtWriteVirtualMemory(-1, done as *mut u8, ZEROES.as_ptr(), n, &mut copied) };
-        if status >= 0 {
-            done += n;
-            continue;
-        }
-        done += copied.min(n);
-        WRITABLE.with(|w| w.set(([(0, 0); 4], 0)));
-        if stored || done >= to || !readable(done, 1) {
-            break;
-        }
-        stored = true;
-        // SAFETY: committed and readable a moment ago, and the byte is one this instruction
-        // zeroes; a store refused there faults as the instruction itself would.
-        unsafe { std::ptr::write_volatile(done as *mut u8, 0) };
-    }
-    done - at
-}
-
-/// Copies up to `out.len()` bytes of this process's memory at `at` into `out` through the
-/// kernel, which checks the mapping as it copies: memory unmapped or protected since it was
-/// looked at fails the copy instead of faulting inside the handler. The bytes copied.
-fn copy_in(at: usize, out: &mut [u8]) -> usize {
-    let mut copied = 0usize;
-    // SAFETY: `out` is ours and as long as asked; -1 is the current process.
-    let status = unsafe { NtReadVirtualMemory(-1, at as *const u8, out.as_mut_ptr(), out.len(), &mut copied) };
-    if status < 0 { copied.min(out.len()) } else { out.len() }
-}
-
-/// The code bytes at `rip` (up to 16) into `out`: those in the faulting instruction's page
-/// (the processor just fetched from it), and those of the next page where Windows says it is
-/// readable (asked once per place, [`remembers`]). Copied through [`copy_in`], never read in
-/// place. The bytes there.
-fn fetch_code(rip: usize, out: &mut [u8; 16]) -> usize {
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
-    let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
-        Some(&(_, n)) => n,
-        None => {
-            let in_page = (4096 - (rip & 4095)).min(16);
-            let n = if in_page < 16 && readable(rip + in_page, 16 - in_page) { 16 } else { in_page };
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
+/// What `code` (the bytes from the fault to the end of its page, at most 32) and the 7 bytes
+/// before it (`None` where they lie in another page) are.
+fn site(before: Option<[u8; 7]>, code: &[u8]) -> Site {
+    match code {
+        [0x0f, 0x01, 0xfa, ..] => Site::Monitorx,
+        [0x0f, 0x01, 0xfb, ..] => Site::Mwaitx,
+        [0x0f, 0x01, 0xfd, ..] => Site::Rdpru,
+        [0x0f, 0x01, 0xfc, rest @ ..] => {
+            // clzero; add rax, 0x40 (48 83 c0 40); cmp rax, reg (REX.W 39, rm rax, reg not
+            // rax); jb back to the clzero (72 f4).
+            if let [0x48, 0x83, 0xc0, 0x40, r @ (0x48 | 0x4c), 0x39, m, 0x72, 0xf4, ..] = *rest
+                && m & 0xc7 == 0xc0
+                && !(r == 0x48 && m == 0xc0)
+            {
+                return Site::ClzeroLoop([r, 0x39, m]);
             }
-            n
+            // mov rax, a (REX.W 89, rm rax); add a, 0x40 (REX.W 83 /0 a, 0x40); clzero;
+            // cmp a, b (REX.W 39, rm a); jb back to the mov (72 f1). `a` and `b` not rax.
+            if let Some([mr @ (0x48 | 0x4c), 0x89, mm, ar @ (0x48 | 0x49), 0x83, am, 0x40]) = before
+                && let [cr @ 0x48..=0x4f, 0x39, cm, 0x72, 0xf1, ..] = *rest
+            {
+                let a = (mm >> 3) & 7 | (mr & 4) << 1;
+                let added = am & 7 | (ar & 1) << 3;
+                let compared = cm & 7 | (cr & 1) << 3;
+                let b = (cm >> 3) & 7 | (cr & 4) << 1;
+                if mm & 0xc7 == 0xc0 && am & 0xf8 == 0xc0 && cm >> 6 == 3 && a == added && a == compared && a != 0 && b != 0 {
+                    return Site::ClzeroLoop15([cr, 0x39, cm]);
+                }
+            }
+            Site::Clzero
         }
-    };
-    let got = copy_in(rip, &mut out[..n]);
-    if got < n && remembers() {
-        // Changed since: asked again at the next fault here.
-        CODE.with(|c| c.set([(0, 0); 8]));
+        _ => crate::crash::clwb_len(code).map_or(Site::Other, Site::Clwb),
     }
-    got
 }
-
-/// Instructions emulated, the times Windows was asked about memory for them, and the bytes
-/// `clzero` loops zeroed, since the start.
-static EMULATED: AtomicU64 = AtomicU64::new(0);
-static ASKED: AtomicU64 = AtomicU64::new(0);
-static ZEROED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `monitorx` and `mwaitx` are replaced in the title's code the first time they fault
 /// (`monitorx` by a 3-byte no-op, `mwaitx` by `pause` and a no-op), so that they never fault
 /// again. Emulated, each pass of such a wait loop is two trips into Windows and back, through
-/// every vectored handler, and no lighter a wait for it: the emulation does no more than
-/// `pause` either, and the loop looks at its value again after it. On by default;
+/// every vectored handler, and no lighter a wait for it: the emulation does no more than yield
+/// either, and the loop looks at its value again after it. On by default;
 /// `VICTORY_PATCH_WAITS=0` emulates each time, as before.
 fn patches_waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -216,22 +124,40 @@ fn patches_waits() -> bool {
 }
 
 /// What replaces the 3 bytes of a wait instruction.
-fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
+fn wait_patch(what: Site) -> Option<[u8; 3]> {
     match what {
-        ConsoleOnly::Monitorx => Some([0x0f, 0x1f, 0x00]),
-        ConsoleOnly::Mwaitx => Some([0xf3, 0x90, 0x90]),
+        Site::Monitorx => Some([0x0f, 0x1f, 0x00]),
+        Site::Mwaitx => Some([0xf3, 0x90, 0x90]),
         _ => None,
     }
 }
 
-/// Whether a `clzero` loop ([`ConsoleOnly::ClzeroLoop`]) is replaced the first time it faults
+/// Whether a `clzero` loop ([`Site::ClzeroLoop`]) is replaced the first time it faults
 /// by a jump to the same loop with plain stores ([`clzero_stub`]). Run cpu-5 (the dorm): 25,000
 /// exceptions a second, 2,100 a frame, at five such loops of one function of the title, for
 /// some kilobytes each; ten times what the wait instructions raised. On by default;
-/// `VICTORY_PATCH_CLZERO=0` emulates each time, as before.
+/// `VICTORY_PATCH_CLZERO=0` emulates each time, as before (and the 15-byte form too).
 fn patches_clzero() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_CLZERO").is_none_or(|v| v != "0"))
+}
+
+/// Whether the 15-byte `clzero` loop ([`Site::ClzeroLoop15`]) is replaced too, by a jump from
+/// its `clzero` to a plain-store line and its own compare and branch ([`clzero_stub15`]).
+/// Emulated, it costs an exception every time the loop is entered (the emulation does the whole
+/// loop in one). On by default (with `VICTORY_PATCH_CLZERO`); `VICTORY_CLZERO_LOOP15=0` leaves
+/// it emulated.
+fn patches_clzero15() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| patches_clzero() && std::env::var_os("VICTORY_CLZERO_LOOP15").is_none_or(|v| v != "0"))
+}
+
+/// Whether a lone `clwb` is replaced by no-ops of its length the first time it faults: the
+/// PC's memory is coherent, it has nothing to do. On by default; `VICTORY_PATCH_CLWB=0` leaves
+/// it emulated.
+fn patches_clwb() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_CLWB").is_none_or(|v| v != "0"))
 }
 
 /// `jmp rel32` at `at` to `to`, if it reaches.
@@ -241,14 +167,10 @@ pub(crate) fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
     Some([0xe9, a, b, c, d])
 }
 
-/// The `clzero` loop of 12 bytes at `at` with plain stores, as code at `stub`: every register
-/// and the flags come out as the loop leaves them. `cmp` is its `cmp rax, reg` (3 bytes, the
-/// register not `rax`), `None` for another form. (The scratch register is saved on the stack
-/// and back before the compare, whose register it may be.)
-fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
-    if !matches!(cmp[0], 0x48 | 0x4c) || cmp[1] != 0x39 || cmp[2] & 0xc7 != 0xc0 || (cmp[0] == 0x48 && cmp[2] == 0xc0) {
-        return None;
-    }
+/// Zeroes the 64-byte line `rax` is in with plain stores; every register comes out as it went
+/// in, the flags do not (the caller compares after). (`rcx` is the scratch register, saved on
+/// the stack and back: Windows x64 code keeps nothing below `rsp`.)
+fn zero_line() -> Vec<u8> {
     let mut code = vec![
         0x51, // push rcx
         0x48, 0x89, 0xc1, // mov rcx, rax
@@ -258,6 +180,17 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
         code.extend([0x48, 0xc7, 0x41, k * 8, 0, 0, 0, 0]); // mov qword [rcx + 8k], 0
     }
     code.push(0x59); // pop rcx
+    code
+}
+
+/// The `clzero` loop of 12 bytes at `at` with plain stores, as code at `stub`: every register
+/// and the flags come out as the loop leaves them. `cmp` is its `cmp rax, reg` (3 bytes, the
+/// register not `rax`), `None` for another form.
+fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
+    if !matches!(cmp[0], 0x48 | 0x4c) || cmp[1] != 0x39 || cmp[2] & 0xc7 != 0xc0 || (cmp[0] == 0x48 && cmp[2] == 0xc0) {
+        return None;
+    }
+    let mut code = zero_line();
     code.extend([0x48, 0x83, 0xc0, 0x40]); // add rax, 0x40
     code.extend(cmp);
     let back = -(code.len() as i64 + 2);
@@ -267,9 +200,27 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
+/// What the `clzero` at `at` of a 15-byte loop jumps to, as code at `stub`: the line, the loop's
+/// own `cmp a, b`, `jb` back to the loop's `mov` 7 bytes before `at`, else on after the loop's
+/// `jb` (8 bytes after `at`). The `mov` and `add` stay in the title's code and run as before.
+fn clzero_stub15(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
+    let mut code = zero_line();
+    code.extend(cmp);
+    // jb rel32 to the loop's top.
+    let from = stub + code.len() + 6;
+    let rel = i32::try_from((at as i64 - 7) - from as i64).ok()?;
+    code.extend([0x0f, 0x82]);
+    code.extend(rel.to_le_bytes());
+    let end = stub + code.len();
+    code.extend(jump(end, at + 8)?);
+    Some(code)
+}
+
 /// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
+/// Where [`STUBS`] is (0: not made yet), read without its lock by [`is_replacement`].
+static STUBS_AT: AtomicUsize = AtomicUsize::new(0);
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
 pub(crate) fn near(at: usize) -> Option<usize> {
@@ -282,18 +233,14 @@ pub(crate) fn near(at: usize) -> Option<usize> {
     })
 }
 
-/// Replaces the `clzero` loop at `at`, whose 12 bytes are `code`: whether it did.
-///
-/// No thread is ever inside the loop's other instructions (the emulation does the whole loop
-/// in one), so the five bytes of the jump may take the place of two of them.
+/// Replaces the 5 bytes at `at`, which are `was`, by a jump to `body` placed near it: whether
+/// it did.
 ///
 /// # Safety
-/// `at` is in the title's code, which stays mapped.
-unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
-    let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
-        return false;
-    };
-    // Never waited for (see `configure`): busy, the loop is emulated this time.
+/// `at` is in the title's code, which stays mapped; `body` does what the code it jumps over did,
+/// and no thread is ever inside those 5 bytes but at their first.
+unsafe fn patch_to_stub(at: usize, was: [u8; 5], body: impl FnOnce(usize) -> Option<Vec<u8>>) -> bool {
+    // Never waited for (see `configure`): busy, the instruction is emulated this time.
     let mut stubs = match STUBS.try_lock() {
         Ok(stubs) => stubs,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -301,12 +248,15 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     };
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
+        if let Some((place, _)) = *stubs {
+            STUBS_AT.store(place, Relaxed);
+        }
     }
     let Some((place, used)) = stubs.as_mut() else {
         return false;
     };
     let stub = *place + *used;
-    let (Some(body), Some(jump)) = (clzero_stub(at, stub, [x, y, z]), jump(at, stub)) else {
+    let (Some(body), Some(jump)) = (body(stub), jump(at, stub)) else {
         return false;
     };
     if *used + body.len() > STUBS_LEN || (at & 15) + 5 > 16 {
@@ -315,8 +265,13 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
-        *used += body.len().next_multiple_of(16);
-        patch(at, [a, b, c, d, e], jump)
+        let done = patch(at, &was, &jump);
+        // A stub nothing jumps to (another thread replaced the code first, with its own stub)
+        // gives its room back; the lock is held, so no other stub was placed after it.
+        if done {
+            *used += body.len().next_multiple_of(16);
+        }
+        done
     }
 }
 
@@ -335,7 +290,7 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
 
 /// One thread at a time changes code: a second one would take the first one's loosened
 /// protection for the page's own. Never waited for (see [`configure`]): a thread that finds it
-/// taken leaves the code as it is and emulates the instruction this time.
+/// taken leaves the code as it is and the instruction is emulated this time.
 static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn patching() -> Option<std::sync::MutexGuard<'static, ()>> {
@@ -346,23 +301,24 @@ fn patching() -> Option<std::sync::MutexGuard<'static, ()>> {
     }
 }
 
-/// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
-/// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
-/// cannot be written).
+/// Replaces the bytes at `at`, which are `was`, by `patch` (as long), in one store that other
+/// threads see whole: whether they are replaced now (not where they cross 16 aligned bytes, or
+/// the page cannot be written).
 ///
 /// # Safety
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
-unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+unsafe fn patch(at: usize, was: &[u8], patch: &[u8]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+    let n = patch.len();
+    if was.len() != n || (at & 15) + n > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
     let Some(_one) = patching() else { return false };
     let word = (at & !15) as *mut u128;
-    let here = (at & 15)..(at & 15) + N;
+    let here = (at & 15)..(at & 15) + n;
     let mut old = 0u32;
     // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code, made
     // writable for the store and put back; the processor has the instruction (asked above).
@@ -378,7 +334,7 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
                 // (Another thread's fault at the same place: done already.)
                 break true;
             }
-            let Some(new) = (bytes == was).then(|| with_patch(now, at, &patch)).flatten() else {
+            let Some(new) = (bytes == was).then(|| with_patch(now, at, patch)).flatten() else {
                 break false;
             };
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
@@ -393,34 +349,126 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
     }
 }
 
+/// Whether the code at `rip` is one of the replacements made here: `0f 1f 00` (for `monitorx`),
+/// `pause; nop` (for `mwaitx`), a run of the no-ops a `clwb` becomes, or a jump into the stubs.
+/// A thread that faulted on the instruction before another thread replaced it finds this there
+/// in its handler, and goes on into the replacement instead of being left to an emulation that
+/// knows only the console's instructions (the illegal instruction would kill the title).
+/// Replacements are never undone, so once this is true it stays true.
+///
+/// # Safety
+/// `rip` is where the faulting thread is, in code that stays mapped.
+pub(crate) unsafe fn is_replacement(rip: usize) -> bool {
+    let room = 0x1000 - (rip & 0xfff);
+    let mut code = [0u8; 5];
+    let n = room.min(code.len());
+    // SAFETY: inside the page of the faulting instruction.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, code.as_mut_ptr(), n) };
+    replacement(&code[..n], rip, STUBS_AT.load(Relaxed))
+}
+
+/// [`is_replacement`] for `code` (the bytes at `at`, up to 5) and stubs at `stubs` (0: none).
+fn replacement(code: &[u8], at: usize, stubs: usize) -> bool {
+    match *code {
+        [0x0f, 0x1f, 0x00, ..] | [0xf3, 0x90, 0x90, ..] | [0x90, 0x90, 0x90, 0x90, ..] => true,
+        [0xe9, a, b, c, d] if stubs != 0 => {
+            let to = (at as i64 + 5 + i64::from(i32::from_le_bytes([a, b, c, d]))) as usize;
+            (stubs..stubs + STUBS_LEN).contains(&to)
+        }
+        _ => false,
+    }
+}
+
+/// Places replaced so far, of each kind (wait, `clzero` loop, 15-byte `clzero` loop, `clwb`).
+static REPLACED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Replaces the instruction at `rip`, where an illegal-instruction exception was just raised,
+/// when it is one replaced here: whether the code at `rip` is the replacement now, so the thread
+/// goes on there as it is (it runs the replacement, which does the instruction's job). `false`
+/// leaves it to the emulation.
+///
+/// # Safety
+/// `rip` is where the faulting thread is, in code that stays mapped.
+pub(crate) unsafe fn replace_at_fault(rip: usize) -> bool {
+    // Only bytes inside the faulting instruction's page are read (the CPU fetched from it); the
+    // next page, or the one before, may not be mapped.
+    let room = 0x1000 - (rip & 0xfff);
+    let mut code = [0u8; 32];
+    let n = room.min(code.len());
+    // SAFETY: inside the page of the faulting instruction.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, code.as_mut_ptr(), n) };
+    let before = (rip & 0xfff >= 7).then(|| {
+        // SAFETY: as above.
+        unsafe { ((rip - 7) as *const [u8; 7]).read_unaligned() }
+    });
+    let what = site(before, &code[..n]);
+    #[cfg(feature = "diagnostics")]
+    sites::count(rip, what);
+    // SAFETY: (each) the title's code, where the instruction just faulted, and a replacement
+    // that does its job.
+    let (kind, done) = unsafe {
+        match what {
+            Site::Monitorx | Site::Mwaitx if patches_waits() => {
+                // Both replacements are waits that wait for nothing, as the emulation is.
+                (0, wait_patch(what).is_some_and(|new| patch(rip, &code[..3], &new)))
+            }
+            Site::ClzeroLoop(cmp) if patches_clzero() => {
+                // No thread is ever inside the loop's other instructions (the emulation does
+                // the whole loop in one), so the five bytes of the jump may take the place of
+                // two of them.
+                let was = [code[0], code[1], code[2], code[3], code[4]];
+                (1, patch_to_stub(rip, was, |stub| clzero_stub(rip, stub, cmp)))
+            }
+            Site::ClzeroLoop15(cmp) if patches_clzero15() => {
+                // The jump takes the place of the `clzero` and the `cmp`'s first two bytes; no
+                // thread is ever at the `cmp` (the emulation does the whole loop in one, and
+                // leaves past its `jb`).
+                let was = [code[0], code[1], code[2], code[3], code[4]];
+                (2, patch_to_stub(rip, was, |stub| clzero_stub15(rip, stub, cmp)))
+            }
+            Site::Clwb(len) if patches_clwb() => (3, patch(rip, &code[..len], &[0x90; 16][..len])),
+            // (Something else: perhaps another thread's replacement, made since this fault.)
+            _ => return is_replacement(rip),
+        }
+    };
+    if done {
+        REPLACED[kind].fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        sites::patched();
+        // (Logged by `report`, not here.)
+    }
+    // Not replaced by this thread: by another one meanwhile (with another stub, say)?
+    // SAFETY: as above.
+    done || unsafe { is_replacement(rip) }
+}
+
 /// Diagnostics: how often each place in the title's code raises one of these exceptions, the
 /// busiest logged every five seconds.
 #[cfg(feature = "diagnostics")]
 mod sites {
-    use super::{AtomicU64, Relaxed};
+    use super::{AtomicU64, Relaxed, Site};
     use std::sync::atomic::AtomicUsize;
 
     /// Address, what is there (an index into [`NAMES`]), exceptions since the last line.
     static SITES: [(AtomicUsize, AtomicUsize, AtomicU64); 512] =
         [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0)) }; 512];
-    const NAMES: [&str; 8] = ["other", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "extrq/insertq"];
+    const NAMES: [&str; 8] = ["other", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "clzero loop 15"];
     static PATCHED: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn patched() {
         PATCHED.fetch_add(1, Relaxed);
     }
 
-    pub(super) fn count(at: usize, what: super::ConsoleOnly) {
-        use super::ConsoleOnly as C;
+    pub(super) fn count(at: usize, what: Site) {
         let kind = match what {
-            C::Clwb => 1,
-            C::Monitorx => 2,
-            C::Mwaitx => 3,
-            C::Clzero => 4,
-            C::ClzeroLoop { .. } => 5,
-            C::Rdpru => 6,
-            C::Extrq { .. } | C::Insertq { .. } => 7,
-            _ => 0,
+            Site::Clwb(_) => 1,
+            Site::Monitorx => 2,
+            Site::Mwaitx => 3,
+            Site::Clzero => 4,
+            Site::ClzeroLoop(_) => 5,
+            Site::Rdpru => 6,
+            Site::ClzeroLoop15(_) => 7,
+            Site::Other => 0,
         };
         let mut i = (at ^ at >> 9) % SITES.len();
         for _ in 0..8 {
@@ -433,9 +481,9 @@ mod sites {
             }
             i = (i + 1) % SITES.len();
         }
+        // (The line is logged by `report`, not here.)
     }
 
-    /// The line for the last `seconds` (from `report`, outside the handler).
     pub(super) fn line(seconds: f64) {
         let mut all: Vec<(u64, usize, usize)> =
             SITES.iter().map(|s| (s.2.swap(0, Relaxed), s.0.load(Relaxed), s.1.load(Relaxed))).filter(|s| s.0 > 0).collect();
@@ -461,223 +509,61 @@ mod sites {
     }
 }
 
-fn readable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    ASKED.fetch_add(1, Relaxed);
-    found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
-}
-
-fn writable(va: usize, bytes: usize) -> bool {
-    writable_to(va, va + bytes) == Some(va + bytes)
-}
-
-/// Where the committed, writable memory that `va` lies in ends, at most `end`; None if `va`
-/// is not in such memory. A region found is remembered ([`remembers`]).
-/// shortcut: a remembered region that was freed or protected since is written to all the same
-/// for up to [`ANSWERS`] answers, through [`zero`]: the kernel refuses that write instead of
-/// it faulting inside the handler.
-fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
-    let remember = remembers();
-    if remember {
-        let (regions, answers) = WRITABLE.with(Cell::get);
-        if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
-            let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
-            WRITABLE.with(|w| w.set(next));
-            return Some(to.min(end));
-        }
-    }
-    // SAFETY: plain data filled in by the query.
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
-    ASKED.fetch_add(1, Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
-        return None;
-    }
-    let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
-    if remember {
-        WRITABLE.with(|w| {
-            let (mut regions, answers) = w.get();
-            regions.rotate_right(1);
-            regions[0] = (from, to);
-            w.set((regions, answers));
-        });
-    }
-    Some(to.min(end))
-}
-
-/// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
-/// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
-/// see it).
-///
-/// # Safety
-/// `ctx` is the faulting thread's context, from the exception being dispatched.
-pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
-    let rip = ctx.Rip as usize;
-    // The same few instructions fault again and again: their bytes are asked about once.
-    let mut bytes = [0u8; 16];
-    let n = fetch_code(rip, &mut bytes);
-    let code = &bytes[..n];
-    let Some((what, len)) = decode::decode(code) else { return 0 };
-    // Logged by `report`, outside the handler.
-    let _ = FIRST[kind(what)].compare_exchange(0, rip, Relaxed, Relaxed);
-    #[cfg(feature = "diagnostics")]
-    if what != ConsoleOnly::Ud2 {
-        sites::count(rip, what);
-    }
-    match what {
-        ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            if let Some(_one) = patching() {
-                // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-                unsafe {
-                    if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                        std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                        VirtualProtect(rip as *const _, len, old, &mut old);
-                    }
-                }
-            }
-        }
-        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
-            // Without a prefix, so 3 bytes: replaced, the next pass does not fault.
-            if len == 3
-                && patches_waits()
-                && let Some(new) = wait_patch(what)
-                // SAFETY: the title's code, where the instruction just faulted; both
-                // replacements are waits that wait for nothing, as the emulation is.
-                && unsafe { patch(rip, [code[0], code[1], code[2]], new) }
-            {
-                #[cfg(feature = "diagnostics")]
-                sites::patched();
-            }
-            std::hint::spin_loop();
-        }
-        ConsoleOnly::Clzero => {
-            // with an address-size prefix (0x67) the line is at EAX, zero-extended
-            let a32 = code[..len - 3].contains(&0x67);
-            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) || zero(line, line + 64) < 64 {
-                return 0; // the real instruction faults there too
-            }
-        }
-        ConsoleOnly::ClzeroLoop { end_reg } => {
-            // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
-            // (and not again: the next time it is plain stores)
-            if len == 12
-                && patches_clzero()
-                // SAFETY: the title's code, where the loop's first instruction just faulted.
-                && unsafe { patch_clzero(rip, &code[..12]) }
-            {
-                #[cfg(feature = "diagnostics")]
-                sites::patched();
-            }
-            let regs: [u64; 16] = [
-                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
-            ];
-            let end = regs[end_reg as usize & 15] as usize;
-            let start = ctx.Rax as usize;
-            // A pass zeroes the whole line `rax` is in, wherever in it, and the test comes
-            // after it: lines are zeroed past an `end` inside one, and one is for an `end`
-            // not above the start. (The bytes from `start` to `end` were, `rax` came out as
-            // `end`, and the flags stayed what they were.)
-            const MOST: usize = (2 << 30) / 64;
-            let wanted = if end > start { (end - start).div_ceil(64) } else { 1 };
-            let passes = wanted.min(MOST);
-            let first = start & !63;
-            let Some(stop) = first.checked_add(passes * 64) else { return 0 };
-            // Region by region: a block may lie across several (the title's pages are
-            // mapped one view each), and one answer for all of it was a refusal, after
-            // which every 64-byte line took an exception of its own.
-            let mut at = first;
-            while at < stop {
-                let Some(to) = writable_to(at, stop) else { break };
-                let zeroed = zero(at, to);
-                at += zeroed;
-                if at < to {
-                    break;
-                }
-            }
-            let done = (at - first) / 64;
-            if done == 0 {
-                return 0;
-            }
-            ZEROED.fetch_add((done * 64) as u64, Relaxed);
-            ctx.Rax = ctx.Rax.wrapping_add((done * 64) as u64);
-            if done < wanted {
-                // What follows is not writable (or the block is huge): the loop goes on
-                // there (the same instruction again), where the real one faults too.
-                return CONTINUE_EXECUTION;
-            }
-            ctx.EFlags = ctx.EFlags & !crate::crash::CMP_FLAGS | crate::crash::cmp_flags(ctx.Rax, end as u64);
-        }
-        ConsoleOnly::Rdpru => {
-            let mut v = 0i64;
-            // SAFETY: a valid out pointer.
-            unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
-            let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
-            ctx.Rax = v & 0xFFFF_FFFF;
-            ctx.Rdx = v >> 32;
-        }
-        ConsoleOnly::Rdpid(r) => {
-            // SAFETY: no preconditions.
-            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as u64;
-            let regs: [&mut u64; 16] = [
-                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi, &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13,
-                &mut ctx.R14, &mut ctx.R15,
-            ];
-            *regs[r as usize & 15] = cpu;
-        }
-        // the low quadword changes; the high one is zeroed, as a Zen 5 does
-        ConsoleOnly::Extrq { dst, src, len, idx } => {
-            // SAFETY: the context's XMM registers (CONTEXT_FLOATING_POINT is captured for exceptions).
-            let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
-            let (len, idx) = match src {
-                Some(s) => {
-                    let c = x[s as usize & 15].Low;
-                    (c as u8, (c >> 8) as u8)
-                }
-                None => (len, idx),
-            };
-            let d = &mut x[dst as usize & 15];
-            d.Low = decode::extrq(d.Low, len, idx);
-            d.High = 0;
-        }
-        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
-            // SAFETY: as above.
-            let x = unsafe { &mut ctx.Anonymous.FltSave.XmmRegisters };
-            let s = x[src as usize & 15];
-            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
-            let d = &mut x[dst as usize & 15];
-            d.Low = decode::insertq(d.Low, s.Low, len, idx);
-            d.High = 0;
-        }
-    }
-    ctx.Rip += len as u64;
-    // How often this runs at all (each one is an exception: a trip into Windows and back;
-    // logged by `report`).
-    EMULATED.fetch_add(1, Relaxed);
-    CONTINUE_EXECUTION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+    };
 
-    /// The tests that run the emulation take this: it may patch the code it is given, and the
-    /// handler only tries the patching lock, so a test emulating in parallel left another's
-    /// instruction emulated and not replaced.
+    /// The tests that patch code take this: the handler only tries the patching lock, so a test
+    /// patching in parallel would leave another's instruction emulated and not replaced.
     static PATCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn one_patching_test() -> std::sync::MutexGuard<'static, ()> {
         PATCH_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn sites_are_told_apart() {
+        assert_eq!(site(None, &[0x0f, 0x01, 0xfa]), Site::Monitorx);
+        assert_eq!(site(None, &[0x0f, 0x01, 0xfb, 0xc3]), Site::Mwaitx);
+        assert_eq!(site(None, &[0x0f, 0x01, 0xfd]), Site::Rdpru);
+        assert_eq!(site(None, &[0x0f, 0x01, 0xfc, 0xc3]), Site::Clzero);
+        let lp = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
+        assert_eq!(site(None, &lp), Site::ClzeroLoop([0x4c, 0x39, 0xd0]));
+        // Against rax itself, or a cut loop: one line.
+        assert_eq!(site(None, &[0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc0, 0x72, 0xf4]), Site::Clzero);
+        assert_eq!(site(None, &lp[..11]), Site::Clzero);
+        // mov rax, rdx; add rdx, 0x40 | clzero; cmp rdx, r8; jb
+        let before = [0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40];
+        let rest = [0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72, 0xf1];
+        assert_eq!(site(Some(before), &rest), Site::ClzeroLoop15([0x4c, 0x39, 0xc2]));
+        assert_eq!(site(None, &rest), Site::Clzero, "the bytes before in another page");
+        // The add on another register than the mov's.
+        assert_eq!(site(Some([0x48, 0x89, 0xd0, 0x48, 0x83, 0xc1, 0x40]), &rest), Site::Clzero);
+        // clwb [rax]; clwb [r9 + 8]
+        assert_eq!(site(None, &[0x66, 0x0f, 0xae, 0x30]), Site::Clwb(4));
+        assert_eq!(site(None, &[0x66, 0x41, 0x0f, 0xae, 0x71, 0x08]), Site::Clwb(6));
+        assert_eq!(site(None, &[0x90]), Site::Other);
+    }
+
+    #[test]
+    fn replacements_are_known_again() {
+        assert!(replacement(&[0x0f, 0x1f, 0x00, 0xc3], 0x1000, 0));
+        assert!(replacement(&[0xf3, 0x90, 0x90], 0x1000, 0));
+        assert!(replacement(&[0x90, 0x90, 0x90, 0x90, 0xc3], 0x1000, 0));
+        assert!(!replacement(&[0x90, 0x90, 0x90, 0xc3], 0x1000, 0), "shorter than any clwb");
+        assert!(!replacement(&[0x0f, 0x01, 0xfb], 0x1000, 0));
+        assert!(!replacement(&[0x90], 0x1000, 0), "cut by the page's end");
+        // jmp from 0x10_0000 to 0x20_0000, the stubs there or elsewhere.
+        let j = jump(0x10_0000, 0x20_0000).unwrap();
+        assert!(replacement(&j, 0x10_0000, 0x20_0000));
+        assert!(replacement(&j, 0x10_0000, 0x20_0000 - STUBS_LEN + 1));
+        assert!(!replacement(&j, 0x10_0000, 0x20_0001));
+        assert!(!replacement(&j, 0x10_0000, 0x20_0000 - STUBS_LEN));
+        assert!(!replacement(&j, 0x10_0000, 0), "no stubs yet");
     }
 
     #[test]
@@ -689,20 +575,16 @@ mod tests {
         assert!(with_patch(word, 0x100e, &[0; 3]).is_none(), "crosses into the next sixteen");
     }
 
-    /// `monitorx; mwaitx; ret` in a page of its own: each is replaced at its first fault,
-    /// and the page is protected as before.
+    /// `monitorx; mwaitx; clwb [rax]; ret` in a page of its own: each is replaced at its first
+    /// fault, and the page is protected as before.
     #[test]
-    fn a_wait_faults_once_and_the_page_keeps_its_protection() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-            VirtualProtect, VirtualQuery,
-        };
+    fn waits_and_clwb_fault_once_and_the_page_keeps_its_protection() {
         let _one = one_patching_test();
         // SAFETY: memory of our own, read, written and run within its page.
         unsafe {
             let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
             assert!(!page.is_null());
-            let code = [0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb, 0xc3];
+            let code = [0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb, 0x66, 0x0f, 0xae, 0x30, 0xc3];
             // The first over the end of its aligned eight bytes, as the title's is; and one
             // over the end of its sixteen (at 46), which is left alone.
             std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(6), code.len());
@@ -710,21 +592,21 @@ mod tests {
             let mut old = 0;
             assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_EXECUTE_READ, &mut old), 0);
             let at = page as usize;
-            let mut context: CONTEXT = std::mem::zeroed();
-            for rip in [at + 6, at + 9, at + 46] {
-                context.Rip = rip as u64;
-                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
-                assert_eq!(context.Rip, rip as u64 + 3);
+            for rip in [at + 6, at + 9, at + 12] {
+                assert_eq!(replace_at_fault(rip), patches_waits() || rip == at + 12 && patches_clwb());
             }
-            if patches_waits() {
-                let now = std::slice::from_raw_parts(page.add(6), 7);
-                assert_eq!(now, [0x0f, 0x1f, 0x00, 0xf3, 0x90, 0x90, 0xc3]);
+            assert!(!replace_at_fault(at + 46), "crosses its sixteen bytes");
+            if patches_waits() && patches_clwb() {
+                let now = std::slice::from_raw_parts(page.add(6), 11);
+                assert_eq!(now, [0x0f, 0x1f, 0x00, 0xf3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xc3]);
                 // They run now.
                 let run: extern "system" fn() = std::mem::transmute(page.add(6));
                 run();
+                for rip in [at + 6, at + 9, at + 12] {
+                    assert!(replace_at_fault(rip), "a thread that faulted before the replacement");
+                }
                 // A second thread that faulted at the same place meanwhile.
-                assert!(patch(at + 6, [0x0f, 0x01, 0xfa], [0x0f, 0x1f, 0x00]));
-                assert!(!patch(at + 46, [0x0f, 0x01, 0xfa], [0x0f, 0x1f, 0x00]), "crosses its sixteen bytes");
+                assert!(patch(at + 6, &[0x0f, 0x01, 0xfa], &[0x0f, 0x1f, 0x00]));
             }
             assert_eq!(std::slice::from_raw_parts(page.add(46), 3), [0x0f, 0x01, 0xfa]);
             let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -734,61 +616,10 @@ mod tests {
         }
     }
 
-    /// Code bytes are copied, not read in place: an instruction at the end of its page, with
-    /// nothing mapped after it, is read up to the page's end and emulated; one with readable
-    /// code after it gets its 16 bytes.
-    #[test]
-    fn code_is_read_up_to_an_unmapped_page() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        let _one = one_patching_test();
-        // SAFETY: memory of our own: the first page committed, the second only reserved.
-        unsafe {
-            let base = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_READWRITE) as usize;
-            assert_ne!(base, 0);
-            assert_ne!(VirtualAlloc(base as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
-            // `monitorx` in the page's last three bytes.
-            let at = base + 4093;
-            std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfa].as_ptr(), at as *mut u8, 3);
-            let mut bytes = [0u8; 16];
-            assert_eq!(fetch_code(at, &mut bytes), 3);
-            assert_eq!(bytes[..3], [0x0f, 0x01, 0xfa]);
-            assert_eq!(fetch_code(base + 100, &mut bytes), 16);
-            // Not code of our own: nothing at all.
-            assert_eq!(fetch_code(base + 4096, &mut bytes), 0);
-            let mut context: CONTEXT = std::mem::zeroed();
-            context.Rip = at as u64;
-            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
-            assert_eq!(context.Rip, at as u64 + 3);
-            VirtualFree(base as *mut _, 0, MEM_RELEASE);
-        }
-    }
-
-    /// Zeroing goes through the kernel: up to memory that is not there it zeroes, and there
-    /// it stops instead of faulting, remembered regions or not.
-    #[test]
-    fn zeroing_stops_where_memory_ends() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        // SAFETY: memory of our own: the first page committed, the second only reserved.
-        unsafe {
-            let base = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_READWRITE) as usize;
-            assert_ne!(base, 0);
-            assert_ne!(VirtualAlloc(base as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
-            std::ptr::write_bytes(base as *mut u8, 0xAB, 4096);
-            assert_eq!(zero(base + 64, base + 128), 64);
-            assert_eq!(*((base + 63) as *const u8), 0xAB);
-            assert_eq!(*((base + 128) as *const u8), 0xAB);
-            assert!(std::slice::from_raw_parts((base + 64) as *const u8, 64).iter().all(|&b| b == 0));
-            assert_eq!(zero(base + 4032, base + 8192), 64);
-            assert_eq!(zero(base + 4096, base + 4160), 0);
-            VirtualFree(base as *mut _, 0, MEM_RELEASE);
-        }
-    }
-
     /// `clzero` loops run as plain stores: the lines they name are zero and no other byte,
     /// and the pointer, the scratch register and the flags come out as from the loop.
     #[test]
     fn a_clzero_loop_becomes_plain_stores() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
         let _one = one_patching_test();
         // Against rdx (rm rax, reg rdx) and against rcx, the scratch register.
         for (cmp, by) in [([0x48, 0x39, 0xd0], 2), ([0x48, 0x39, 0xc8], 1), ([0x4c, 0x39, 0xc0], 8)] {
@@ -800,8 +631,8 @@ mod tests {
                 // loop at 16, and what rax became.
                 let mut head = vec![0x48, 0x89, 0xc8]; // mov rax, rcx
                 match by {
-                    1 => head.extend([0x48, 0x89, 0xd1]),  // mov rcx, rdx
-                    8 => head.extend([0x49, 0x89, 0xd0]),  // mov r8, rdx
+                    1 => head.extend([0x48, 0x89, 0xd1]), // mov rcx, rdx
+                    8 => head.extend([0x49, 0x89, 0xd0]), // mov r8, rdx
                     _ => {}
                 }
                 head.resize(16, 0x90);
@@ -811,21 +642,18 @@ mod tests {
                 code.extend([0x72, 0xf4]);
                 code.push(0xc3);
                 std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
-                let mut context: CONTEXT = std::mem::zeroed();
                 let mut block = vec![0xaau8; 64 * 8 + 64];
                 let base = block.as_mut_ptr() as usize;
                 let first = base.next_multiple_of(64);
-                // The fault itself: emulated whole, and replaced.
-                context.Rip = page as u64 + 16;
-                context.Rax = first as u64;
-                context.Rdx = first as u64 + 128;
-                context.Rcx = context.Rdx;
-                context.R8 = context.Rdx;
-                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
-                assert_eq!((context.Rip, context.Rax), (page as u64 + 28, first as u64 + 128));
+                assert_eq!(replace_at_fault(page + 16), patches_clzero());
                 if patches_clzero() {
                     assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
-                    block.fill(0xaa);
+                    // A thread that read the loop before the jump was written: its own stub is
+                    // not used (and gives its room back), and it goes on into the jump there.
+                    let was = [0x0f, 0x01, 0xfc, 0x48, 0x83];
+                    assert!(!patch_to_stub(page + 16, was, |stub| clzero_stub(page + 16, stub, cmp)));
+                    assert!(is_replacement(page + 16));
+                    assert!(replace_at_fault(page + 16), "a second fault there finds the jump");
                     let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
                     // From inside a line to inside the third: whole lines, one past the end.
                     assert_eq!(run(first + 8, first + 130), first + 8 + 128);
@@ -842,5 +670,46 @@ mod tests {
         }
         assert!(clzero_stub(0x1000, 0x2000, [0x48, 0x39, 0xc0]).is_none(), "against rax itself");
         assert!(jump(0x1000, 0x9000_0000_0000).is_none(), "out of reach");
+    }
+
+    /// The 15-byte loop, `mov rax, a; add a, 0x40; clzero; cmp a, b; jb`, runs as plain stores
+    /// after its first fault, with `a` and the flags as the loop leaves them.
+    #[test]
+    fn a_fifteen_byte_clzero_loop_becomes_plain_stores() {
+        let _one = one_patching_test();
+        // SAFETY: memory of our own, written and run inside it.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            // fn(start: rcx, end: rdx) -> a: a = rcx in r9, the loop at 9 (clzero at 16), then
+            // mov rax, r9; ret.
+            let mut code = vec![0x49, 0x89, 0xc9]; // mov r9, rcx
+            code.resize(9, 0x90);
+            code.extend([0x4c, 0x89, 0xc8]); // mov rax, r9
+            code.extend([0x49, 0x83, 0xc1, 0x40]); // add r9, 0x40
+            code.extend([0x0f, 0x01, 0xfc]); // clzero
+            code.extend([0x49, 0x39, 0xd1]); // cmp r9, rdx
+            code.extend([0x72, 0xf1]); // jb the mov
+            code.extend([0x4c, 0x89, 0xc8, 0xc3]); // mov rax, r9; ret
+            std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+            let mut block = vec![0xaau8; 64 * 8 + 64];
+            let base = block.as_mut_ptr() as usize;
+            let first = base.next_multiple_of(64);
+            let at = first - base;
+            assert_eq!(replace_at_fault(page + 16), patches_clzero15());
+            if patches_clzero15() {
+                assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
+                assert!(replace_at_fault(page + 16), "a second fault there finds the jump");
+                let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
+                // Lines from the start until `a` (64 past the line zeroed) reaches the end.
+                assert_eq!(run(first, first + 130), first + 192);
+                assert!(block[at..at + 192].iter().all(|&b| b == 0));
+                assert!(block[..at].iter().chain(&block[at + 192..]).all(|&b| b == 0xaa));
+                block.fill(0xaa);
+                assert_eq!(run(first, first), first + 64);
+                assert!(block[at..at + 64].iter().all(|&b| b == 0) && block[at + 64] == 0xaa);
+            }
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
     }
 }

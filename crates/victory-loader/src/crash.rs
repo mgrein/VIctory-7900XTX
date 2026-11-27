@@ -185,6 +185,13 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
+                if let Some((register, len)) = rdpid(&bytes[..n]) {
+                    // The processor's number, which Windows keeps in TSC_AUX for `rdpid`.
+                    let cpu = windows_sys::Win32::System::Threading::GetCurrentProcessorNumber();
+                    *gpr(context, register) = u64::from(cpu);
+                    context.Rip += len as u64;
+                    return true;
+                }
                 if let Some(len) = clwb_len(&bytes[..n]) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
@@ -202,9 +209,20 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     true
 }
 
+/// `rdpid r64` (`f3 [rex] 0f c7 /7`, a register operand), which Intel CPUs before Ice Lake
+/// lack: the register written and the length, or `None` for any other instruction.
+fn rdpid(code: &[u8]) -> Option<(u8, usize)> {
+    let (rex, at) = if *code.get(1)? & 0xf0 == 0x40 { (code[1], 2) } else { (0, 1) };
+    if *code.first()? != 0xf3 || code.get(at..at + 2)? != [0x0f, 0xc7] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    (modrm >> 6 == 3 && (modrm >> 3) & 7 == 7).then_some((modrm & 7 | (rex & 1) << 3, at + 3))
+}
+
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
 /// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: &[u8]) -> Option<usize> {
+pub(crate) fn clwb_len(code: &[u8]) -> Option<usize> {
     let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
     if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
         return None;
@@ -471,15 +489,24 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
-        // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
-        if r != 0 {
-            return r;
-        }
+    // (first replaced in the title's code where it is one replaced there, so it faults no more:
+    // the thread goes on at the same place, into the replacement)
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION
+        // SAFETY: where the faulting thread is, in the code it runs.
+        && unsafe { crate::console_insn::replace_at_fault((*(*info).ContextRecord).Rip as usize) }
+    {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // Another thread replaced the instruction after the checks above read it (the emulation
+    // knows only the original): the thread goes on into the replacement.
+    // SAFETY: as above; where the faulting thread is, in the code it runs.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION
+        && unsafe { crate::console_insn::is_replacement((*(*info).ContextRecord).Rip as usize) }
+    {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -997,6 +1024,15 @@ mod tests {
         // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
         assert_eq!(run(0, u64::MAX - 10), (4, 0));
         assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn rdpid_is_decoded() {
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xf8]), Some((0, 4)));
+        assert_eq!(rdpid(&[0xf3, 0x41, 0x0f, 0xc7, 0xf9]), Some((9, 5)));
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0x38]), None, "a memory operand");
+        assert_eq!(rdpid(&[0xf3, 0x0f, 0xc7, 0xf0]), None, "rdrand's /6");
+        assert_eq!(rdpid(&[0xf3, 0x0f]), None);
     }
 
     #[test]

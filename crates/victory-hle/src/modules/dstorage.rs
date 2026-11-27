@@ -23,7 +23,6 @@
 
 mod error_record;
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -637,6 +636,11 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// Since the last 5 s line: the slowest request run (ms, destination
+    /// bytes, options), and requests over 250 ms and over 1 s, plain and
+    /// BCPack apart. (VIctory-DXR 71630635.)
+    slowest: (u64, u32, u64),
+    slow: [u64; 4],
 }
 
 /// A queue's requests in the scheduler.
@@ -698,6 +702,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    slowest: (0, 0, 0),
+                    slow: [0; 4],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -705,18 +711,105 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
+        let low = low_priority();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        if low {
+                            lower_this_thread();
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, below_normal = low, "dstorage: workers");
     });
     Some(scheduler)
+}
+
+/// How many workers read, inflate and unpack requests at once. They share the
+/// processor with the title's own threads, the list translators and the
+/// submitting thread, and SMT twins add little to a pool that already keeps
+/// every core busy: so the PC's physical cores by default (fxceless PR #1044
+/// measured copies back at 2.4-3.5 ms/MB with 8 workers against 5.7 with 16 on
+/// an 8-core/16-thread machine). `VICTORY_DSTORAGE_WORKERS=<1..64>` sets the
+/// count outright; `VICTORY_DSTORAGE_WORKERS=logical` takes every logical
+/// processor, as before.
+fn worker_count() -> usize {
+    let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let set = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+    worker_count_for(set.as_deref(), logical, physical_cores())
+}
+
+fn worker_count_for(set: Option<&str>, logical: usize, physical: Option<usize>) -> usize {
+    match set.map(str::trim) {
+        Some("logical") => return logical,
+        Some(v) => {
+            if let Some(n) = v.parse::<usize>().ok().filter(|n| (1..=64).contains(n)) {
+                return n;
+            }
+            tracing::warn!(value = v, "dstorage: VICTORY_DSTORAGE_WORKERS is not 1-64 or `logical`; ignored");
+        }
+        None => {}
+    }
+    physical.unwrap_or(logical / 2).clamp(2, 32).min(logical.max(2))
+}
+
+/// The PC's physical cores, if Windows says (one `RelationProcessorCore`
+/// record per core, whatever its SMT twins).
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len = 0u32;
+    // SAFETY: a null buffer asks for the size only.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    // u64s, so that the records' fields are aligned.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: the buffer holds at least `len` bytes.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let bytes = buf.as_ptr().cast::<u8>();
+    let (mut at, mut cores) = (0usize, 0usize);
+    while at + 8 <= len as usize {
+        // SAFETY: inside the `len` bytes written; `Size` is at offset 4.
+        let size = unsafe { std::ptr::read_unaligned(bytes.add(at + 4).cast::<u32>()) } as usize;
+        if size < 8 || at + size > len as usize {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+/// Whether the workers run below normal priority, so that a burst of streaming
+/// gives way to the title's hot threads (`VICTORY_DSTORAGE_LOW_PRIORITY=1`;
+/// off by default: streaming bursts may come later, so try it against late
+/// textures before turning it on).
+fn low_priority() -> bool {
+    std::env::var_os("VICTORY_DSTORAGE_LOW_PRIORITY").is_some_and(|v| v == "1")
+}
+
+fn lower_this_thread() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: the pseudo handle of the calling thread.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
 impl Scheduler {
@@ -891,6 +984,17 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        let ms = started.elapsed().as_millis() as u64;
+        let bc = job.request.options & BCPACK != 0;
+        if ms > self.slowest.0 {
+            self.slowest = (ms, job.request.destination_size, job.request.options);
+        }
+        if ms >= 250 {
+            self.slow[usize::from(bc) * 2] += 1;
+        }
+        if ms >= 1000 {
+            self.slow[usize::from(bc) * 2 + 1] += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -908,6 +1012,22 @@ impl Lanes {
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
+            // Late textures at their source: said only when a request took
+            // 250 ms or more.
+            let (ms, bytes, options) = std::mem::take(&mut self.slowest);
+            let slow = std::mem::take(&mut self.slow);
+            if slow[0] + slow[2] > 0 {
+                tracing::info!(
+                    "dstorage, slowest request in the last {:.1} s: {ms} ms for {:.1} MB (options {options:#x}{}); requests over 250 ms: {} plain, {} BCPack; over 1 s: {} plain, {} BCPack (a status behind such a request on its queue waits that long)",
+                    elapsed.as_secs_f64(),
+                    f64::from(bytes) / 1e6,
+                    if options & BCPACK != 0 { ", BCPack" } else { "" },
+                    slow[0],
+                    slow[2],
+                    slow[1],
+                    slow[3],
+                );
+            }
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
@@ -1617,18 +1737,37 @@ fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
     let source = read_source(request, file).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = scratch::take(request.intermediate_size as usize);
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        // The compressed bytes are not needed while BCPack decodes.
+        drop(source);
         packed.truncate(n);
-        Cow::Owned(packed)
+        Source::Owned(packed)
     } else {
         source
     };
-    into_destination(request, saved, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    // Decoded before (`VICTORY_DSTORAGE_CACHE`): the bytes are read back.
+    let key = decoded_cache::dir().map(|_| decoded_cache::key(request, &source));
+    if let Some(key) = &key
+        && let Some(bytes) = decoded_cache::get(key, size)
+    {
+        return into_destination(request, saved, size, |out| {
+            out[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        })
+        .map_err(|hr| fail(hr, "copying a decoded request from the cache"));
+    }
+    into_destination(request, saved, size, |out| {
+        let n = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string()))?,
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?,
+        };
+        if let Some(key) = &key {
+            decoded_cache::put(key, &out[..n]);
+        }
+        Ok(n)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1637,6 +1776,168 @@ fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// `VICTORY_DSTORAGE_CACHE=<dir>` (off without it): compressed requests
+/// (zlib, BCPack or both) decoded once are kept in that folder and read back
+/// the next time the same compressed bytes come with the same options and
+/// sizes, instead of being inflated and BCPack-decoded again on the CPU the
+/// title shares. The key is two 64-bit SipHashes of the compressed bytes
+/// (with different salts) plus their length, the options and the
+/// destination and intermediate sizes, so a file changed on disk is simply
+/// another key. `VICTORY_DSTORAGE_CACHE_MB` caps the folder (default 4096):
+/// past it the oldest files go. (An idea of XCL PR #2864; our own code.)
+mod decoded_cache {
+    use super::Request;
+    use std::hash::Hasher;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) fn dir() -> Option<&'static Path> {
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = PathBuf::from(std::env::var_os("VICTORY_DSTORAGE_CACHE").filter(|v| !v.is_empty())?);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    tracing::info!(dir = %dir.display(), mb = cap() >> 20, "dstorage: decoded requests are cached on disk");
+                    Some(dir)
+                }
+                Err(error) => {
+                    tracing::warn!(dir = %dir.display(), %error, "dstorage: VICTORY_DSTORAGE_CACHE cannot be made; not cached");
+                    None
+                }
+            }
+        })
+        .as_deref()
+    }
+
+    fn cap() -> u64 {
+        static CAP: OnceLock<u64> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_CACHE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096).max(16) << 20
+        })
+    }
+
+    /// The file name for a request whose compressed bytes are `source`.
+    pub(super) fn key(request: &Request, source: &[u8]) -> String {
+        let hash = |salt: u64| {
+            let mut h = std::hash::DefaultHasher::new();
+            h.write_u64(salt);
+            h.write(source);
+            h.finish()
+        };
+        format!(
+            "{:016x}{:016x}-{:x}-{:x}-{:x}-{:x}.bin",
+            hash(0x5eed_0001),
+            hash(0x5eed_0002),
+            source.len(),
+            request.options,
+            request.destination_size,
+            request.intermediate_size
+        )
+    }
+
+    /// Hits and misses since the start, for the log.
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The decoded bytes kept for `key`, if any and no longer than `size`.
+    pub(super) fn get(key: &str, size: usize) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(dir()?.join(key)).ok().filter(|b| b.len() <= size);
+        let n = if bytes.is_some() { HITS.fetch_add(1, Relaxed) + 1 } else { MISSES.fetch_add(1, Relaxed) + 1 };
+        if n.is_power_of_two() && n >= 64 {
+            tracing::info!(hits = HITS.load(Relaxed), misses = MISSES.load(Relaxed), "dstorage: decoded request cache");
+        }
+        bytes
+    }
+
+    /// Bytes in the folder, counted at the first write; then what we add.
+    static USED: OnceLock<AtomicU64> = OnceLock::new();
+
+    /// Keeps `bytes` for `key`: written aside and renamed, so a reader sees
+    /// all of it or nothing.
+    pub(super) fn put(key: &str, bytes: &[u8]) {
+        let Some(dir) = dir() else { return };
+        let used = USED.get_or_init(|| AtomicU64::new(files(dir).iter().map(|f| f.1).sum()));
+        let path = dir.join(key);
+        let aside = dir.join(format!("{key}.{}.{:?}.part", std::process::id(), std::thread::current().id()));
+        if std::fs::write(&aside, bytes).is_err() || std::fs::rename(&aside, &path).is_err() {
+            let _ = std::fs::remove_file(&aside);
+            return;
+        }
+        if used.fetch_add(bytes.len() as u64, Relaxed) + bytes.len() as u64 > cap() {
+            trim(dir, used, cap());
+        }
+    }
+
+    /// The cached files: path, bytes, last written.
+    fn files(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+        entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((e.path(), m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)))
+            })
+            .collect()
+    }
+
+    /// Removes the oldest files until the folder is at three quarters of
+    /// `cap`. One thread at a time; the others go on.
+    fn trim(dir: &Path, used: &AtomicU64, cap: u64) {
+        static TRIMMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let Ok(_one) = TRIMMING.try_lock() else { return };
+        let mut all = files(dir);
+        all.sort_unstable_by_key(|f| f.2);
+        let mut total: u64 = all.iter().map(|f| f.1).sum();
+        for (path, len, _) in &all {
+            if total <= cap / 4 * 3 {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total -= len;
+            }
+        }
+        used.store(total, Relaxed);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn keys_follow_every_input_and_files_trim_oldest_first() {
+            // SAFETY: a zeroed request is plain data (null pointers, zeros).
+            let mut request: Request = unsafe { std::mem::zeroed() };
+            request.options = 1;
+            request.destination_size = 100;
+            let a = key(&request, b"compressed");
+            assert_eq!(a, key(&request, b"compressed"));
+            assert_ne!(a, key(&request, b"compresseD"));
+            request.destination_size = 101;
+            assert_ne!(a, key(&request, b"compressed"));
+            request.destination_size = 100;
+            request.options = 3;
+            assert_ne!(a, key(&request, b"compressed"));
+            let dir = tempfile::tempdir().unwrap();
+            for (i, name) in ["a.bin", "b.bin", "c.bin", "d.bin"].into_iter().enumerate() {
+                let path = dir.path().join(name);
+                std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+                let t = std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i as u64 * 10);
+                std::fs::File::options().write(true).open(&path).unwrap().set_modified(t).unwrap();
+            }
+            assert_eq!(files(dir.path()).len(), 4);
+            let used = AtomicU64::new(4 << 20);
+            // A cap of 3 MiB: down to 2.25 MiB, the two oldest gone.
+            trim(dir.path(), &used, 3 << 20);
+            assert_eq!(used.load(Relaxed), 2 << 20);
+            let mut left: Vec<_> = files(dir.path()).into_iter().map(|f| f.0.file_name().unwrap().to_owned()).collect();
+            left.sort();
+            assert_eq!(left, ["c.bin", "d.bin"]);
+        }
+    }
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -1726,18 +2027,119 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
+/// A compressed request's bytes: the title's memory, or ours.
+enum Source {
+    Borrowed(&'static [u8]),
+    Owned(scratch::Buf),
+}
+
+impl std::ops::Deref for Source {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Source::Borrowed(bytes) => bytes,
+            Source::Owned(buf) => buf,
+        }
+    }
+}
+
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request, file: Option<&Files>) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request, file: Option<&Files>) -> Result<Source, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Source::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = scratch::take(size);
     read_into(request, &mut bytes, file)?;
-    Ok(Cow::Owned(bytes))
+    Ok(Source::Owned(bytes))
+}
+
+/// Each worker keeps its last two compressed-source and intermediate
+/// buffers of up to 8 MiB for its next requests, instead of a new
+/// allocation (and the page faults of fresh pages) per request; larger ones
+/// are freed as before. The idea from VItoriaBr PR #124 (ItzMeGamer).
+mod scratch {
+    use std::cell::RefCell;
+
+    /// Largest buffer kept, and how many.
+    const KEPT_BYTES: usize = 8 << 20;
+    const KEPT: usize = 2;
+
+    thread_local! {
+        static FREE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `len` zero bytes, in a kept buffer when one is there.
+    pub(super) fn take(len: usize) -> Buf {
+        if len > KEPT_BYTES {
+            // Fresh zeroed pages, as before.
+            return Buf(vec![0; len]);
+        }
+        let mut bytes = FREE.with_borrow_mut(Vec::pop).unwrap_or_default();
+        bytes.clear();
+        bytes.resize(len, 0);
+        Buf(bytes)
+    }
+
+    pub(super) struct Buf(Vec<u8>);
+
+    impl Buf {
+        pub(super) fn truncate(&mut self, len: usize) {
+            self.0.truncate(len);
+        }
+    }
+
+    impl std::ops::Deref for Buf {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Buf {
+        fn deref_mut(&mut self) -> &mut [u8] {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Buf {
+        fn drop(&mut self) {
+            let bytes = std::mem::take(&mut self.0);
+            if bytes.capacity() != 0 && bytes.capacity() <= KEPT_BYTES {
+                // `try_with`: a buffer dropped while the thread ends is freed.
+                let _ = FREE.try_with(|free| {
+                    let mut free = free.borrow_mut();
+                    if free.len() < KEPT {
+                        free.push(bytes);
+                    }
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn small_buffers_are_reused_zeroed_and_large_ones_freed() {
+            let mut a = super::take(1000);
+            a[..3].copy_from_slice(&[1, 2, 3]);
+            let at = a.as_ptr();
+            drop(a);
+            let b = super::take(500);
+            assert_eq!(b.as_ptr(), at);
+            assert!(b.iter().all(|&x| x == 0) && b.len() == 500);
+            drop(b);
+            let big = super::take(super::KEPT_BYTES + 1);
+            drop(big);
+            super::FREE.with_borrow(|free| {
+                assert!(free.len() <= super::KEPT);
+                assert!(free.iter().all(|v| v.capacity() <= super::KEPT_BYTES));
+            });
+        }
+    }
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -2135,6 +2537,17 @@ mod tests {
     }
 
     #[test]
+    fn workers_follow_physical_cores_unless_set() {
+        assert_eq!(super::worker_count_for(None, 12, Some(6)), 6);
+        assert_eq!(super::worker_count_for(None, 12, None), 6);
+        assert_eq!(super::worker_count_for(None, 2, Some(1)), 2);
+        assert_eq!(super::worker_count_for(Some("logical"), 12, Some(6)), 12);
+        assert_eq!(super::worker_count_for(Some(" 3 "), 12, Some(6)), 3);
+        assert_eq!(super::worker_count_for(Some("0"), 12, Some(6)), 6);
+        assert!(super::physical_cores().is_some_and(|n| n >= 1));
+    }
+
+    #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
         assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
@@ -2463,6 +2876,8 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            slowest: (0, 0, 0),
+            slow: [0; 4],
         }
     }
 

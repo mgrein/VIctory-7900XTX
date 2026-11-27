@@ -288,6 +288,7 @@ static PACED: AtomicBool = AtomicBool::new(false);
 /// rule), so the title's next blocking flip wait ends at once. Tokens and
 /// ticks count as before.
 pub(crate) fn after_present() {
+    av_sync::presented();
     if pace_after() {
         pace_flip();
     }
@@ -300,6 +301,105 @@ fn pace_flip() {
         std::thread::sleep(wait);
     }
     PACED.store(true, Ordering::Relaxed);
+}
+
+/// `VICTORY_AV_SYNC` (read here once; off by default): audio paced to the
+/// frames actually shown, for cutscenes that run far below the title's rate
+/// (3-10 a second) and would otherwise lose their sound to the picture.
+/// `1`: against the title's frame interval; `n` (2 or more): against n
+/// frames a second. Unset, `0` or anything else: off, audio in real time.
+/// [`av_sync_factor`] is how many times slower than the target the frames
+/// come (1 within a quarter of it, at most 20); the audio modules of
+/// victory-hle stretch their clocks by it. The idea and the shape from
+/// VItoriaBr PR #124 (ItzMeGamer), written again here.
+pub fn av_sync_factor() -> f64 {
+    av_sync::factor()
+}
+
+mod av_sync {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// `None`: off; `Some(None)`: the title's interval; `Some(Some(d))`:
+    /// that interval.
+    fn mode() -> Option<Option<Duration>> {
+        static MODE: OnceLock<Option<Option<Duration>>> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let spec = std::env::var("VICTORY_AV_SYNC").ok()?;
+            let mode = parse(&spec);
+            if let Some(target) = mode {
+                tracing::info!(?target, "audio paced to the frames shown (VICTORY_AV_SYNC)");
+            }
+            mode
+        })
+    }
+
+    pub(super) fn parse(spec: &str) -> Option<Option<Duration>> {
+        match spec.trim().parse::<u64>().ok()? {
+            0 => None,
+            1 => Some(None),
+            fps => Some(Some(Duration::from_nanos(1_000_000_000 / fps))),
+        }
+    }
+
+    fn epoch() -> Instant {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
+
+    /// Microseconds since `epoch` of the last present (0: none yet), and the
+    /// smoothed time between presents (0: fewer than two).
+    static LAST_US: AtomicU64 = AtomicU64::new(0);
+    static SMOOTH_US: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn presented() {
+        if mode().is_none() {
+            return;
+        }
+        let now = (epoch().elapsed().as_micros() as u64).max(1);
+        let last = LAST_US.swap(now, Ordering::Relaxed);
+        if last != 0 && now > last {
+            let gap = (now - last).clamp(1_000, 2_000_000);
+            let smooth = SMOOTH_US.load(Ordering::Relaxed);
+            SMOOTH_US.store(smooth_next(smooth, gap), Ordering::Relaxed);
+        }
+    }
+
+    /// A quarter of the new gap; a gap more than twice the average counts
+    /// half at once (a stall shows quickly).
+    pub(super) fn smooth_next(smooth: u64, gap: u64) -> u64 {
+        match smooth {
+            0 => gap,
+            s if gap > s.saturating_mul(2) => (s + gap) / 2,
+            s => (s * 3 + gap) / 4,
+        }
+    }
+
+    pub(super) fn factor() -> f64 {
+        let Some(target) = mode() else {
+            return 1.0;
+        };
+        let smooth = SMOOTH_US.load(Ordering::Relaxed);
+        if smooth == 0 {
+            return 1.0;
+        }
+        // A present that is late already counts (a stall in progress).
+        let last = LAST_US.load(Ordering::Relaxed);
+        let since = (epoch().elapsed().as_micros() as u64).saturating_sub(last).min(2_000_000);
+        let target = target.unwrap_or_else(super::interval).as_micros() as u64;
+        slowdown(smooth.max(since), target)
+    }
+
+    /// 1 within a quarter over the target (or with no target: uncapped),
+    /// else how many times longer, at most 20.
+    pub(super) fn slowdown(frame_us: u64, target_us: u64) -> f64 {
+        if target_us == 0 || frame_us <= target_us + target_us / 4 {
+            1.0
+        } else {
+            (frame_us as f64 / target_us as f64).min(20.0)
+        }
+    }
 }
 
 /// How even the frames are (`VICTORY_TIMER_LOG=1`): the times between frame
@@ -529,5 +629,26 @@ mod tests {
         assert!(paced >= 1 && !PACED.load(Ordering::Relaxed));
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
         assert!(last(FLIP).load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn av_sync_parses_and_scales() {
+        use super::av_sync::{parse, slowdown, smooth_next};
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("yes"), None);
+        assert_eq!(parse("1"), Some(None));
+        assert_eq!(parse(" 30 "), Some(Some(Duration::from_nanos(33_333_333))));
+        // Within a quarter of the target: real time.
+        assert_eq!(slowdown(16_667, 16_667), 1.0);
+        assert_eq!(slowdown(20_000, 16_667), 1.0);
+        assert!((slowdown(333_330, 33_333) - 10.0).abs() < 0.01);
+        assert_eq!(slowdown(5_000_000, 16_667), 20.0);
+        // Uncapped (no interval): nothing to pace against.
+        assert_eq!(slowdown(500_000, 0), 1.0);
+        assert_eq!(smooth_next(0, 100), 100);
+        assert_eq!(smooth_next(100, 140), 110);
+        assert_eq!(smooth_next(100, 500), 300);
+        // Off unless asked for (tests do not set it).
+        assert_eq!(super::av_sync_factor(), 1.0);
     }
 }
