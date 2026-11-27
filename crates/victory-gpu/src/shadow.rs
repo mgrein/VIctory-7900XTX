@@ -2144,14 +2144,18 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, and their bytes; then how often it gave
+/// up (the caller waits for the flights instead), by why ([`note_stale`]):
+/// the memory not watched, the journal not answering, more changed runs
+/// than the cap, no snapshot.
+static MERGED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn note_stale(why: usize) {
     STALE_WHY.store(why, Ordering::Relaxed);
+    MERGED[3 + why.min(3)].fetch_add(1, Ordering::Relaxed);
 }
 
 /// [`STALE_WHY`] in words (diagnostics).
@@ -2185,8 +2189,8 @@ pub(crate) fn under_stats() -> [u64; 10] {
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 7] {
+    std::array::from_fn(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// Adds the time since it was made to [`UNDER_NS`]`[6]` when dropped.

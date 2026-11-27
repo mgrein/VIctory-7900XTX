@@ -39,6 +39,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod batch;
 
@@ -442,6 +443,7 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    counted(spec.0, count.is_some());
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
@@ -462,8 +464,47 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
+    counted(spec.0, false);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+/// Clamps recorded alone ([`bound`], [`bound_ahead`]) since the last
+/// frame-rate line, by the kind of their records: draws, indexed draws,
+/// dispatches, mesh dispatches; then of all those, the ones with a count
+/// buffer.
+static BOUNDED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn counted(kind: u32, count: bool) {
+    BOUNDED[clamp_kind(kind)].fetch_add(1, Ordering::Relaxed);
+    if count {
+        BOUNDED[4].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`BOUNDED`]'s counter for records of `kind` (PC argument numbering).
+fn clamp_kind(kind: u32) -> usize {
+    match kind {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 3,
+    }
+}
+
+/// For the frame-rate line: [`BOUNDED`] per frame, if any.
+pub(crate) fn line(frames: f64) {
+    let n = BOUNDED.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+    if n[..4].iter().sum::<f64>() > 0.0 {
+        tracing::info!(
+            "indirect calls clamped alone by a pass of ours per frame: {:.0} draws, {:.0} indexed draws, {:.0} dispatches, {:.0} mesh dispatches; {:.0} of them with a count buffer",
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4]
+        );
+    }
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
