@@ -61,7 +61,7 @@ foreach ($name in 'Safe', 'RayTracing', 'SoftwareRT', 'ConstantAmbient', 'Nvidia
     if ((Get-Variable $name -ValueOnly).IsPresent) { $playArgs[$name] = $true }
 }
 if ($PSBoundParameters.ContainsKey('Fps')) { $playArgs.Fps = $Fps }
-$run = & (Join-Path $PSScriptRoot 'play.ps1') @profile
+$run = & (Join-Path $PSScriptRoot 'play.ps1') @playArgs
 if (-not $run) { exit 1 }
 
 # As play.ps1: other settings left over in this window go; where your files are stays.
