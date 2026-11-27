@@ -131,9 +131,6 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
-    if super::no_wait() && super::fill_unlocked() {
-        staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
-    }
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));

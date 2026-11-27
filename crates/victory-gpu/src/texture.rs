@@ -77,9 +77,6 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
-    /// How many bytes of the texture's memory were mapped when a list last
-    /// recorded an upload of it ([`fill_unlocked`]; 0: not asked).
-    expected: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -107,6 +104,30 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The staging buffer holds a whole detiling of the texture's memory.
+    published: bool,
+    /// The last refresh found the runtime remapping title memory and kept
+    /// what the staging buffer held ([`Last::defer_remap`]).
+    deferred: bool,
+}
+
+impl Last {
+    /// A refresh that finds the runtime remapping title memory
+    /// ([`no_wait`]): whether it keeps what the staging buffer holds and
+    /// leaves the texture for its next refresh (what was learnt about
+    /// writes to it is forgotten, so that it is not passed over as
+    /// unwritten). Only a staging buffer that holds a detiling does, and
+    /// not twice in a row: a first filling, or the refresh after one left,
+    /// waits for the mapping to hold still, so that a runtime that remaps
+    /// all the time cannot keep a texture old for ever.
+    fn defer_remap(&mut self) -> bool {
+        if !self.published || self.deferred {
+            return false;
+        }
+        self.deferred = true;
+        self.asked = 0;
+        true
+    }
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -359,44 +380,26 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// ms, the texture's own lock 0).
 ///
 /// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// runtime has it, a staging buffer that holds a detiling keeps it and the
+/// texture is read at its next refresh, a frame later ([`Last::defer_remap`]);
+/// one that holds nothing yet, or that was left so at the refresh before,
+/// waits for the lock. The texture was read through the kernel instead
+/// before (and a buffer never filled from the pages there), but a read
+/// through the kernel that succeeds can still span two mappings of the
+/// memory, the runtime changing one page of it in between: that put texels
+/// of the old and the new contents together into one picture.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. A staging buffer that holds nothing
-/// yet is filled with what is there all the same ([`fill_unlocked`]): a list
-/// has recorded the upload from it by then.
+/// is remapping may show a frame later. It never shows read across a remap.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
-/// Whether a refresh that does not wait ([`no_wait`]) and finds a page
-/// missing fills a staging buffer that was never filled from the pages that
-/// are there (`VICTORY_TEXTURE_FILL=0`: it was left as it was made).
-///
-/// Left for the next refresh, it was uploaded as it was: the upload is
-/// recorded before the refresh, and a texture picked by index has no next
-/// refresh (its staging buffer goes with the upload). A texture the title
-/// holds only the smaller levels of is never all there, so whenever the
-/// runtime was remapping at that moment, its levels became zeros on the
-/// card, good ones too: of 16,135 textures a recorded frame's slots show,
-/// 2,382 had zeros in the first level shown; 137 of that frame's 787 repeated
-/// uploads put zeros over a filled level (run pic1-1; 68,700 refreshes left
-/// in the 150 s of world of run play1).
-fn fill_unlocked() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
-}
-
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there; staging buffers
-/// filled from the pages there ([`fill_unlocked`]), and of them those that
-/// got less than was mapped (their slots are looked at again).
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Since the last frame-rate line, with [`no_wait`]: refreshes that found
+/// title memory being remapped and kept what the staging buffer held, and
+/// those that waited for it all the same ([`Last::defer_remap`]).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -799,13 +802,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
-    if no_wait() && fill_unlocked() {
-        let there = match picking {
-            Some(there) if there != u64::MAX => there,
-            _ => mapped_bytes(staging.memory, staging.read),
-        };
-        staging.expected.store(there, Relaxed);
-    }
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
@@ -1253,7 +1249,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.publish(read, last);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1309,16 +1305,23 @@ impl Staging {
         // it a page went between the asking and the read in runs 71 and
         // 74).
         let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
+            // Not waited for while the staging buffer holds a detiling: it
+            // is kept and the texture read at its next refresh (`no_wait`).
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None if last.defer_remap() => {
+                    UNLOCKED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
+                None => {
+                    UNLOCKED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    waited(2, crate::watch::title_memory_reading)
+                }
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        last.deferred = false;
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1344,7 +1347,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.publish(read, last);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1366,7 +1369,7 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 found_blind(last);
-                self.detile(tiled);
+                self.publish(tiled, last);
                 self.keep_whole(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1384,83 +1387,10 @@ impl Staging {
         }
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        self.publish(tiled, last);
         self.keep_whole(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
-    }
-
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then a staging buffer that was filled
-    /// before keeps what it holds and the texture is looked at again at its
-    /// next refresh (what was learnt about writes to it is forgotten, so
-    /// that it is not passed over as unwritten); one never filled takes the
-    /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-                self.keep_whole(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else if last.hash.is_none() && fill_unlocked() {
-            self.fill(last, size)
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
-        }
-    }
-
-    /// The first filling of the staging buffer while the runtime is
-    /// remapping title memory, of a texture not all of which can be read:
-    /// with the pages that are there, zeros for the others, as a partly
-    /// mapped texture is filled under the lock. Pages that are away only
-    /// for the moment of a change (the runtime unmaps the rest of a view to
-    /// change one page of it) are read when that change is over. If less
-    /// was read than was mapped when the upload was recorded, or is mapped
-    /// now, the texture's slots are looked at again.
-    fn fill(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let start = self.memory as u64;
-        let mut there = 0;
-        let got = with_read(size, |read| {
-            let mut got = 0;
-            for _ in 0..4 {
-                got = crate::host::read_there(self.memory, read) as u64;
-                there = mapped_bytes(self.memory, size);
-                if got >= there.max(self.expected.load(Relaxed)) {
-                    break;
-                }
-                crate::watch::change_over();
-            }
-            if got != 0 {
-                last.hash = Some(digest(read));
-                self.detile(read);
-            }
-            got
-        });
-        last.partial = Some(crate::frame::current());
-        UNLOCKED[2].fetch_add(1, Relaxed);
-        if got < there.max(self.expected.load(Relaxed)) {
-            UNLOCKED[3].fetch_add(1, Relaxed);
-            last.asked = 0;
-            crate::descriptor::host::read_short(start);
-        } else {
-            crate::descriptor::host::read_all(start);
-        }
         size
     }
 
@@ -1490,8 +1420,20 @@ impl Staging {
         crate::texstore::keep(self.shape, &self.layout, tiled, parts);
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles `tiled` (the texture's memory) into the staging buffer and
+    /// notes in `last` whether it holds a whole detiling now; if not, the
+    /// texture is read again at its next refresh.
+    fn publish(&self, tiled: &[u8], last: &mut Last) {
+        last.published = self.detile(tiled);
+        if !last.published {
+            last.asked = 0;
+            last.hash = None;
+        }
+    }
+
+    /// Detiles `tiled` (the texture's memory) into the staging buffer;
+    /// false if a part of it could not be.
+    fn detile(&self, tiled: &[u8]) -> bool {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1538,9 +1480,10 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
         }
+        true
     }
 }
 
@@ -1937,7 +1880,6 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
-        expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
@@ -1950,6 +1892,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// A refresh that finds the runtime remapping keeps only a staging
+    /// buffer that holds a detiling, and not twice in a row; it forgets
+    /// what it learnt of writes, so that the next refresh reads.
+    #[test]
+    fn a_remap_keeps_only_a_published_picture_and_once() {
+        let mut last = super::Last::default();
+        assert!(!last.defer_remap(), "a first filling waits");
+        last.published = true;
+        last.asked = 42;
+        assert!(last.defer_remap());
+        assert_eq!(last.asked, 0);
+        assert!(!last.defer_remap(), "the refresh after one left waits");
+        last.deferred = false;
+        assert!(last.defer_remap());
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
