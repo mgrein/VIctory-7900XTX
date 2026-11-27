@@ -165,6 +165,27 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_NAN_GUARD=1`: a pixel program's colour export (`SV_Target`)
+/// that is not a number is written as 0, so one bad pixel does not spread
+/// through bloom or the temporal passes as a flickering square (after
+/// fxceless PR #837, KLBF Lab). Off by default: it hides whatever made the
+/// value, and costs a compare and a select per exported channel. Part of
+/// the translation: the shader cache keys on the switch when it is set.
+pub fn nan_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Whether pixel programs the console depth-tests before they run declare
+/// early depth and stencil tests (`lower::early_depth`): on unless
+/// `VICTORY_EARLY_DEPTH=0`, which gives the translation as it was before
+/// (the host tests after such a shader), for comparing. Part of the
+/// translation: the shader cache keys on the switch when it is set.
+pub fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

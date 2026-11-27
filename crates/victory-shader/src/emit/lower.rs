@@ -13958,8 +13958,11 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            // `VICTORY_NAN_GUARD=1`: a not-a-number colour is written as 0.
+            let guard_colours = self.s.pixel && !mesh && super::nan_guard();
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let guarded = guard_colours && el.kind == 16;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -13970,6 +13973,14 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            let x = if guarded && suffix == ".f32" {
+                let c = self.cur;
+                let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                let zero = self.s.m.f32(0);
+                self.s.m.select(c, nan, zero, x)
+            } else {
+                x
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),
