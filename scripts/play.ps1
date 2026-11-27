@@ -66,6 +66,10 @@ if ($Nvidia) {
     # RTX 4070, same save: 153 -> 108 ms a frame against the emulated walk. Changes every
     # shader's cache key: run `victory shaders` once with VICTORY_NATIVE_RT=1 set.
     if ($RayTracing -and -not $SoftwareRT) { $settings.VICTORY_NATIVE_RT = '1' }
+    # DirectStorage reads in flight up to 256 MiB, not the title's 32 MiB (codec-d/cool_fox 641835a4,
+    # their default; DexNom's tested baseline): multi-MB archive chunks no longer wait on each other.
+    # A budget of reads in flight, not an allocation: at most 224 MiB more RAM while streaming.
+    $settings.VICTORY_DSTORAGE_STAGING_MB = '256'
     # A spinning 64-thread compute queue that keeps the card awake contends with NVIDIA's time slicing.
     if (-not $CardAwake) { $settings.Remove('VICTORY_CARD_AWAKE') }
     # Switches to try, one at a time (-More @{NAME='value'}); each is read only by builds that have it:
@@ -80,6 +84,14 @@ if ($Nvidia) {
     #   VICTORY_PACE_AFTER=1      the frame pacing sleep after a present instead of before the next flip
     #   VICTORY_BVH_NO_HIT=1      ray walks find no hit while the structure builder is not running whole
     #   VICTORY_POOL_INPLACE=1    the page pool's windows mapped in place
+    # Memory and streaming (cool_fox's launcher, DexNom's baseline, VItoriaBr PR #107), one A/B run each
+    # with scripts\bench.ps1 before any becomes a default:
+    #   VICTORY_RESIDENCY=1       new host textures and staging held back while RAM or the card's memory runs short
+    #                             (codec-d, 32 GB: 64.2 -> 54.8 ms a frame and a lower peak commit; textures may come later)
+    #   VICTORY_LEVELS_ON_DEMAND=1  host copies of streamed textures take the card's memory level by level
+    #                             (little effect until reserved textures reach CreateReservedResource; late levels possible)
+    #   VICTORY_D3D12_BACKGROUND=0  no driver recompiles on the "D3D Background Thread"s for minutes after loading
+    #                             (frames 1,000-1,200 -> 830-950 ms once they stopped, run 54; the shaders kept may be slower)
 }
 if ($PSBoundParameters.ContainsKey('Fps')) {
     # One frame-rate switch (upstream's): it paces our frame clock and the loader gives the title the same rate.
