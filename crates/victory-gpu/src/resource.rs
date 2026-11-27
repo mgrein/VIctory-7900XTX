@@ -5122,7 +5122,7 @@ mod tests {
             S_OK
         );
         resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(source));
         let written = host_resource(source).unwrap();
         let sampled = host_resource(view).unwrap();
         let (upload, data) = host.upload_buffer(1024).unwrap();

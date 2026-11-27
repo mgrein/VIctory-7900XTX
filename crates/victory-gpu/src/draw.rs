@@ -1847,7 +1847,7 @@ impl State {
         }
         let host = heap.host()?;
         let slot = host.dynamic(1)?;
-        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, host.id(), slot, 1));
         let (cpu, resource) = host.make_for_clear(slot, view)?;
         self.bind_heaps(list);
         Some((host.gpu_handle(slot), cpu, resource))

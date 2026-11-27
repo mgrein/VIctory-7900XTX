@@ -154,7 +154,9 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    if walls_trace() != 0 {
+    // Kept only for the walls trace and the error record: otherwise a path
+    // for every open, for the whole run.
+    if walls_trace() != 0 || error_record::enabled() {
         walls_files().insert(file as usize, kept);
     }
     put(out, file)

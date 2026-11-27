@@ -10,7 +10,7 @@
 //! seen calling either slot, so it is not confirmed, and the slots stay
 //! unimplemented unless `VICTORY_DSTORAGE_ERROR_RECORD=1`.
 
-use super::{HRESULT, MEMORY_SOURCE, QueueRef, Request, WALLS_FILES};
+use super::{HRESULT, MEMORY_SOURCE, QueueRef, Request, walls_files};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::HANDLE;
@@ -69,9 +69,9 @@ impl Record {
             return;
         }
         self.offset = r.offset;
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        // The latest file at that address: an older one there was released.
-        if let Some((_, path)) = files.iter().rev().find(|(address, _)| *address == r.source as usize) {
+        // The latest file at that address (the map keeps the newest open):
+        // an older one there was released.
+        if let Some(path) = walls_files().get(&(r.source as usize)) {
             for (out, unit) in self.file[..259].iter_mut().zip(path.encode_utf16()) {
                 *out = unit;
             }

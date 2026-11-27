@@ -9703,7 +9703,6 @@ impl Batch {
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         static COPIES: MapHint = MapHint::new();
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = COPIES.map();
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
         // Renderer port #6: each list's part made on the threads beside, and
@@ -9745,7 +9744,7 @@ impl Batch {
             self.refresh_spans(spans, due, planning);
             return;
         }
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = COPIES.map();
         let mut touches = Vec::new();
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {

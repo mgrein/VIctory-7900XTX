@@ -258,6 +258,8 @@ impl GraphicsState {
             targets,
             depth_format: self.depth_format,
             samples: self.samples,
+            title_bias: self.title_bias,
+            depth16: self.depth16,
         }
     }
 }
