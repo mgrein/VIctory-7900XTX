@@ -448,6 +448,43 @@ impl Drop for State {
     }
 }
 
+/// The time the passes making textures picked by index ready may take
+/// ([`State::heap_textures`]): whether it is a slice of each frame that the
+/// recording threads' passes share (`VICTORY_TEXTURE_STAGE_PER_FRAME`, on
+/// unless `0`), and how long it is (`VICTORY_TEXTURE_STAGE_MS`: 6 ms a frame
+/// shared, 250 ms a pass otherwise).
+fn stage_span() -> (bool, std::time::Duration) {
+    static SPAN: std::sync::OnceLock<(bool, std::time::Duration)> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        let shared = std::env::var_os("VICTORY_TEXTURE_STAGE_PER_FRAME").is_none_or(|v| v != "0");
+        let ms = std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (shared, std::time::Duration::from_millis(ms.unwrap_or(if shared { 6 } else { 250 })))
+    })
+}
+
+/// The frame the shared texture slice was last spent in, and how much of it
+/// was ([`stage_span`]).
+static FRAME_SLICE: std::sync::Mutex<(u64, std::time::Duration)> =
+    std::sync::Mutex::new((0, std::time::Duration::ZERO));
+
+/// What is left of frame `frame`'s slice of `span` (`budget`: the frame it
+/// was last spent in and how much), starting it afresh in a new frame;
+/// `None` if nothing is, or `budget` is of a later frame.
+fn slice_left(
+    budget: &mut (u64, std::time::Duration),
+    frame: u64,
+    span: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if budget.0 > frame {
+        return None;
+    }
+    if budget.0 != frame {
+        *budget = (frame, std::time::Duration::ZERO);
+    }
+    let left = span.saturating_sub(budget.1);
+    (!left.is_zero()).then_some(left)
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -2402,14 +2439,20 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
+        // Also within a time per frame: the pass runs on a thread that
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        // It was 250 ms a pass (750 while a backlog drains), and with
+        // thousands of slots due a pass could take all of it in every frame
+        // of the world: a frame could not be shorter. A game streams its
+        // textures in a slice of each frame: `VICTORY_TEXTURE_STAGE_MS` (6)
+        // is that slice, shared by the recording threads' passes, three
+        // times as long while a backlog drains.
+        // `VICTORY_TEXTURE_STAGE_PER_FRAME=0`: a budget per pass, 250 ms
+        // unless `VICTORY_TEXTURE_STAGE_MS` is set, as before. Early passes
+        // keep their own budgets.
+        let (shared, span) = stage_span();
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
@@ -2419,9 +2462,25 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
+        let mut slice = None;
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+            }
+            None if shared => {
+                // The slice is the frame's, not the pass's: a pass while
+                // another thread's runs leaves its slots due (no recording
+                // thread waits on another).
+                let mut budget = match FRAME_SLICE.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                };
+                let Some(remaining) = slice_left(&mut budget, frame, span) else {
+                    return;
+                };
+                slice = Some(budget);
+                (remaining, per_frame)
             }
             None => (span, per_frame),
         };
@@ -2791,6 +2850,9 @@ impl State {
         }
         if baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
+        }
+        if let Some(mut budget) = slice {
+            budget.1 += began.elapsed();
         }
     }
 
@@ -4834,6 +4896,23 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn texture_slice_is_shared_within_a_frame_and_renewed_by_the_next() {
+        use super::slice_left;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut budget = (0, Duration::ZERO);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), Some(ms(6)));
+        budget.1 += ms(4);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), Some(ms(2)));
+        budget.1 += ms(3);
+        assert_eq!(slice_left(&mut budget, 5, ms(6)), None);
+        // A pass of an earlier frame, late: nothing.
+        assert_eq!(slice_left(&mut budget, 4, ms(6)), None);
+        assert_eq!(slice_left(&mut budget, 6, ms(18)), Some(ms(18)));
+        assert_eq!(budget, (6, Duration::ZERO));
     }
 }
 
