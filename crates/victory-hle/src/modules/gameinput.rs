@@ -1333,26 +1333,19 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>`: a file an outside script appends key
+    /// names to, one a line (`scripts/bench.ps1` presses Enter once the
+    /// log shows the start screen). It is read every quarter second; each
+    /// line added since is held for 0.2 s from then. (After Belobug PR #139,
+    /// by Zetsukae.)
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_code(key)?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1364,10 +1357,74 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(file_keys());
+        down
+    }
+
+    /// The key a name in `VICTORY_KEYS` or `VICTORY_KEYS_FILE` stands for.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim().trim_start_matches('\u{feff}') {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// The keys of the lines after the first `seen` of `text` (a last line
+    /// without its line end is not counted yet: the writer may be midway),
+    /// and how many lines are seen then.
+    #[cfg(feature = "diagnostics")]
+    fn new_lines(text: &str, seen: usize) -> (Vec<u8>, usize) {
+        let whole = text.matches('\n').count();
+        let keys = text.lines().take(whole).skip(seen).filter_map(key_code).collect();
+        (keys, whole.max(seen))
+    }
+
+    /// Keys held now from `VICTORY_KEYS_FILE` (see [`scripted`]).
+    #[cfg(feature = "diagnostics")]
+    fn file_keys() -> Vec<u8> {
+        struct Watch {
+            path: Option<std::path::PathBuf>,
+            next_read: Instant,
+            seen: usize,
+            held: Vec<(Instant, u8)>,
+        }
+        static WATCH: LazyLock<Mutex<Watch>> = LazyLock::new(|| {
+            Mutex::new(Watch {
+                path: std::env::var_os("VICTORY_KEYS_FILE").map(Into::into),
+                next_read: Instant::now(),
+                seen: 0,
+                held: Vec::new(),
+            })
+        });
+        let mut watch = WATCH.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(path) = watch.path.clone() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        if now >= watch.next_read {
+            watch.next_read = now + Duration::from_millis(250);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let (keys, seen) = new_lines(&text, watch.seen);
+                watch.seen = seen;
+                watch.held.extend(keys.into_iter().map(|vk| (now + Duration::from_millis(200), vk)));
+            }
+        }
+        watch.held.retain(|&(until, _)| until > now);
+        watch.held.iter().map(|&(_, vk)| vk).collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1378,6 +1435,17 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn keys_file_lines_are_taken_once_and_only_when_whole() {
+        assert_eq!(new_lines("", 0), (vec![], 0));
+        assert_eq!(new_lines("\u{feff}Enter\r\n", 0), (vec![0x0D], 1));
+        assert_eq!(new_lines("Enter\r\n", 1), (vec![], 1));
+        // A line being written is left for the next read.
+        assert_eq!(new_lines("Enter\r\nEs", 1), (vec![], 1));
+        assert_eq!(new_lines("Enter\r\nEsc\nnot a key\na\n", 1), (vec![0x1B, b'A'], 4));
     }
 
     #[test]

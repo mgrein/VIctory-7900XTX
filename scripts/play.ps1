@@ -3,7 +3,12 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 #               (on NVIDIA through the card's own ray tracing, DXR 1.1 ray queries; -SoftwareRT: the emulated walk)
-# -Build        target\diag (the default, the build all measurements are of) or target\release (faster to play)
+# -Build        auto (the default): target\release when it is built, else target\diag;
+#               release: the plain build, faster to play (no copy counters, per-call timing or memory-map walks),
+#               logging warnings and errors only (VICTORY_LOG=warn, unless -More sets it);
+#               diag: the build all measurements are of, for measuring runs (its log lines at info, as before)
+# -ConstantAmbient  without -RayTracing: a constant stand-in light (0.8) in place of the estimate from the frame,
+#               and the air's light bounded by 1.5 times the light around (cool_fox's non-ray-traced profile)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Nvidia       the NVIDIA profile even where no NVIDIA card is found (it is taken by itself on one; README.md, "NVIDIA")
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
@@ -15,12 +20,15 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$SoftwareRT,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [switch]$ConstantAmbient,
+    [ValidateSet('auto', 'diag', 'release')][string]$Build = 'auto',
     [hashtable]$More = @{},
     [switch]$Nvidia,
     [switch]$CardAwake,
     [ValidateRange(0, 1000)][int]$Fps,
-    [switch]$SmoothMotion
+    [switch]$SmoothMotion,
+    # Start nothing: give back the executable and the settings (scripts\bench.ps1 runs them itself).
+    [switch]$Print
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -34,6 +42,15 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+elseif ($ConstantAmbient) {
+    # (starnotes-xj's cool_fox launcher, 22d4a742, 0c2ece78, 81a5b319: "the constant 0.8 the runs that read best used";
+    # the air bound cleared a milky haze indoors on an RTX 4060.) The estimate (VICTORY_AMBIENT=0.8, the
+    # default here) follows the hour and the room's lamps but can wash rooms out near bright doorways;
+    # the constant cannot follow the time of day. A/B screenshots indoors and out, day and night, before
+    # either becomes the default.
+    $settings.VICTORY_AMBIENT = 'constant:0.8'
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+}
 
 # The NVIDIA profile: on an NVIDIA card (or with -Nvidia).
 if (-not $Nvidia) {
@@ -63,6 +80,10 @@ if ($Nvidia) {
     # RTX 4070, same save: 153 -> 108 ms a frame against the emulated walk. Changes every
     # shader's cache key: run `victory shaders` once with VICTORY_NATIVE_RT=1 set.
     if ($RayTracing -and -not $SoftwareRT) { $settings.VICTORY_NATIVE_RT = '1' }
+    # DirectStorage reads in flight up to 256 MiB, not the title's 32 MiB (codec-d/cool_fox 641835a4,
+    # their default; DexNom's tested baseline): multi-MB archive chunks no longer wait on each other.
+    # A budget of reads in flight, not an allocation: at most 224 MiB more RAM while streaming.
+    $settings.VICTORY_DSTORAGE_STAGING_MB = '256'
     # A spinning 64-thread compute queue that keeps the card awake contends with NVIDIA's time slicing.
     if (-not $CardAwake) { $settings.Remove('VICTORY_CARD_AWAKE') }
     # Switches to try, one at a time (-More @{NAME='value'}); each is read only by builds that have it:
@@ -77,6 +98,14 @@ if ($Nvidia) {
     #   VICTORY_PACE_AFTER=1      the frame pacing sleep after a present instead of before the next flip
     #   VICTORY_BVH_NO_HIT=1      ray walks find no hit while the structure builder is not running whole
     #   VICTORY_POOL_INPLACE=1    the page pool's windows mapped in place
+    # Memory and streaming (cool_fox's launcher, DexNom's baseline, VItoriaBr PR #107), one A/B run each
+    # with scripts\bench.ps1 before any becomes a default:
+    #   VICTORY_RESIDENCY=1       new host textures and staging held back while RAM or the card's memory runs short
+    #                             (codec-d, 32 GB: 64.2 -> 54.8 ms a frame and a lower peak commit; textures may come later)
+    #   VICTORY_LEVELS_ON_DEMAND=1  host copies of streamed textures take the card's memory level by level
+    #                             (little effect until reserved textures reach CreateReservedResource; late levels possible)
+    #   VICTORY_D3D12_BACKGROUND=0  no driver recompiles on the "D3D Background Thread"s for minutes after loading
+    #                             (frames 1,000-1,200 -> 830-950 ms once they stopped, run 54; the shaders kept may be slower)
 }
 if ($PSBoundParameters.ContainsKey('Fps')) {
     # One frame-rate switch (upstream's): it paces our frame clock and the loader gives the title the same rate.
@@ -84,6 +113,14 @@ if ($PSBoundParameters.ContainsKey('Fps')) {
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
+if ($Build -eq 'auto') {
+    # (After cool_fox's Play-VIctory.cmd, which plays the release build at VICTORY_LOG=warn.)
+    $Build = if (Test-Path (Join-Path $PSScriptRoot '..\target\release\victory.exe')) { 'release' } else { 'diag' }
+    Write-Host "Playing the $Build build (-Build diag for a measuring run, -Build release for the faster one)."
+}
+# The release build logs warnings and errors only: info lines cost on the title's threads and say
+# little without the diagnostics' counters. -More @{VICTORY_LOG='info'} brings them back.
+if ($Build -eq 'release' -and -not $More.ContainsKey('VICTORY_LOG')) { $settings.VICTORY_LOG = 'warn' }
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
@@ -97,6 +134,7 @@ if ($SmoothMotion) {
     $victory = $sm
     Write-Host "Starting ${sm}. Smooth Motion adds about a frame of latency; VICTORY_REFLEX=1 (-More) goes with it, in builds that have it."
 }
+if ($Print) { return [pscustomobject]@{ Victory = (Resolve-Path $victory).Path; Exe = (Resolve-Path $Exe).Path; Settings = $settings } }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
