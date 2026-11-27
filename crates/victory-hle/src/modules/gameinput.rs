@@ -81,7 +81,8 @@ fn fresher() -> bool {
 const FRESH_US: u64 = 1_000;
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// Sticks: W/A/S/D left, I/J/K/L (and with `VICTORY_MOUSE_LOOK=1` the mouse)
+/// right; triggers Z and C. `VICTORY_KEYBINDS` changes buttons and triggers.
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -132,28 +133,199 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse, asked only while the stand-in pad can be in use.
+    fn mouse(&mut self) -> Mouse {
+        Mouse::default()
+    }
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
+/// The mouse as the stand-in pad sees it: look in stick units (-1 to 1, up
+/// positive) and the mouse buttons held, as virtual keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Mouse {
+    look_x: f32,
+    look_y: f32,
+    buttons: Vec<u8>,
+}
+
+/// What a key or mouse button does on the stand-in pad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bind {
+    Button(u32),
+    LeftTrigger,
+    RightTrigger,
+    Nothing,
+}
+
+/// Mouse look on the stand-in pad (`VICTORY_MOUSE_LOOK=1`, off by default):
+/// mouse movement turns the right stick, the right button pulls the left
+/// trigger (aim) and the left button the right one (fire), and while the
+/// title's window has focus the cursor is held in its middle. Off by
+/// default because it takes the cursor. From DexNom PR #82.
+fn mouse_look() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_MOUSE_LOOK").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// `VICTORY_MOUSE_SENSITIVITY=<number>` scales mouse look (default 1).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sensitivity() -> f32 {
+    static SCALE: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_SENSITIVITY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v: &f32| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    });
+    *SCALE
+}
+
+/// The default buttons and triggers: the table above, Z and C, and with
+/// mouse look the mouse buttons (right aims on the left trigger, left fires
+/// on the right).
+fn default_binds(mouse: bool) -> Vec<(u8, Bind)> {
+    let mut binds: Vec<_> = FALLBACK_BUTTONS
+        .iter()
+        .map(|&(vk, bit)| (vk, Bind::Button(bit)))
+        .collect();
+    binds.extend([(b'Z', Bind::LeftTrigger), (b'C', Bind::RightTrigger)]);
+    if mouse {
+        binds.extend([(0x02, Bind::LeftTrigger), (0x01, Bind::RightTrigger)]);
+    }
+    binds
+}
+
+/// `VICTORY_KEYBINDS=Space=X,LShift=A,Mouse4=LB,Backspace=None` (any build):
+/// each entry replaces what that key or mouse button does on the stand-in
+/// pad; names are case-insensitive, an entry not understood is left out with
+/// a warning. Keys: letters, digits, F1-F12, Space, Enter, Esc, Tab,
+/// Backspace, Up, Down, Left, Right, LShift, RShift, LCtrl, RCtrl, LAlt,
+/// RAlt, Mouse1-Mouse5 (LMB, RMB, MMB). Targets: A, B, X, Y, LB, RB, LS, RS,
+/// Menu, View, DUp, DDown, DLeft, DRight, LT, RT, None. The stick keys
+/// (W/A/S/D, I/J/K/L) keep moving their sticks. From DexNom PR #82.
+fn parse_binds(list: &str, mouse: bool) -> Vec<(u8, Bind)> {
+    let mut binds = default_binds(mouse);
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let parsed = entry
+            .split_once('=')
+            .and_then(|(key, to)| Some((key_named(key.trim())?, bind_named(to.trim())?)));
+        let Some((vk, bind)) = parsed else {
+            tracing::warn!(entry, "VICTORY_KEYBINDS: entry not understood, left out");
+            continue;
+        };
+        binds.retain(|&(key, _)| key != vk);
+        binds.push((vk, bind));
+    }
+    binds
+}
+
+fn key_named(name: &str) -> Option<u8> {
+    let upper = name.to_ascii_uppercase();
+    if let [c @ (b'A'..=b'Z' | b'0'..=b'9')] = *upper.as_bytes() {
+        return Some(c);
+    }
+    if let Some(n) = upper.strip_prefix('F').and_then(|n| n.parse::<u8>().ok())
+        && (1..=12).contains(&n)
+    {
+        return Some(0x6F + n);
+    }
+    Some(match upper.as_str() {
+        "MOUSE1" | "LMB" => 0x01,
+        "MOUSE2" | "RMB" => 0x02,
+        "MOUSE3" | "MMB" => 0x04,
+        "MOUSE4" => 0x05,
+        "MOUSE5" => 0x06,
+        "BACKSPACE" => 0x08,
+        "TAB" => 0x09,
+        "ENTER" => 0x0D,
+        "ESC" | "ESCAPE" => 0x1B,
+        "SPACE" => 0x20,
+        "LEFT" => 0x25,
+        "UP" => 0x26,
+        "RIGHT" => 0x27,
+        "DOWN" => 0x28,
+        "SHIFT" | "LSHIFT" => 0xA0,
+        "RSHIFT" => 0xA1,
+        "CTRL" | "LCTRL" => 0xA2,
+        "RCTRL" => 0xA3,
+        "ALT" | "LALT" => 0xA4,
+        "RALT" => 0xA5,
+        _ => return None,
+    })
+}
+
+fn bind_named(name: &str) -> Option<Bind> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "A" => Bind::Button(A),
+        "B" => Bind::Button(B),
+        "X" => Bind::Button(X),
+        "Y" => Bind::Button(Y),
+        "LB" => Bind::Button(LEFT_SHOULDER),
+        "RB" => Bind::Button(RIGHT_SHOULDER),
+        "LS" => Bind::Button(LEFT_STICK),
+        "RS" => Bind::Button(RIGHT_STICK),
+        "MENU" | "START" => Bind::Button(MENU),
+        "VIEW" | "BACK" => Bind::Button(VIEW),
+        "DUP" => Bind::Button(UP),
+        "DDOWN" => Bind::Button(DOWN),
+        "DLEFT" => Bind::Button(LEFT),
+        "DRIGHT" => Bind::Button(RIGHT),
+        "LT" => Bind::LeftTrigger,
+        "RT" => Bind::RightTrigger,
+        "NONE" => Bind::Nothing,
+        _ => return None,
+    })
+}
+
+/// Stick deflection per pixel moved in one poll, at sensitivity 1.
+const LOOK_PER_PIXEL: f32 = 0.05;
+
+/// Mouse movement since the last poll (pixels, down positive) added to the
+/// deflection carried over, which halves each poll: a title that reads less
+/// often than we poll still sees the movement.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn look(carried: (f32, f32), dx: f32, dy: f32, sensitivity: f32) -> (f32, f32) {
+    let axis = |carried: f32, moved: f32| {
+        let v = (carried * 0.5 + moved * LOOK_PER_PIXEL * sensitivity).clamp(-1.0, 1.0);
+        if v.abs() < 0.01 { 0.0 } else { v }
     };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+    (axis(carried.0, dx), axis(carried.1, -dy))
+}
+
+static BINDS: LazyLock<Vec<(u8, Bind)>> = LazyLock::new(|| {
+    parse_binds(&std::env::var("VICTORY_KEYBINDS").unwrap_or_default(), mouse_look())
+});
+
+/// Whether the mouse is read at all: mouse look, or a bind on a mouse button.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn mouse_wanted() -> bool {
+    mouse_look() || BINDS.iter().any(|&(vk, _)| vk < 0x08)
+}
+
+fn fallback(keys: &[KeyState], mouse: &Mouse) -> PadState {
+    fallback_with(&BINDS, keys, mouse)
+}
+
+fn fallback_with(binds: &[(u8, Bind)], keys: &[KeyState], mouse: &Mouse) -> PadState {
+    let held = |vk: u8| keys.iter().any(|k| k.virtual_key == vk) || mouse.buttons.contains(&vk);
+    let on = |vk: u8| if held(vk) { 1.0 } else { 0.0 };
+    let mut pad = PadState {
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: (on(b'L') - on(b'J') + mouse.look_x).clamp(-1.0, 1.0),
+        right_y: (on(b'I') - on(b'K') + mouse.look_y).clamp(-1.0, 1.0),
+        ..Default::default()
+    };
+    for &(_, bind) in binds.iter().filter(|(vk, _)| held(*vk)) {
+        match bind {
+            Bind::Button(bit) => pad.buttons |= bit,
+            Bind::LeftTrigger => pad.left_trigger = 1.0,
+            Bind::RightTrigger => pad.right_trigger = 1.0,
+            Bind::Nothing => {}
+        }
     }
+    pad
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -483,8 +655,15 @@ impl Hub {
     fn read(&self, source: &mut dyn Source) -> Vec<Event> {
         let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
         let keys = source.keys();
+        // The mouse only feeds the stand-in pad: with a host pad and one pad
+        // each, it is left alone (the cursor too).
+        let mouse = if self.one_pad || pads.iter().all(Option::is_none) {
+            source.mouse()
+        } else {
+            Mouse::default()
+        };
         self.last_read.store(now(), Ordering::Relaxed);
-        self.state().poll(&self.devices, self.one_pad, pads, keys)
+        self.state().poll(&self.devices, self.one_pad, pads, keys, mouse)
     }
 
     /// On the title's thread, before it takes the current reading: the host
@@ -549,6 +728,7 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Mouse,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -567,7 +747,7 @@ impl State {
             self.seen_input[slot].then_some(pad)
         });
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(fallback(&keys, &mouse), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -576,7 +756,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, &mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1202,6 +1382,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1215,7 +1396,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1260,6 +1441,10 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Mouse look: stick deflection carried between polls, and when the
+        /// cursor was last put back in the window's middle.
+        look: (f32, f32),
+        centred: Option<Instant>,
     }
 
     impl Source for Host {
@@ -1321,6 +1506,61 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        /// Mouse buttons and, with mouse look, movement since the last poll,
+        /// the cursor then put back in the middle of the title's window.
+        /// Nothing without focus, so the cursor is free in other windows.
+        fn mouse(&mut self) -> Mouse {
+            if !mouse_wanted() || !focused() {
+                self.look = (0.0, 0.0);
+                self.centred = None;
+                return Mouse::default();
+            }
+            let buttons = [0x01_u8, 0x02, 0x04, 0x05, 0x06]
+                .into_iter()
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect();
+            let (mut dx, mut dy) = (0.0, 0.0);
+            if mouse_look() {
+                let now = Instant::now();
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                let mut at = POINT { x: 0, y: 0 };
+                // SAFETY: plain queries into locals.
+                let known = unsafe {
+                    GetWindowRect(GetForegroundWindow(), &mut rect) != 0
+                        && GetCursorPos(&mut at) != 0
+                };
+                if known {
+                    let centre = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                    // The last poll put the cursor in the middle; after a
+                    // gap (focus back, a host pad in between) start afresh.
+                    if self
+                        .centred
+                        .is_some_and(|t| now - t < Duration::from_millis(100))
+                    {
+                        dx = (at.x - centre.0) as f32;
+                        dy = (at.y - centre.1) as f32;
+                    }
+                    if (at.x, at.y) != centre {
+                        // SAFETY: plain call.
+                        unsafe { SetCursorPos(centre.0, centre.1) };
+                    }
+                    self.centred = Some(now);
+                }
+            }
+            self.look = look(self.look, dx, dy, sensitivity());
+            Mouse {
+                look_x: self.look.0,
+                look_y: self.look.1,
+                buttons,
+            }
         }
     }
 
@@ -1686,6 +1926,63 @@ mod tests {
         assert_eq!(pad(hub), PadState::default());
         assert_eq!(log.lock().unwrap().len(), 1);
         assert!(!hub.state().slots[2].connected);
+    }
+
+    #[test]
+    fn mouse_buttons_pull_the_triggers_and_movement_turns_the_right_stick() {
+        let mouse = Mouse {
+            look_x: 0.5,
+            look_y: -0.25,
+            buttons: vec![0x01, 0x02],
+        };
+        // Without mouse look the buttons do nothing; the movement still adds.
+        let pad = fallback_with(&default_binds(false), &[key(b'L')], &mouse);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (0.0, 0.0));
+        let pad = fallback_with(&default_binds(true), &[key(b'L')], &mouse);
+        assert_eq!((pad.left_trigger, pad.right_trigger), (1.0, 1.0));
+        // I/J/K/L and the mouse add up, within the stick's range.
+        assert_eq!((pad.right_x, pad.right_y), (1.0, -0.25));
+
+        // Moved right and up; nothing more, and it fades to rest.
+        let mut carried = look((0.0, 0.0), 10.0, -4.0, 1.0);
+        assert_eq!(carried, (0.5, 0.2));
+        for _ in 0..8 {
+            carried = look(carried, 0.0, 0.0, 1.0);
+        }
+        assert_eq!(carried, (0.0, 0.0));
+        assert_eq!(look((0.0, 0.0), 1000.0, 0.0, 1.0).0, 1.0);
+        assert_eq!(look((0.0, 0.0), 10.0, 0.0, 2.0).0, 1.0);
+    }
+
+    #[test]
+    fn keybinds_replace_what_a_key_did() {
+        let binds = parse_binds(
+            "Space=X, lshift=a, Mouse4=LB, Enter=None, Q=RT, nonsense, F1=Up",
+            false,
+        );
+        let held = |vks: &[u8]| {
+            let keys: Vec<_> = vks.iter().map(|&vk| key(vk)).collect();
+            fallback_with(&binds, &keys, &Mouse::default())
+        };
+        assert_eq!(held(&[0x20]).buttons, X);
+        assert_eq!(held(&[0xA0]).buttons, A);
+        assert_eq!(held(&[0x0D]).buttons, 0);
+        let q = held(b"Q");
+        assert_eq!((q.buttons, q.right_trigger), (0, 1.0));
+        // "Up" is a key name, not a target: that entry is left out.
+        assert_eq!(held(&[0x70]).buttons, 0);
+        // Defaults nobody rebound stay, and the stick keys keep their sticks.
+        assert_eq!(held(&[0x1B]).buttons, MENU);
+        assert_eq!(held(b"W").left_y, 1.0);
+        let mouse = Mouse {
+            buttons: vec![0x05],
+            ..Default::default()
+        };
+        assert_eq!(fallback_with(&binds, &[], &mouse).buttons, LEFT_SHOULDER);
+        assert_eq!(key_named("f12"), Some(0x7B));
+        assert_eq!(key_named("F13"), None);
+        // With no binds the stand-in pad is what it always was.
+        assert_eq!(parse_binds("", false), default_binds(false));
     }
 
     #[test]
