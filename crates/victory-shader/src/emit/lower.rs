@@ -12330,8 +12330,9 @@ impl<'a> Lower<'a> {
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
                     // An f32 result from 16-bit vertex values.
+                    // omod and clamp apply to it (abs and neg were refused above).
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    self.as_int(f)
+                    return self.write_f(inst, f, None);
                 } else if f16 {
                     let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     if let Fields::Valu(v) = &inst.fields {
