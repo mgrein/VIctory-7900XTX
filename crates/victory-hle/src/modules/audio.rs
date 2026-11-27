@@ -20,7 +20,7 @@ use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -329,6 +329,9 @@ struct Voice {
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
+    /// `VICTORY_AV_SYNC` with the frames behind: when the next block may
+    /// be written (blocks come at the frames' pace, not the clock's).
+    next_block_at: Option<Instant>,
     trace: Trace,
 }
 
@@ -427,6 +430,7 @@ impl Xma {
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
+            next_block_at: None,
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
@@ -516,7 +520,20 @@ fn pump(context: Context, voice: &mut Voice) {
     if size == 0 {
         return;
     }
+    // `VICTORY_AV_SYNC` (victory_gpu::frame::av_sync_factor; 1 when off):
+    // with the frames this many times slower than the title's rate, each
+    // block waits as many times its length after the last.
+    let slow = victory_gpu::frame::av_sync_factor();
+    if slow <= 1.0 {
+        voice.next_block_at = None;
+    }
     while context.field(1, 31, 1) == 1 {
+        let paced_at = (slow > 1.0).then(Instant::now);
+        if let (Some(now), Some(due)) = (paced_at, voice.next_block_at)
+            && now < due
+        {
+            return;
+        }
         if xma_refill() {
             // (codec-d/cool_fox fabb872a, `VICTORY_XMA_REFILL=1`.) A skipped
             // frame or an input boundary can advance the decoder without
@@ -547,6 +564,19 @@ fn pump(context: Context, voice: &mut Voice) {
             pair.copy_from_slice(&sample.to_le_bytes());
         }
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        if let Some(now) = paced_at {
+            const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+            let rate = RATES[context.field(1, 27, 2) as usize];
+            let block = Duration::from_micros(
+                (SAMPLES_PER_BLOCK / context.channels()) as u64 * 1_000_000 / u64::from(rate),
+            );
+            // Late by more than 50 ms: start again from now (no burst).
+            let base = voice
+                .next_block_at
+                .unwrap_or(now)
+                .max(now.checked_sub(Duration::from_millis(50)).unwrap_or(now));
+            voice.next_block_at = Some(base + block.mul_f64(slow));
+        }
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         // The read block is the title's: taken modulo the ring like the
@@ -706,8 +736,12 @@ fn wake_decoder() {
                 .spawn(|| {
                     loop {
                         xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono
+                        // (longer with `VICTORY_AV_SYNC` slowing it, at
+                        // most 16 ms).
+                        let slow = victory_gpu::frame::av_sync_factor();
+                        let wait = (2.0 * slow).clamp(2.0, 16.0);
+                        std::thread::park_timeout(Duration::from_secs_f64(wait / 1000.0));
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -769,14 +803,27 @@ struct State {
     /// Messages lost to a full queue since the last one queued.
     dropped: u32,
     since: Instant,
+    /// `VICTORY_AV_SYNC`: time the clock held back while the frames came
+    /// slower than the title's rate, and when that was last counted.
+    held: Duration,
+    counted: Instant,
 }
 
 impl State {
-    fn usec(&self) -> u64 {
-        self.since.elapsed().as_micros() as u64
+    /// The coprocessor's clock: time since connecting, less what
+    /// `VICTORY_AV_SYNC` held back (none when off: the wall clock as is).
+    fn usec(&mut self) -> u64 {
+        let now = Instant::now();
+        let slow = victory_gpu::frame::av_sync_factor();
+        if slow > 1.0 {
+            // Of the time since last counted, only 1/slow goes by.
+            self.held += now.saturating_duration_since(self.counted).mul_f64(1.0 - 1.0 / slow);
+        }
+        self.counted = now;
+        now.saturating_duration_since(self.since).saturating_sub(self.held).as_micros() as u64
     }
 
-    fn frame(&self) -> u32 {
+    fn frame(&mut self) -> u32 {
         (self.usec() * FRAMES_PER_SECOND / 1_000_000) as u32
     }
 
@@ -937,6 +984,8 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
             capacity: 0,
             dropped: 0,
             since: Instant::now(),
+            held: Duration::ZERO,
+            counted: Instant::now(),
         }),
     });
     // SAFETY: checked non-null.
@@ -1323,6 +1372,7 @@ mod tests {
             pcm: VecDeque::new(),
             skip: 0,
             ended: false,
+            next_block_at: None,
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
