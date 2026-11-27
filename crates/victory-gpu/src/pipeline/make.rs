@@ -46,7 +46,73 @@ pub(crate) struct Pending {
     /// What first uses have waited for it so far, over all frames and
     /// threads, in microseconds ([`total_capped`]).
     waited_us: AtomicU64,
+    /// Why it is never made ([`left_out`]); its draws and dispatches are
+    /// dropped as those of a pipeline the host refused.
+    left_out: Option<&'static str>,
 }
+
+/// Whether one of the compute programs in `shaders` is `name`: the title's
+/// containers hold their programs' names.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders.iter().any(|s| s.stage == "compute" && holds(&s.container, name))
+}
+
+/// Whether `bytes` hold `name` (not empty) somewhere.
+fn holds(bytes: &[u8], name: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let Some(at) = rest.iter().position(|b| *b == name[0]) {
+        if rest[at..].starts_with(name) {
+            return true;
+        }
+        rest = &rest[at + 1..];
+    }
+    false
+}
+
+/// The ray-tracing passes switched off for a run that traces no rays:
+/// `VICTORY_RT_RESOLVE=0` leaves out the programs that shade what the rays
+/// hit (`CS_RaytracingResolve`, about a thousand of them: on a cold cache
+/// they fill the workers' queue and the library for nothing but the answer
+/// "no hit"), `VICTORY_ACTIVATE_RAYS=0` the one that picks the rays to send
+/// (`CS_ScreenProbes_ActivateRays`). Both are made by default, as before:
+/// without them the targets they fill keep what was in them, which changes
+/// the picture. Neither switch counts in a run that builds the title's ray
+/// structures (`VICTORY_BVH_BUILDER=1`) or traces natively
+/// (`VICTORY_NATIVE_RT=1`): there the passes have hits to shade.
+/// (After DexNom ab34a8b2, pipeline/ray_tracing.rs, and the cool_fox fork's
+/// 8cc31ab3 by codec_d, `left_out`.)
+fn rays_left_out() -> [bool; 2] {
+    static OUT: OnceLock<[bool; 2]> = OnceLock::new();
+    *OUT.get_or_init(|| {
+        let off = |name: &str| std::env::var_os(name).is_some_and(|v| v == "0");
+        let asked = [off("VICTORY_RT_RESOLVE"), off("VICTORY_ACTIVATE_RAYS")];
+        let traced = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") || victory_shader::emit::native_rt();
+        if asked == [false, false] {
+            return asked;
+        }
+        if traced {
+            tracing::warn!("VICTORY_RT_RESOLVE=0 and VICTORY_ACTIVATE_RAYS=0 do not count in a run that traces rays");
+            return [false, false];
+        }
+        tracing::info!(resolve = asked[0], activate = asked[1], "ray-tracing passes left out: their pipelines are not made");
+        asked
+    })
+}
+
+/// Why the pipeline of `shaders` is not made at all, with the passes
+/// `out` ([`rays_left_out`]) left out.
+fn left_out(shaders: &[Arc<Shader>], out: [bool; 2]) -> Option<&'static str> {
+    if out[0] && named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray hits in a run that traces no rays (VICTORY_RT_RESOLVE=0)");
+    }
+    if out[1] && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("picks rays in a run that traces none (VICTORY_ACTIVATE_RAYS=0)");
+    }
+    None
+}
+
+/// Pipelines left out so far ([`left_out`]).
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
 // elements point into its own names) is only read after creation.
@@ -62,8 +128,16 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let out = rays_left_out();
+        // (The names are looked for only with a switch set: 84,000
+        // pipelines are created while the title loads.)
+        let left_out = if out == [false, false] { None } else { left_out(&shaders, out) };
+        if left_out.is_some() && LEFT_OUT.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::info!(?shaders, why = left_out, "a pipeline is left out (the first; further ones are not logged)");
+        }
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            left_out,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -174,6 +248,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -189,6 +266,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -196,6 +276,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -670,6 +753,39 @@ mod tests {
 
     /// Passes over the screen go before all others, and workers of their own
     /// take nothing else.
+    /// A pipeline of one shader whose container is `text` (with the stage
+    /// in it: the shader table keeps one shader per content).
+    fn of_container(stage: &'static str, text: &[u8]) -> Vec<Arc<Shader>> {
+        vec![super::super::shader(stage, &[stage.as_bytes(), b":", text].concat())]
+    }
+
+    #[test]
+    fn ray_passes_are_left_out_only_when_switched_off() {
+        let resolve = of_container("compute", b"..CS_RaytracingResolve_0db46314_Wrapped..");
+        let activate = of_container("compute", b"CS_ScreenProbes_ActivateRays_1");
+        let other = of_container("compute", b"CS_PedStandardSkinning_0");
+        let pixel = of_container("pixel", b"CS_RaytracingResolve in a pixel shader");
+        assert!(holds(b"aCCS_x", b"CS_x") && holds(b"CS_x", b"CS_x") && !holds(b"CS_", b"CS_x") && !holds(b"", b"C"));
+        assert!(left_out(&resolve, [false, false]).is_none());
+        assert!(left_out(&resolve, [true, false]).is_some());
+        assert!(left_out(&resolve, [false, true]).is_none());
+        assert!(left_out(&activate, [false, true]).is_some());
+        assert!(left_out(&activate, [true, false]).is_none());
+        for all in [[true, true], [false, false]] {
+            assert!(left_out(&other, all).is_none());
+            assert!(left_out(&pixel, all).is_none());
+        }
+        // One left out is never queued, made or waited for.
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("test");
+        let p = Arc::new(p);
+        early(&p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+    }
+
     #[test]
     fn a_pipeline_is_waited_for_one_budget_in_all() {
         let ms = Duration::from_millis;
