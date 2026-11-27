@@ -2314,8 +2314,8 @@ mod wide_tests {
 /// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
 /// the first byte that differs to the last, title memory is read into
 /// `title` (scratch, sized to that stretch) by `read` (the stretch's offset
-/// in the piece, where to), the GPU's bytes are put in and `host` takes the
-/// result. The stretch's offset in the piece and its length if that changed
+/// in the piece, where to), the GPU's bytes are put in and `host` and
+/// `old` take the result. The stretch's offset in the piece and its length if that changed
 /// title memory; none if nothing differs or title memory is not there.
 /// `runs` takes the runs of the stretch (offsets into `title`, lengths)
 /// whose bytes are the GPU's and differ from the title's as read: only
@@ -2324,7 +2324,7 @@ mod wide_tests {
 /// `mask` is scratch.
 fn back_piece(
     host: &mut [u8],
-    old: &[u8],
+    old: &mut [u8],
     title: &mut Vec<u8>,
     mask: &mut Vec<u8>,
     runs: &mut Vec<(usize, usize)>,
@@ -2337,7 +2337,7 @@ fn back_piece(
     let first = first_difference(host, old)?;
     let last = last_difference(host, old).unwrap_or(first);
     let n = last + 1 - first;
-    let (host, old) = (&mut host[first..=last], &old[first..=last]);
+    let (host, old) = (&mut host[first..=last], &mut old[first..=last]);
     title.clear();
     title.resize(n, 0);
     if !read(first, title) {
@@ -2357,13 +2357,18 @@ fn back_piece(
     mask.clear();
     mask.resize(n, 0);
     let mut differs = 0u8;
-    for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
+    for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()).zip(mask.iter_mut()) {
         let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
         let merged = (*t & !gpu) | (*h & gpu);
         *m = merged ^ *t;
         differs |= *m;
         *t = merged;
         *h = merged;
+        // The snapshot follows the copy: a later range of the submission
+        // over these bytes finds nothing of the GPU's left to put back, and
+        // a title write since (even of the byte's value before the
+        // submission) is not taken for the GPU's (Belobug PR #238, loyodea).
+        *o = merged;
     }
     if differs == 0 {
         return None;
@@ -2820,7 +2825,7 @@ mod merge_tests {
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), Some((5, 5)));
+        assert_eq!(back_piece(&mut host, &mut old.clone(), &mut scratch, &mut mask, &mut runs, read), Some((5, 5)));
         assert_eq!(asked, Some((5, 5)));
         let mut wanted = title_memory[5..10].to_vec();
         wanted[0] = gpu[5];
@@ -2835,10 +2840,10 @@ mod merge_tests {
 
         // Nothing differs: title memory is not read.
         let mut same = old.clone();
-        assert_eq!(back_piece(&mut same, &old, &mut scratch, &mut mask, &mut runs, |_, _| unreachable!()), None);
+        assert_eq!(back_piece(&mut same, &mut old.clone(), &mut scratch, &mut mask, &mut runs, |_, _| unreachable!()), None);
         // Title memory not there: nothing to write, the copy unchanged.
         let mut host = gpu.clone();
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, |_, _| false), None);
+        assert_eq!(back_piece(&mut host, &mut old.clone(), &mut scratch, &mut mask, &mut runs, |_, _| false), None);
         assert!(host == gpu);
         // The GPU wrote what the title holds already: nothing to write.
         let mut title_memory = old.clone();
@@ -2849,10 +2854,10 @@ mod merge_tests {
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), None);
+        assert_eq!(back_piece(&mut host, &mut old.clone(), &mut scratch, &mut mask, &mut runs, read), None);
         // A whole piece changed: the scratch grows to it.
         let mut host: Vec<u8> = old.iter().map(|b| !b).collect();
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, |_, into| into.len() == PIECE), Some((0, PIECE)));
+        assert_eq!(back_piece(&mut host, &mut old.clone(), &mut scratch, &mut mask, &mut runs, |_, into| into.len() == PIECE), Some((0, PIECE)));
         assert_eq!(scratch.len(), PIECE);
     }
 
@@ -2875,10 +2880,48 @@ mod merge_tests {
             into.copy_from_slice(&title_memory[first..first + into.len()]);
             true
         };
-        assert_eq!(back_piece(&mut host, &old, &mut scratch, &mut mask, &mut runs, read), Some((1, 4)));
+        assert_eq!(back_piece(&mut host, &mut old.clone(), &mut scratch, &mut mask, &mut runs, read), Some((1, 4)));
         assert_eq!(scratch, [20, 3, 44, 50], "the title's byte where both changed");
         assert_eq!(host[1..5], [20, 3, 44, 50], "the copy takes the result");
         assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
+    }
+
+    /// Two ranges of a submission over the same bytes: the second finds
+    /// nothing of the GPU's left where the first put it back, and a title
+    /// write between the two stays, even one that puts back the byte's
+    /// value before the submission (Belobug PR #238, loyodea).
+    #[test]
+    fn an_overlapping_range_keeps_a_title_write_made_after_the_first() {
+        let mut old = vec![0u8; 8];
+        let mut host = old.clone();
+        host[2] = 0xa5; // the GPU, either side of the title's byte
+        host[7] = 0x5a;
+        let mut title_memory = vec![0u8; 8];
+        title_memory[5] = 0x11; // the title, before the first range
+        let (mut scratch, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        fn read(m: &[u8]) -> impl FnOnce(usize, &mut [u8]) -> bool + '_ {
+            move |first: usize, into: &mut [u8]| {
+                into.copy_from_slice(&m[first..first + into.len()]);
+                true
+            }
+        }
+        let put = |m: &mut [u8], first: usize, scratch: &[u8], runs: &[(usize, usize)]| {
+            for &(at, n) in runs {
+                m[first + at..first + at + n].copy_from_slice(&scratch[at..at + n]);
+            }
+        };
+        let (first, _) = back_piece(&mut host, &mut old, &mut scratch, &mut mask, &mut runs, read(&title_memory)).unwrap();
+        put(&mut title_memory, first, &scratch, &runs);
+        assert_eq!(title_memory[2], 0xa5);
+        // The title writes the byte back to what it was before the
+        // submission; the second range comes over it.
+        title_memory[5] = 0;
+        let again = back_piece(&mut host, &mut old, &mut scratch, &mut mask, &mut runs, read(&title_memory));
+        if let Some((first, _)) = again {
+            put(&mut title_memory, first, &scratch, &runs);
+        }
+        assert_eq!(title_memory[5], 0, "an older title byte came back");
+        assert_eq!(title_memory[2], 0xa5);
     }
 
 
@@ -3866,17 +3909,17 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if let Some(before) = &mut *snapshot
             && from < to
         {
             // SAFETY: `writing` set the snapshot's bytes of every declared
-            // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            // range, at the copy's offsets; ours under its lock.
+            let before = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -3906,7 +3949,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
