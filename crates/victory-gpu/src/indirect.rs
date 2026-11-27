@@ -118,6 +118,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 g = src_args.Load3(src_at);
+        // Diagnostics, in the budget buffer's word 20: the largest count a
+        // compute record asked for in one dimension, of those over the
+        // 65,535 Direct3D 12 names for a dispatch (few: one atomic each).
+        uint widest_asked = max(g.x, max(g.y, g.z));
+        if (widest_asked > 65535u) {
+            uint told;
+            budget.InterlockedMax(20, widest_asked, told);
+        }
         // Up to WIDEST groups in x run as asked (`widest`).
         g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
         // x * y fits 32 bits where it is looked at; the whole count may not.
@@ -338,12 +346,15 @@ pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
+/// (`VICTORY_INDIRECT_REST=1`; off by default: it takes nothing, runs
+/// empty, and the next one that fits runs). A list whose budget one
+/// oversized record emptied lost all its later draws, and which record
+/// that was could differ from frame to frame (objects far away that come
+/// and go). What a list runs stays bounded by its budget either way: a
+/// record runs only if it fits in what is left. The frame line says how
+/// many records a frame are refused. (After cool_fox f4b48ad7, codec_d.)
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -436,16 +447,24 @@ fn validate_layout(
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
 /// available.
+///
+/// `root` is the caller's note of the compute root signature its list has
+/// bound (`crate::draw`'s `host_roots[1]`: a root signature's interface
+/// pointer, 0 for none or not known). A clamp leaves its own there, and
+/// one that finds its own there binds neither the root signature nor the
+/// budget again ([`clamp_binds_once`]); the pipeline it binds every time
+/// (callers set theirs to not known after, as before).
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    root: &mut usize,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     counted(spec.0, count.is_some());
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, false, root).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -462,11 +481,12 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
+    root: &mut usize,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     counted(spec.0, false);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true, root).then_some(dst)
 }
 
 /// Clamps recorded alone ([`bound`], [`bound_ahead`]) since the last
@@ -520,10 +540,22 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
+    root: &mut usize,
 ) -> bool {
+    /// A key of `HostList::first_use`: the first clamp of one execution
+    /// since the reset (another recording has none of our state, whatever
+    /// the caller's note says).
+    const BOUND_USE: usize = usize::MAX - 0x7b;
     let before = list.indirect_state(dst);
     let wait = waits_before(list);
-    let recorded = record_clamp_waiting(c, &list.list, (dst, before), budget, src, count, spec, ahead, wait);
+    let ours = windows::core::Interface::as_raw(&c.root) as usize;
+    // (Asked first: the first use is noted either way.)
+    let unbound = list.first_use(BOUND_USE) || *root != ours || !clamp_binds_once();
+    let recorded = record_clamp_waiting(c, &list.list, (dst, before), budget, src, count, spec, ahead, wait, unbound);
+    // (A clamp of no records binds nothing.)
+    if recorded && spec.2 > 0 {
+        *root = ours;
+    }
     if recorded {
         list.indirect_readable(dst);
         // The pass wrote the budget; with no wait after it the next pass
@@ -531,6 +563,23 @@ fn clamp_into(
         list.list.note_uav_work(!clamp_after_uav() || !barrier_waits());
     }
     recorded
+}
+
+/// Whether a clamp of one execution that follows another in its list,
+/// with no compute root signature bound between them, leaves out its
+/// `SetComputeRootSignature` and the budget's
+/// `SetComputeRootUnorderedAccessView` (`VICTORY_CLAMP_BIND_ONCE=0`: every
+/// clamp binds both, as before). Two calls fewer for each such clamp: the
+/// clamps of draws that follow each other, whose own pipelines are
+/// graphics ones and leave the list's compute root signature and its
+/// arguments alone. The budget's address is one for a recording
+/// (`HostList::budget`). What the card runs is the same. (After Belobug
+/// ab5ece8f, romainhedouin: there the clamps are hoisted into a list of
+/// their own and bind their pipeline once too; here a draw's pipeline
+/// comes between two clamps.)
+fn clamp_binds_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_BIND_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_CLAMP_AFTER_UAV=0` (experiment, off by default): a clamp of
@@ -598,12 +647,14 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_waiting(c, l, dst, budget, src, count, spec, ahead, true)
+    record_clamp_waiting(c, l, dst, budget, src, count, spec, ahead, true, true)
 }
 
 /// [`record_clamp_as`], beginning with a wait for every shader write only
 /// if `wait` ([`waits_before`]); it ends with one unless
-/// `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]).
+/// `VICTORY_CLAMP_AFTER_UAV=0` ([`clamp_after_uav`]). `unbound`: the list
+/// does not have the clamp's root signature with the budget in it bound
+/// ([`clamp_binds_once`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_waiting(
     c: &Clamp,
@@ -615,6 +666,7 @@ fn record_clamp_waiting(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
     wait: bool,
+    unbound: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -690,13 +742,15 @@ fn record_clamp_waiting(
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip_first..]);
         if records > 0 {
-            l.SetComputeRootSignature(&c.root);
+            if unbound {
+                l.SetComputeRootSignature(&c.root);
+                l.SetComputeRootUnorderedAccessView(4, budget);
+            }
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&second[skip_second..]);
@@ -2676,13 +2730,13 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), &mut 0).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), &mut 0).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -2698,7 +2752,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             D3D12_RESOURCE_STATE_COMMON,
             "a new scratch buffer is common"
         );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), &mut 0).unwrap();
         assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
@@ -2728,7 +2782,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), &mut 0).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -2743,8 +2797,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
 
     /// A group charges its records in lane order: with 300 left of the
     /// budget, the first draw (100) fits, the second (250) does not and
-    /// takes the rest, and the ones after it run empty. (Racing for the
-    /// word record by record, which of them fitted was up to the GPU.)
+    /// takes the rest (`VICTORY_INDIRECT_REST=1`), and the ones after it run
+    /// empty. (Racing for the word record by record, which of them fitted
+    /// was up to the GPU.)
     #[test]
     fn warp_a_group_charges_its_records_in_lane_order() {
         let Some((left, out)) = four_records_of_a_group(true) else {
@@ -2757,8 +2812,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_eq!(left, 0, "the record that did not fit took the rest");
     }
 
-    /// As above where a record that does not fit takes nothing
-    /// (`VICTORY_INDIRECT_REST=0`): those after it that fit run.
+    /// As above where a record that does not fit takes nothing (as it does
+    /// unless `VICTORY_INDIRECT_REST=1`): those after it that fit run.
     #[test]
     fn warp_a_record_that_does_not_fit_may_take_nothing() {
         let Some((left, out)) = four_records_of_a_group(false) else {
@@ -2774,7 +2829,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -2865,7 +2920,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Two records of 65,535 x 16 groups and one of 32: the whole budget
+        // (2^27 threads) exactly, so that nothing is left whether or not a
+        // record that does not fit takes the rest (`rest`).
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2878,7 +2935,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
             for i in 0..3 {
-                let words = [65535u32, 16, 1];
+                let words = if i < 2 { [65535u32, 16, 1] } else { [32, 1, 1] };
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2890,10 +2947,18 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // The compute root signature the list has bound, as `crate::draw`
+        // notes it: the second clamp of a recording finds the first one's
+        // there and binds neither it nor the budget again
+        // (`clamp_binds_once`), and is charged the same budget all the same;
+        // the first clamp of the next recording binds both whatever the
+        // note says (it is the last recording's).
+        let mut root = 0usize;
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), &mut root).unwrap();
+            assert_eq!(root, clamp().unwrap().root.as_raw() as usize, "a clamp notes its root signature");
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), &mut root).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -2913,8 +2978,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
         }
         // A recording with only the small record: the budget is empty
-        // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        // again, so it runs. (The note is stale here too.)
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), &mut root).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
@@ -3081,7 +3146,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
             for (groups, src) in windows.iter().zip(&sources) {
                 let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
-                let scratch = bound_ahead(&list, (src, 0), spec).unwrap();
+                let scratch = bound_ahead(&list, (src, 0), spec, &mut 0).unwrap();
                 assert_eq!(list.indirect_state(&scratch), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
@@ -3194,6 +3259,56 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
+        }
+    }
+
+    /// A direct dispatch wider than 65,535 groups in x runs every group once
+    /// under its own number on a card that runs wide indirect dispatches
+    /// ([`wide_card`]): the title's direct dispatches are passed on as asked,
+    /// so no spreading of x over y or z is needed there. On an RTX 4070 this
+    /// saw 67,440, 115,200 and 2^20 groups run whole.
+    #[test]
+    fn card_runs_wide_direct_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        if !wide_card(&gpu.device) {
+            return;
+        }
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        for asked in [67_440u32, 115_200, 1 << 20] {
+            let size = 16 + (4 << 20) + 16;
+            let seen = gpu.default_uav(size);
+            let (back, back_ptr, _) = gpu.shared_buffer(size);
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                gpu.list.SetComputeRootSignature(&worker.root);
+                gpu.list.SetPipelineState(&worker.pso);
+                gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                gpu.list.Dispatch(asked, 1, 1);
+                gpu.list.ResourceBarrier(&[uav_barrier()]);
+                gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+            }
+            gpu.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+            assert_eq!([word(0), word(1), word(2)], [asked, asked - 1, asked - 1], "asked for {asked}");
+            let wrong = (0..asked as usize).find(|&g| word(4 + g) != 1);
+            assert_eq!((wrong, word(4 + asked as usize)), (None, 0), "every group once, asked for {asked}");
         }
     }
 
@@ -3327,9 +3442,14 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 }
                 warp.submit_and_wait();
                 // SAFETY: the list has run; mapped words.
-                let budget: Vec<u32> = (0..3).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
+                let budget: Vec<u32> = (0..6).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
                 seen.push((read(back_ptr), budget));
             }
+            // A compute record that asks for more than 65,535 groups in a
+            // dimension is noted by what it asked for, whatever it runs.
+            let asked = records[i].1[..3].iter().copied().max().unwrap_or(0);
+            let noted = if *kind == 2 && asked > 65_535 { asked } else { 0 };
+            assert_eq!(seen[0].1[5], noted, "record {i} of kind {kind}: {:?}", records[i].1);
             // (A mesh record that asks for nothing notes nothing.)
             assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?}", records[i].1);
         }
@@ -3342,10 +3462,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+        // (`rest`: whether one that does not fit takes what is left.)
+        let cases = [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)];
+        for (rest, (times, records, filled)) in [true, false].into_iter().flat_map(|rest| cases.map(|c| (rest, c))) {
+            let source = batch::SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+            let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
@@ -3382,7 +3505,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let asked = (1 << 26) * times * records as u32;
+            let fitted = (1 << 26) * times * filled as u32;
+            assert_eq!(spent, if rest { BUDGET.min(asked) } else { fitted }, "{times} times {records}, rest {rest}");
         }
     }
 
@@ -3523,7 +3648,7 @@ void main() {
             }
             // Clamps of one execution, ending with no wait of their own.
             for record in [2u32, 9] {
-                let scratch = bound(&list, (&source, u64::from(record) * 32), None, (2, 12, 1)).unwrap();
+                let scratch = bound(&list, (&source, u64::from(record) * 32), None, (2, 12, 1), &mut 0).unwrap();
                 assert!(list.list.uav_work(), "with VICTORY_CLAMP_AFTER_UAV=0 a clamp leaves its budget write behind");
                 execute(&scratch, 0);
                 expected += 1 + record;
@@ -3533,7 +3658,7 @@ void main() {
             // SAFETY: an open list.
             unsafe { list.list.barriers(&[uav_barrier()]) };
             assert!(!list.list.uav_work());
-            let scratch = bound(&list, (&source, 32), None, (2, 12, 1)).unwrap();
+            let scratch = bound(&list, (&source, 32), None, (2, 12, 1), &mut 0).unwrap();
             execute(&scratch, 0);
             expected += 2;
             // Arguments a dispatch of the list writes, as the title's do:
