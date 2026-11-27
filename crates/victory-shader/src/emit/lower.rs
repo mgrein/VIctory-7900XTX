@@ -1633,31 +1633,49 @@ fn resinfo_mip_bounds_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_MIP_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_RESINFO_SHAPE=0`: an image size query reads 1 for each size DXIL
+/// leaves out, as before. Otherwise it answers as the console does: the
+/// depth of a 1D or 2D image that is not an array is 0, a 1D array reports
+/// its layers in both the second and the third size, and a cube 6 faces.
+fn resinfo_shape_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_SHAPE").is_none_or(|v| v != "0"))
+}
+
 /// The four results of an image size query (`image_get_resinfo`) of a view of
 /// DXIL resource kind `kind` from the host's `dimensions` (width, height,
-/// depth or layers, levels): a size DXIL leaves out reads 1. With
+/// depth or layers, levels): with `console_shape` the sizes DXIL leaves out
+/// read as on the console ([`resinfo_shape_on`]), else 1. With
 /// `mip_to_check`, all three sizes are 0 for a level at or past the count.
+/// A multisampled view (kinds 3 and 8) has one level.
 pub(super) fn resinfo_sizes(
     m: &mut super::bitcode::Module,
     block: usize,
     kind: u32,
     dimensions: [V; 4],
     mip_to_check: Option<V>,
+    console_shape: bool,
 ) -> [V; 4] {
     let [width, height, depth, levels] = dimensions;
+    let zero = m.i32(0);
     let one = m.i32(1);
+    let missing = if console_shape { zero } else { one };
     let mut sizes = match kind {
-        1 => [width, one, one],
-        2 | 5 | 6 => [width, height, one],
+        1 => [width, one, missing],
+        2 | 3 => [width, height, missing],
+        5 if console_shape => [width, height, m.i32(6)],
+        6 if console_shape => [width, height, height],
+        5 | 6 => [width, height, one],
         _ => [width, height, depth],
     };
     if let Some(mip) = mip_to_check {
-        let zero = m.i32(0);
         let exists = m.cmp(block, pred::IULT, mip, levels);
         for size in &mut sizes {
             *size = m.select(block, exists, *size, zero);
         }
     }
+    // (DXIL's fourth result of a multisampled view is its sample count.)
+    let levels = if matches!(kind, 3 | 8) { one } else { levels };
     [sizes[0], sizes[1], sizes[2], levels]
 }
 
@@ -12694,7 +12712,14 @@ impl<'a> Lower<'a> {
             let dimensions: [V; 4] = std::array::from_fn(|ch| {
                 if uav && ch == 3 { self.s.m.i32(1) } else { self.s.m.extract(c, d, ch as u32) }
             });
-            let sizes = resinfo_sizes(&mut self.s.m, c, kind, dimensions, requested.filter(|_| resinfo_mip_bounds_on()));
+            let sizes = resinfo_sizes(
+                &mut self.s.m,
+                c,
+                kind,
+                dimensions,
+                requested.filter(|_| resinfo_mip_bounds_on()),
+                resinfo_shape_on(),
+            );
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };

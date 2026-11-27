@@ -1408,28 +1408,44 @@ mod tests {
 
     /// The instructions an image size query emits ([`crate::emit::lower::resinfo_sizes`]),
     /// folded over constant dimensions: a level at or past the count reads all
-    /// sizes 0 even where a driver returns the clamped level's. From
+    /// sizes 0 even where a driver returns the clamped level's, and with the
+    /// console's shape the sizes DXIL leaves out read as on the console. From
     /// stellarr-studio/kelvaroq patch 0049.
     #[test]
     fn resinfo_sizes_are_zero_past_the_last_level() {
-        for (kind, mip, expected) in [
-            (2, Some(2), [8, 4, 1, 3]),
-            (2, Some(3), [0, 0, 0, 3]),
-            (2, Some(u32::MAX), [0, 0, 0, 3]),
-            (2, None, [8, 4, 1, 3]),
-            (1, None, [8, 1, 1, 3]),
-            (7, Some(0), [8, 4, 2, 3]),
+        for (kind, mip, shape, expected) in [
+            (2, Some(2), false, [8, 4, 1, 3]),
+            (2, Some(3), false, [0, 0, 0, 3]),
+            (2, Some(u32::MAX), false, [0, 0, 0, 3]),
+            (2, None, false, [8, 4, 1, 3]),
+            (1, None, false, [8, 1, 1, 3]),
+            (7, Some(0), false, [8, 4, 2, 3]),
+            (2, Some(2), true, [8, 4, 0, 3]),
+            (2, Some(3), true, [0, 0, 0, 3]),
+            (1, None, true, [8, 1, 0, 3]),
+            (5, None, true, [8, 4, 6, 3]),
+            (5, Some(3), true, [0, 0, 0, 3]),
+            (5, None, false, [8, 4, 1, 3]),
+            (6, None, true, [8, 4, 4, 3]),
+            (7, None, true, [8, 4, 2, 3]),
+            (3, None, true, [8, 4, 0, 1]),
+            (8, None, true, [8, 4, 2, 1]),
         ] {
             let Kit { mut m, b, writes, .. } = kit();
             let dimensions = [8, 4, 2, 3].map(|v| m.i32(v));
             let mip = mip.map(|v| m.i32(v));
-            let result = crate::emit::lower::resinfo_sizes(&mut m, b, kind, dimensions, mip);
+            let result =
+                crate::emit::lower::resinfo_sizes(&mut m, b, kind, dimensions, mip, shape);
             m.call(b, writes, result[..2].to_vec());
             m.call(b, writes, result[2..].to_vec());
             m.terminate(b, Term::Ret);
             m.optimise(FOLD | DEAD);
             let expected = expected.map(|v| m.i32(v));
-            assert_eq!(stores(&m, b), [expected[..2].to_vec(), expected[2..].to_vec()], "kind {kind}");
+            assert_eq!(
+                stores(&m, b),
+                [expected[..2].to_vec(), expected[2..].to_vec()],
+                "kind {kind} shape {shape}"
+            );
         }
     }
 
