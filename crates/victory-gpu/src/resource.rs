@@ -1860,6 +1860,15 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    texture_headroom(memory) != 0
+}
+
+/// The bytes of host copies of textures the title fills that [`room`] lets
+/// be made now: none when it says no. Levels given tiles one group at a
+/// time (`VICTORY_TEXTURE_LEVEL_BUDGET=1`, `crate::tiles`) get only as many
+/// as fit in it.
+#[cfg(windows)]
+pub(crate) fn texture_headroom(memory: Option<[u64; 4]>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1871,22 +1880,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return limit.saturating_sub(filled);
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
+    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget)).saturating_sub(filled);
     match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let held = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            floor.max((budget / 100 * room_percent()).saturating_sub(held))
         }
-        None => filled < WITHOUT_BUDGET,
+        None => floor.max(WITHOUT_BUDGET.saturating_sub(filled)),
     }
 }
 
@@ -2886,7 +2894,15 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let memory_now = crate::host::host().and_then(|h| h.video_memory());
+        let bytes = if crate::tiles::level_budget() {
+            texture_headroom(memory_now)
+        } else if room(memory_now) {
+            u64::MAX
+        } else {
+            0
+        };
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, bytes);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }

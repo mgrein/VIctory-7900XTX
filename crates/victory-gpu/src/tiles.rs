@@ -63,6 +63,40 @@ const TILE: u64 = 64 << 10;
 /// 4096x4096 one of one byte a texel: 256 tiles.
 const HEAP_TILES: u32 = 1024;
 
+/// Whether held levels of textures made level by level get tiles one group
+/// at a time as far as the room for host copies goes, the packed tail and
+/// the coarsest levels first (`VICTORY_TEXTURE_LEVEL_BUDGET=1`; off by
+/// default: a level gets its tiles only while there is any room at all,
+/// and then as many as it needs). With it a texture short of room shows
+/// its coarse levels instead of nothing, and the room freed by a copy let
+/// go is spent on the levels that fit in it.
+pub(crate) fn level_budget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LEVEL_BUDGET").is_some_and(|v| v == "1"))
+}
+
+/// Of the levels `missing` (a bit a level; from `standard.len()` on the
+/// packed tail, of `packed` tiles), those whose tiles fit in `bytes`: the
+/// tail first, then the standard levels (`standard[level]` tiles each) from
+/// the coarsest on, each whole or not at all.
+fn levels_with_room(standard: &[u32], packed: u32, missing: u32, bytes: u64) -> u32 {
+    let mut tiles = bytes / TILE;
+    let mut allowed = 0;
+    let tail = missing & u32::MAX.checked_shl(standard.len() as u32).unwrap_or(0);
+    if tail != 0 && u64::from(packed) <= tiles {
+        allowed |= tail;
+        tiles -= u64::from(packed);
+    }
+    for (level, &count) in standard.iter().enumerate().take(32).rev() {
+        let bit = 1u32 << level;
+        if missing & bit != 0 && u64::from(count) <= tiles {
+            allowed |= bit;
+            tiles -= u64::from(count);
+        }
+    }
+    allowed
+}
+
 /// Since the start, or now: such textures alive; the bytes all their
 /// levels would take; the bytes of the tiles given to them; the bytes of
 /// the pool's heaps; such textures made in all; levels given; calls of
@@ -343,26 +377,30 @@ impl Tiled {
     /// At the submission of a list that uploads every level of `texture`
     /// from its staging buffer, of which `held` are the title's now (the
     /// others are zeros there): tiles for the held ones that have none.
-    /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
+    /// `bytes`: how much of the card host copies may take now
+    /// (`resource.rs` `texture_headroom`; `u64::MAX` for as much as they
+    /// need, 0 for none). Without room no held level gets tiles: the
     /// list still brings the levels that have theirs up to date (which
     /// takes none of the card's memory), and its copies into the others go
     /// nowhere. (An upload of a host copy that exists passes the full
     /// card's gate in `draw.rs` on the ground that it takes no memory;
     /// with tiles given here regardless, the line would not bound these
-    /// textures.)
+    /// textures.) With some room, the held levels without tiles get theirs
+    /// as far as they fit, the packed tail and the coarsest levels first
+    /// ([`levels_with_room`]).
     /// Returns whether the first level a view may show changed, and
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
     /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, bytes: u64) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_with_room(host.queue(), &host.device, texture, held, bytes),
             None => (false, false),
         }
     }
 
-    /// [`Tiled::uploaded`] on a queue and a device.
+    /// [`Tiled::uploaded`] on a queue and a device, with room or none.
+    #[cfg(test)]
     pub(crate) fn uploaded_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -371,6 +409,18 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        self.uploaded_with_room(queue, device, texture, held, if room { u64::MAX } else { 0 })
+    }
+
+    /// [`Tiled::uploaded`] on a queue and a device.
+    fn uploaded_with_room(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        bytes: u64,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
@@ -378,7 +428,12 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let may = match bytes {
+            0 => card,
+            u64::MAX => named,
+            _ => card | levels_with_room(&self.standard, self.packed, self.without_locked(&given, held), bytes),
+        };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -741,6 +796,17 @@ mod tests {
 
     use super::*;
     use crate::host::{compile, transition, warp_adapter};
+
+    #[test]
+    fn some_room_gives_whole_levels_from_the_tail_on() {
+        let levels = [8, 4, 2];
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, TILE - 1), 0);
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, TILE), 0b11000);
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, 3 * TILE), 0b11100);
+        assert_eq!(levels_with_room(&levels, 1, 0b00011, 4 * TILE), 0b00010);
+        assert_eq!(levels_with_room(&levels, 1, 0b11001, 9 * TILE), 0b11001);
+        assert_eq!(levels_with_room(&levels, 0, 0b111, u64::MAX - 1), 0b111);
+    }
 
     const SIDE: u32 = 1024;
     const LEVELS: u16 = 11;
@@ -1386,6 +1452,28 @@ void look() {
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
+        // Some room (`VICTORY_TEXTURE_LEVEL_BUDGET=1`): of two held levels
+        // the coarsest, which fits, gets its tiles, level 0 still waits;
+        // the room it needs then gives it its own.
+        {
+            let (other, limited) = rig.reserved(&desc);
+            let last = limited.levels - 1;
+            let tail = limited.standard.get(last as usize).copied().unwrap_or(limited.packed);
+            let small = u64::from(tail) * TILE;
+            let held = 1 | (1 << last);
+            let (changed, waiting) = limited.uploaded_with_room(&rig.queue, &rig.device, &other, held, small);
+            rig.check("an upload with room for the coarsest level");
+            assert!(changed && waiting && limited.has_tiles(last) && !limited.has_tiles(0));
+            assert_eq!(limited.given_bytes(), small);
+            let bytes = rig.round_trip(&other, &layout, Some(&upload));
+            assert!(all(&bytes[0], 0) && all(&bytes[last as usize], last as u8 + 1));
+            let needed = u64::from(limited.standard[0]) * TILE;
+            let (changed, waiting) = limited.uploaded_with_room(&rig.queue, &rig.device, &other, held, needed);
+            rig.check("an upload with room for level 0");
+            assert!(changed && !waiting && limited.has_tiles(0));
+            assert_eq!(limited.given_bytes(), small + needed);
+            assert!(all(&rig.round_trip(&other, &layout, Some(&upload))[0], 1));
+        }
         // Asked again with room: the same levels get theirs.
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
         rig.check("the upload again, with room");
