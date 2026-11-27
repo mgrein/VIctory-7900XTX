@@ -10284,6 +10284,12 @@ impl Meter {
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                if crate::resource::EVICTIONS.load(Ordering::Relaxed) != 0 {
+                    tracing::info!(
+                        "host copies of textures let go as uploads were refused for room (VICTORY_TEXTURE_EVICT_FRAMES), since the start: {}",
+                        crate::resource::EVICTIONS.load(Ordering::Relaxed)
+                    );
+                }
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
                 }

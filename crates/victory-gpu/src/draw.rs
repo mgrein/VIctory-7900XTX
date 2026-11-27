@@ -2752,6 +2752,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        crate::resource::uploads_refused(refused);
         if baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
