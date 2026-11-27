@@ -461,10 +461,31 @@ fn slow_limit() -> usize {
     })
 }
 
+/// Whether the workers' queues are ordered by what a pipeline draws. Among
+/// those a draw waits for, the ones with a vertex shader (the passes that
+/// put the picture together are among them) go before compute and mesh
+/// pipelines, which on a cold cache are many and slow; among those started
+/// early, the ones that write depth alone (shadow maps, depth passes) go
+/// first: several later draws read what they drew, so one of them missing
+/// costs more of the picture than another. Each kind in the order asked for.
+/// (After VItoriaBr 8cb509bc by uiliannn and DexNom 921d8d3b.)
+/// On by default; `VICTORY_PIPELINE_ORDER=0`: in the order asked for alone,
+/// as before.
+fn ordered() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ORDER").is_none_or(|v| v != "0"))
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Requested ones with a vertex shader ([`ordered`]): before the other
+    /// requested ones.
+    requested_vertex: VecDeque<Arc<Pending>>,
+    /// Early ones that write depth alone ([`ordered`]): before the other
+    /// early ones.
+    early_depth: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -477,6 +498,8 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            requested_vertex: VecDeque::new(),
+            early_depth: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -491,6 +514,10 @@ impl Queue {
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+        self.push_in(p, priority, slow, ordered())
+    }
+
+    fn push_in(&mut self, p: &Arc<Pending>, priority: u8, slow: bool, ordered: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -498,10 +525,14 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && ordered && p.shaders.iter().any(|s| s.stage == "vertex") {
+            self.requested_vertex.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
+        } else if ordered && p.graphics.as_ref().is_some_and(|g| g.writes_depth_only()) {
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -522,9 +553,9 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front();
+            p = self.requested_vertex.pop_front().or_else(|| self.requested.pop_front());
             if p.is_none() && early {
-                p = unclaimed(&mut self.early);
+                p = unclaimed(&mut self.early_depth).or_else(|| unclaimed(&mut self.early));
             }
             if p.is_none() && early && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
@@ -873,6 +904,46 @@ mod tests {
             assert!(!result.recv_timeout(Duration::from_secs(10)).unwrap());
         });
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Requested pipelines with a vertex shader go before the other
+    /// requested ones, early ones that write depth alone before the other
+    /// early ones, and a request before both.
+    #[test]
+    fn the_queues_are_ordered_by_what_a_pipeline_draws() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let depth_only = || {
+            let mut state = Box::new(GraphicsState::default());
+            let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            // SAFETY: a whole depth format subobject of a pipeline stream.
+            unsafe { state.read(16, format.as_ptr().cast()) };
+            assert!(state.writes_depth_only());
+            Arc::new(Pending::new(Vec::new(), Some(state)))
+        };
+        let of = |stage, text: &[u8]| Arc::new(Pending::new(of_container(stage, text), None));
+        let (plain, promoted, shadow) = (Arc::new(Pending::new(Vec::new(), None)), depth_only(), depth_only());
+        let (compute, mesh, vertex) = (of("compute", b"order"), of("mesh", b"order"), of("vertex", b"order"));
+        let mut queue = Queue::new();
+        for p in [&plain, &shadow, &promoted] {
+            assert_eq!(queue.push_in(p, EARLY, false, true), Some(true));
+        }
+        for p in [&compute, &mesh, &vertex] {
+            assert_eq!(queue.push_in(p, REQUESTED, false, true), Some(true));
+        }
+        assert_eq!(queue.push_in(&promoted, REQUESTED, false, true), Some(false));
+        for expected in [&vertex, &compute, &mesh, &promoted, &shadow, &plain] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
+        }
+        assert!(queue.pop(false, 1).is_none());
+        // Switched off: in the order asked for.
+        let (compute, vertex) = (of("compute", b"order 2"), of("vertex", b"order 2"));
+        let (plain, shadow) = (Arc::new(Pending::new(Vec::new(), None)), depth_only());
+        for (p, priority) in [(&plain, EARLY), (&shadow, EARLY), (&compute, REQUESTED), (&vertex, REQUESTED)] {
+            assert_eq!(queue.push_in(p, priority, false, false), Some(true));
+        }
+        for expected in [&compute, &vertex, &plain, &shadow] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
+        }
     }
 
     #[test]
