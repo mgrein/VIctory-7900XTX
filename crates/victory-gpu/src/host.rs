@@ -7437,7 +7437,9 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        let mut mine = self.plane_slots.lock().unwrap_or_else(|e| e.into_inner());
+        record_plane_pass(&self.list, &depth.texture, &plane.texture, &mut mine.0);
+        drop(mine);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -11303,6 +11305,38 @@ pub(crate) fn list_buffers_let_go() {
     };
     for buffer in kept {
         retire_resource(buffer);
+    }
+}
+
+#[cfg(test)]
+mod plane_slot_tests {
+    use super::{PLANE_VIEWS, plane_slot};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    /// A pass's view is a free slot, kept by its list; no two passes share
+    /// one while both hold theirs, however many there are; with none free
+    /// the ring's slots serve, none of them a list's own.
+    #[test]
+    fn a_depth_plane_pass_takes_a_view_of_its_own_while_one_is_free() {
+        let free = Mutex::new((PLANE_VIEWS..PLANE_VIEWS + 3).rev().collect::<Vec<u32>>());
+        let next = AtomicU32::new(0);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let first = plane_slot(&free, &next, &mut a);
+        let second = plane_slot(&free, &next, &mut b);
+        let third = plane_slot(&free, &next, &mut a);
+        assert_eq!((first, second, third), (PLANE_VIEWS, PLANE_VIEWS + 1, PLANE_VIEWS + 2));
+        assert_eq!((a.clone(), b.clone()), (vec![first, third], vec![second]));
+        // None free: the ring, and nothing noted.
+        for i in 0..PLANE_VIEWS + 2 {
+            let slot = plane_slot(&free, &next, &mut b);
+            assert_eq!(slot, i % PLANE_VIEWS);
+        }
+        assert_eq!(b, vec![second]);
+        // A list that ran gives its own back; the next pass takes one.
+        free.lock().unwrap().append(&mut a);
+        let again = plane_slot(&free, &next, &mut b);
+        assert!(again == first || again == third);
     }
 }
 
