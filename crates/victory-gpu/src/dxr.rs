@@ -106,7 +106,7 @@ pub fn suppress_builder() -> bool {
     })
 }
 
-/// Whether opaque static BLAS geometries should also set
+/// Whether opaque BLAS geometries should also set
 /// `D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION`
 /// (`VICTORY_NATIVE_RT_NO_DUP_OPAQUE=1`, default OFF) for A/B testing
 /// `FORCE_NON_OPAQUE` ray-query loops.
@@ -148,9 +148,9 @@ fn should_compact(uncompacted_size: u64, compacted_size: u64) -> bool {
     saved > 4096 && (saved.saturating_mul(10) >= uncompacted_size || saved >= 64 * 1024)
 }
 
-fn static_geom_flags(opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
+fn static_geom_flags_with(opaque: bool, add_no_dup_opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
     if opaque {
-        if no_dup_opaque() {
+        if add_no_dup_opaque {
             D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
                 | D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION
         } else {
@@ -161,15 +161,23 @@ fn static_geom_flags(opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
     }
 }
 
-fn dynamic_geom_flags(raw_flags: u32) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
+fn static_geom_flags(opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
+    static_geom_flags_with(opaque, no_dup_opaque())
+}
+
+fn dynamic_geom_flags_with(raw_flags: u32, add_no_dup_opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
     let opaque = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE.0 as u32;
     let no_dup = D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION.0 as u32;
-    let flags = if (raw_flags & opaque) == 0 {
+    let flags = if (raw_flags & opaque) == 0 || add_no_dup_opaque {
         raw_flags | no_dup
     } else {
         raw_flags
     };
     D3D12_RAYTRACING_GEOMETRY_FLAGS(flags as i32)
+}
+
+fn dynamic_geom_flags(raw_flags: u32) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
+    dynamic_geom_flags_with(raw_flags, no_dup_opaque())
 }
 
 /// Guest `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS` (`0x18` bytes).
@@ -4306,10 +4314,17 @@ mod tests {
         let opaque = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
         let no_dup = D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION;
 
-        assert_eq!(dynamic_geom_flags(0), no_dup);
-        assert_eq!(dynamic_geom_flags(opaque.0 as u32), opaque);
-        assert_eq!(dynamic_geom_flags((opaque | no_dup).0 as u32), opaque | no_dup);
-        assert_eq!(static_geom_flags(false), no_dup);
+        assert_eq!(dynamic_geom_flags_with(0, false), no_dup);
+        assert_eq!(dynamic_geom_flags_with(opaque.0 as u32, false), opaque);
+        assert_eq!(dynamic_geom_flags_with((opaque | no_dup).0 as u32, false), opaque | no_dup);
+        assert_eq!(dynamic_geom_flags_with(0, true), no_dup);
+        assert_eq!(dynamic_geom_flags_with(opaque.0 as u32, true), opaque | no_dup);
+        assert_eq!(dynamic_geom_flags_with((opaque | no_dup).0 as u32, true), opaque | no_dup);
+
+        assert_eq!(static_geom_flags_with(false, false), no_dup);
+        assert_eq!(static_geom_flags_with(true, false), opaque);
+        assert_eq!(static_geom_flags_with(false, true), no_dup);
+        assert_eq!(static_geom_flags_with(true, true), opaque | no_dup);
     }
 
     #[test]
