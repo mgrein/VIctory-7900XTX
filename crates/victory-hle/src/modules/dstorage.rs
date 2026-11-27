@@ -222,7 +222,7 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", queue_vtable()), Queue { id }),
     )
 }
 
@@ -984,6 +984,17 @@ impl Lane {
         }
     }
 
+    /// `CancelRequestsWithTag`: the reads whose tag matches `value` under
+    /// `mask` and that have not started are dropped, enqueued or submitted;
+    /// running reads finish. Status entries behind them are written as soon
+    /// as the reads before them that remain are done.
+    fn cancel(&mut self, mask: u64, value: u64) {
+        self.unsubmitted
+            .retain(|command| !matches!(command, Command::Read(read) if read.request.tag & mask == value));
+        self.reads.retain(|(_, read)| read.request.tag & mask != value);
+        self.flush();
+    }
+
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
@@ -1499,6 +1510,37 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// `VICTORY_DSTORAGE_CANCEL=0`: slot 0x38 stays unimplemented, as before;
+/// unset or 1: it cancels the queue's reads by tag ([`Lane::cancel`]).
+fn cancel_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_CANCEL").is_none_or(|v| v != "0"))
+}
+
+/// Slot 0x38: cancels the reads not started whose tag matches.
+extern "system" fn cancel(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: as above.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        return;
+    };
+    let before = lane.entries();
+    lane.cancel(mask, value);
+    tracing::debug!(
+        mask = format_args!("{mask:#x}"),
+        value = format_args!("{value:#x}"),
+        cancelled = before - lane.entries(),
+        "dstorage: reads cancelled by tag"
+    );
+    drop(lanes);
+    // Room in the queue, and perhaps status entries written.
+    scheduler.finished.notify_all();
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1898,20 +1940,28 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Option<Vec<usize>
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
-    missing::<0> as *const (),
-    add_ref_instance::<Queue> as *const (),
-    release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
-]);
+/// One table for each choice of the switches ([`cancel_reads`]).
+fn queue_vtable() -> &'static Methods<12> {
+    static TABLES: [Methods<12>; 2] = [queue_methods(false), queue_methods(true)];
+    &TABLES[usize::from(cancel_reads())]
+}
+
+const fn queue_methods(cancel_reads: bool) -> Methods<12> {
+    Methods([
+        missing::<0> as *const (),
+        add_ref_instance::<Queue> as *const (),
+        release::<Queue> as *const (),
+        enqueue_request as *const (), // 0x18
+        enqueue_status as *const (),  // 0x20
+        missing::<5> as *const (),    // 0x28 (2020: fence signal)
+        submit as *const (),          // 0x30
+        if cancel_reads { cancel as *const () } else { missing::<7> as *const () }, // 0x38
+        close as *const (),           // 0x40
+        missing::<9> as *const (),    // 0x48 (2020: error event)
+        missing::<10> as *const (),   // 0x50 (2020: error record)
+        missing::<11> as *const (),   // 0x58 (2020: queue info)
+    ])
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -2379,6 +2429,32 @@ mod tests {
             bcpack: Default::default(),
             since: None,
         }
+    }
+
+    #[test]
+    fn cancelling_drops_matching_reads_not_started_and_not_later_ones() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 20));
+        let tag_last = |l: &mut Lanes, tag| {
+            if let Some(Command::Read(r)) = l.lanes.get_mut(&0).unwrap().unsubmitted.last_mut() {
+                r.request.tag = tag;
+            }
+        };
+        for tag in [0xa0, 0xb0] {
+            read(&mut l, 0, 0, 4);
+            tag_last(&mut l, tag);
+            l.submit(0, false);
+        }
+        read(&mut l, 0, 0, 4);
+        tag_last(&mut l, 0xa1);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.cancel(0xf0, 0xa0);
+        assert!(lane.unsubmitted.is_empty());
+        assert_eq!(lane.reads.len(), 1);
+        assert_eq!(lane.reads[0].1.request.tag, 0xb0);
+        read(&mut l, 0, 0, 4);
+        tag_last(&mut l, 0xa0);
+        assert_eq!(l.lanes[&0].unsubmitted.len(), 1);
     }
 
     fn read(lanes: &mut Lanes, id: u64, options: u64, size: u32) {
