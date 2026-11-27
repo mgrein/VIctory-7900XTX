@@ -313,6 +313,20 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// Whether the title texture `this` is a full-screen (1280x720 or more)
+/// single-mip 2D image, as a decoded video frame the title refills every
+/// frame is (`crate::list` with `VICTORY_THIN`; after cool_fox 22d4a742,
+/// starnotes-xj).
+#[cfg(windows)]
+pub(crate) fn is_video_frame(this: This) -> bool {
+    if this.is_null() || !is_resource(this) {
+        return false;
+    }
+    let d = resource(this).desc;
+    const TEXTURE2D: u32 = 3;
+    d.dimension == TEXTURE2D && d.mip_levels == 1 && d.width >= 1280 && d.height >= 720
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
