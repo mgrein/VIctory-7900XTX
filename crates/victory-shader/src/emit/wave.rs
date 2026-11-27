@@ -407,8 +407,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             let l = lane_number(lane);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
+                // (a value from before the section is each lane's own:
+                // what one named lane holds is that lane's, not what every
+                // lane holds; DexNom PR #99, Castyan)
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
+                    .filter(|s| !matches!(s, Sym::Own(_)))
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
@@ -921,6 +925,24 @@ mod tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         crate::ir::build(&code, wave64, 256).unwrap()
+    }
+
+    /// `v_readlane_b32 s1, v0, 4` inside a whole-wave section, of a VGPR
+    /// written before it: lane 4's value, not each lane's own `v0` (a
+    /// 32-lane host returned 1..64 where the console reads 4).
+    #[test]
+    fn a_lane_read_of_an_earlier_value_is_not_each_lanes_own() {
+        // (v0 has another use, so its lane 4 is no parked scalar, `ir::unspill`)
+        let mut w = vec![vop1(2, 0x01, 256)]; // v_mov_b32 v2, v0
+        w.push(sop1(0, 0x3D, 193)); // s_or_saveexec_b32 s0, -1
+        w.extend(vop3(1, 0x360, 256, 128 + 4, 0)); // v_readlane_b32 s1, v0, 4
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        assert_eq!(insts[2].name(), "v_readlane_b32");
+        let s1 = insts[2].write(Reg::S(1)).unwrap();
+        let section = &sections(&p, 0)[&1];
+        assert_eq!(section.shapes.get(&s1), None);
     }
 
     #[test]
