@@ -10,7 +10,7 @@ less processor time per frame and less memory.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
 Tested on one PC: Windows 11, RTX 4070 12 GB, 32 GB RAM, 12 threads, the Series X
 profile. In the world, ray tracing off: 64-80 ms a frame (12-16 fps) in areas of
@@ -116,6 +116,30 @@ per run (median of the last 15 five-second lines):
 | Heavier area (later save, ~4,000 draws), `play.ps1` NVIDIA profile | 80 ms (12.5 fps) | 64 ms (15.7 fps) |
 | Same area, ray tracing: emulated walk / DXR 1.1 ray queries | — | 153 ms (6.5 fps) / 108 ms (9.3 fps) |
 | Render queue (`VICTORY_REFLEX=1`, driver-measured) | not available | 0.2 ms |
+
+### The heavy save, by profile (2026-11-27)
+
+The same later save restored before every run (~3,500-4,000 draws a frame,
+on a boat in open water), `play.ps1`'s NVIDIA profile, 10 minutes a run,
+median of the last twelve five-second lines once the scene has settled;
+ray tracing is `-RayTracing` (DXR 1.1 ray queries). "Before" is main as it
+was on 2026-11-26 (9849f041); "after" adds the memory-leak fixes, the
+kelvaroq ports and the 187 improvements surveyed from the other forks.
+
+| Profile | Ray tracing | before | after | peak private memory before / after |
+|---|---|---|---|---|
+| Series X, 1440p | off | 64-66 ms (15.4 fps) | 59-60 ms (16.8 fps) | 27.5-27.9 / 26.8-27.2 GB |
+| Series X, 1440p | on | 130-155 ms (7.1 fps) | 84 ms (11.9 fps)* | 30.5-31.4 / 29.5-30.4 GB |
+| Series X, 1080p output (`VICTORY_OUTPUT=1920x1080`) | off | 52 ms (19.3 fps) | 50 ms (19.9 fps) | 27.6 / 26.2 GB |
+| Series X, 1080p output | on | 138 ms (7.2 fps) | 85 ms (11.8 fps) | 29.9 / 28.4 GB |
+| Series S (`--console series-s`) | off | 49 ms (20.4 fps) | 52 ms (19.2 fps) | 25.1 / 24.3 GB |
+| Series S | on | 64 ms (15.6 fps) | 62 ms (16.2 fps) | 27.1 / 26.4 GB |
+
+\* One of the two runs at 1440p with ray tracing went to 198 ms: the card's
+12 GB are full there and frames swing from 130 to 320 ms when what spills
+into the PC's memory is used. The Series S profile, whose targets are
+smaller, stays clear of it. Series S with ray tracing is the profile that
+plays best on this card.
 
 What made the difference on NVIDIA (each behind a `VICTORY_...` switch
 described where it is read):
