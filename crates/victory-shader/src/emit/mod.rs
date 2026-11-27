@@ -84,6 +84,8 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod builder32_tests;
 mod container;
+#[cfg(test)]
+mod coverage_tests;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]

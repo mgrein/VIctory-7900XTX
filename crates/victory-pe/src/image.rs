@@ -413,15 +413,41 @@ fn parse_tls(
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
         let array_rva = va_to_rva(callbacks_va, image_base)?;
-        let array = sections
-            .pe_data_at(data, array_rva)
+        let section = sections
+            .section_containing(array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
-            let va = u64::from_le_bytes(*slot);
-            if va == 0 {
+        let offset = (array_rva - section.virtual_address.get(LE)) as usize;
+        let virtual_len = section.virtual_size.get(LE) as usize - offset;
+        let raw = section.pe_data(data)?;
+        let array = raw.get(offset..).unwrap_or(&[]);
+        let mut terminated = false;
+        // Inspect the terminator after the last allowed callback too. The
+        // section's virtual tail is zero-filled by the Windows loader, so
+        // it can complete a slot or supply the null terminator.
+        for index in 0..=MAX_TLS_CALLBACKS {
+            let at = index * 8;
+            if at + 8 > virtual_len {
                 break;
             }
+            let mut slot = [0u8; 8];
+            if let Some(backed) = array.get(at..) {
+                let len = backed.len().min(slot.len());
+                slot[..len].copy_from_slice(&backed[..len]);
+            }
+            let va = u64::from_le_bytes(slot);
+            if va == 0 {
+                terminated = true;
+                break;
+            }
+            if index == MAX_TLS_CALLBACKS {
+                return Err(PeError::Malformed(format!(
+                    "TLS callback array exceeds {MAX_TLS_CALLBACKS} callbacks"
+                )));
+            }
             callback_rvas.push(va_to_rva(va, image_base)?);
+        }
+        if !terminated {
+            return Err(PeError::Malformed("unterminated TLS callback array".into()));
         }
     }
     Ok(Some(TlsInfo {
@@ -539,6 +565,183 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    /// A TLS directory followed by exactly `callbacks`, with no padding
+    /// that could accidentally supply a missing null terminator.
+    fn synthetic_tls_image(callbacks: &[u8]) -> Vec<u8> {
+        const BASE: u64 = 0x1_8000_0000;
+        let mut data = synthetic_image(&[0; 40]);
+        let export = layout::data_directory_offset(&data, 0).unwrap();
+        data[export..export + 8].fill(0);
+        let tls = layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_TLS).unwrap();
+        data[tls..tls + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[tls + 4..tls + 8].copy_from_slice(&40u32.to_le_bytes());
+        data[0x218..0x220].copy_from_slice(&(BASE + 0x1028).to_le_bytes());
+        data.truncate(0x228);
+        data.extend_from_slice(callbacks);
+        let size = (40 + callbacks.len()) as u32;
+        let section = layout::optional_header_offset(&data).unwrap() + 240;
+        data[section + 8..section + 12].copy_from_slice(&size.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&size.to_le_bytes());
+        let image_size = 0x1000 + size;
+        let opt = layout::optional_header_offset(&data).unwrap();
+        data[opt + 56..opt + 60].copy_from_slice(&image_size.to_le_bytes());
+        data
+    }
+
+    fn callback_bytes(rvas: &[u32]) -> Vec<u8> {
+        rvas.iter()
+            .flat_map(|&rva| {
+                let va = if rva == 0 {
+                    0
+                } else {
+                    0x1_8000_0000 + u64::from(rva)
+                };
+                va.to_le_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tls_callbacks_preserve_order_and_stop_at_null() {
+        let data = synthetic_tls_image(&callback_bytes(&[0x1000, 0x1010, 0, 0x1020]));
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.callback_rvas, [0x1000, 0x1010]);
+    }
+
+    #[test]
+    fn tls_callbacks_allow_empty_arrays_and_absent_pointers() {
+        let mut data = synthetic_tls_image(&callback_bytes(&[0]));
+        assert!(
+            ImageInfo::parse(&data)
+                .unwrap()
+                .tls
+                .unwrap()
+                .callback_rvas
+                .is_empty()
+        );
+        data[0x218..0x220].fill(0);
+        assert!(
+            ImageInfo::parse(&data)
+                .unwrap()
+                .tls
+                .unwrap()
+                .callback_rvas
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tls_callbacks_reject_missing_and_partial_terminators() {
+        for tail in 0..8 {
+            let mut bytes = callback_bytes(&[0x1000]);
+            bytes.resize(bytes.len() + tail, 0);
+            let data = synthetic_tls_image(&bytes);
+            assert!(
+                matches!(ImageInfo::parse(&data), Err(PeError::Malformed(_))),
+                "accepted {tail} bytes of a null terminator"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_callbacks_reject_arrays_without_a_complete_slot() {
+        for len in 0..8 {
+            let data = synthetic_tls_image(&vec![0; len]);
+            assert!(matches!(
+                ImageInfo::parse(&data),
+                Err(PeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn tls_callbacks_accept_the_limit_only_with_a_terminator() {
+        let mut rvas = vec![0x1000; MAX_TLS_CALLBACKS];
+        rvas.push(0);
+        let data = synthetic_tls_image(&callback_bytes(&rvas));
+        assert_eq!(
+            ImageInfo::parse(&data)
+                .unwrap()
+                .tls
+                .unwrap()
+                .callback_rvas
+                .len(),
+            MAX_TLS_CALLBACKS
+        );
+        rvas.pop();
+        let data = synthetic_tls_image(&callback_bytes(&rvas));
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn tls_callbacks_reject_lists_beyond_the_limit() {
+        let mut rvas = vec![0x1000; MAX_TLS_CALLBACKS + 1];
+        rvas.push(0);
+        let data = synthetic_tls_image(&callback_bytes(&rvas));
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn tls_callbacks_allow_terminators_in_zero_filled_section_data() {
+        // Windows fills the section's virtual tail with zeros. A null
+        // terminator may lie partly or wholly beyond the file-backed data.
+        for tail in 0..8 {
+            let mut bytes = callback_bytes(&[0x1000]);
+            bytes.resize(bytes.len() + tail, 0);
+            let mut data = synthetic_tls_image(&bytes);
+            let opt = layout::optional_header_offset(&data).unwrap();
+            let section = opt + 240;
+            let size = 40 + 16u32;
+            data[section + 8..section + 12].copy_from_slice(&size.to_le_bytes());
+            data[opt + 56..opt + 60].copy_from_slice(&(0x1000 + size).to_le_bytes());
+            assert_eq!(
+                ImageInfo::parse(&data).unwrap().tls.unwrap().callback_rvas,
+                [0x1000]
+            );
+        }
+    }
+
+    #[test]
+    fn tls_callbacks_read_slots_split_between_raw_and_zero_filled_data() {
+        // The last three bytes of this valid VA are zero and need not be
+        // file-backed. The following null slot is entirely zero-filled.
+        let bytes = callback_bytes(&[0x1000]);
+        let mut data = synthetic_tls_image(&bytes[..5]);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let section = opt + 240;
+        let size = 40 + 16u32;
+        data[section + 8..section + 12].copy_from_slice(&size.to_le_bytes());
+        data[opt + 56..opt + 60].copy_from_slice(&(0x1000 + size).to_le_bytes());
+        assert_eq!(
+            ImageInfo::parse(&data).unwrap().tls.unwrap().callback_rvas,
+            [0x1000]
+        );
+    }
+
+    #[test]
+    fn tls_callbacks_allow_an_empty_array_in_zero_filled_data() {
+        let mut data = synthetic_tls_image(&[]);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let section = opt + 240;
+        let size = 40 + 8u32;
+        data[section + 8..section + 12].copy_from_slice(&size.to_le_bytes());
+        data[opt + 56..opt + 60].copy_from_slice(&(0x1000 + size).to_le_bytes());
+        assert!(
+            ImageInfo::parse(&data)
+                .unwrap()
+                .tls
+                .unwrap()
+                .callback_rvas
+                .is_empty()
+        );
     }
 
     #[test]
