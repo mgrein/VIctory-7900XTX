@@ -155,6 +155,12 @@ fn build() -> [u8; 32] {
                 bytes.extend_from_slice(b"VICTORY_PORT_CBV_SLOT=1");
             }
         }
+        // Mesh draws launched by an amplification stage of the host's
+        // (`VICTORY_MESH_LAUNCH`): translated mesh shaders declare a payload.
+        // Only when on, so the translations cached without it keep their key.
+        if victory_shader::emit::mesh_launch() {
+            bytes.extend_from_slice(b"VICTORY_MESH_LAUNCH=payload");
+        }
         // Native ray tracing (`VICTORY_NATIVE_RT=1`): traversal loops lifted
         // to `RayQuery`, and the switches that pick which and how. Only when
         // one is set, so the translations cached without them keep their key.

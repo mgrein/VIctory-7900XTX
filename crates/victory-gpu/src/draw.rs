@@ -3405,8 +3405,15 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    // With the launch stage (`crate::launch`) the count goes
+                    // to it as a root constant.
+                    match crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.launch.as_ref()) {
+                        Some(launch) => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4047,6 +4054,30 @@ impl State {
         }
     }
 
+    /// After the bind of the mesh pipeline `p` for an indirect call the
+    /// launch stage does not take (`crate::launch`): if `p` has the stage,
+    /// its twin without it is bound in its place. False if there is none.
+    fn unlaunched(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(launch) = &p.launch else {
+            return true;
+        };
+        let Some(plain) = launch.plain() else {
+            return false;
+        };
+        let raw = plain.as_raw() as usize;
+        if self.host_pipeline != raw {
+            // SAFETY: an open list and a live pipeline of the bound root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            // The next bind of `p` sets its own again.
+            self.host_pipeline = raw;
+            list.keep(plain);
+        }
+        crate::launch::fill(list, launch.roots);
+        crate::launch::note_plain();
+        true
+    }
+
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
     /// is, from the open batch or a new one ([`batches`]). `None` if it
     /// cannot be clamped in one.
@@ -4173,6 +4204,42 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record without a count, of a pipeline with the launch
+        // stage (`crate::launch`, `VICTORY_MESH_LAUNCH`): the draw reads it
+        // itself, with no clamp pass of ours before it (no batch, no window).
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+            && args.offset(arguments).is_multiple_of(4)
+            && list.budget().is_some()
+        {
+            // Ends the window as every other writing path does: the mesh
+            // stage may store into the arguments a window clamped ahead.
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            crate::launch::wait_if_written(list);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max 1 at {arguments:#x} launched"), false));
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            // SAFETY: a live buffer (kept by the list: `refresh`).
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + args.offset(arguments);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no launch (no mesh command list)");
+                return false;
+            }
+            self.drew(list, Some(p));
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // For timing only (`indirect_trust`, unsafe): one draw or mesh
         // record without a count runs from the title's buffer as written,
         // with no pass of ours (no batch, no window, no clamp of its own).
@@ -4181,7 +4248,7 @@ impl State {
             args.refresh(list, arguments, len);
             let ran = match kind {
                 DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-                _ => self.prepare_for(list, false, true),
+                _ => self.prepare_for(list, false, true) && self.unlaunched(list, p),
             };
             if !ran {
                 why("prepare failed");
@@ -4299,7 +4366,9 @@ impl State {
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            // A mesh call the launch stage does not take runs on the same
+            // pipeline without it.
+            MESH => self.prepare_for(list, false, true) && self.unlaunched(list, p),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
