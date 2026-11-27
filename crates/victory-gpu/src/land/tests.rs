@@ -188,6 +188,16 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
         if round % 3 != 0 {
             assert!(crate::watch::writes(title.at, title.at + 2 * BLOCK, true).is_some());
             assert_eq!(crate::watch::writes(title.at, title.at + 2 * BLOCK, true).map(|w| w.1.len() > 2), Some(false));
+            // The same answer in the list the thread keeps, and in one of
+            // its own when asked again from within.
+            let (end, plain) = (title.at + 2 * BLOCK, crate::watch::writes(title.at, title.at + 2 * BLOCK, true));
+            let kept = crate::watch::with_writes(title.at, end, true, |_, outer| {
+                let inner = crate::watch::with_writes(title.at, end, true, |_, inner| inner.to_vec());
+                (outer.to_vec(), inner)
+            });
+            let plain = plain.map(|w| w.1);
+            assert_eq!(kept.as_ref().map(|k| &k.0), plain.as_ref(), "round {round}");
+            assert_eq!(kept.and_then(|k| k.1), plain, "round {round}");
         }
         let asked = crate::watch::writes(title.at, title.at + BLOCK, true).expect("a view").0;
         let mut notes = Notes::default();
