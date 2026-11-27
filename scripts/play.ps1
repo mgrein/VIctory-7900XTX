@@ -26,7 +26,9 @@ param(
     [switch]$Nvidia,
     [switch]$CardAwake,
     [ValidateRange(0, 1000)][int]$Fps,
-    [switch]$SmoothMotion
+    [switch]$SmoothMotion,
+    # Start nothing: give back the executable and the settings (scripts\bench.ps1 runs them itself).
+    [switch]$Print
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -132,6 +134,7 @@ if ($SmoothMotion) {
     $victory = $sm
     Write-Host "Starting ${sm}. Smooth Motion adds about a frame of latency; VICTORY_REFLEX=1 (-More) goes with it, in builds that have it."
 }
+if ($Print) { return [pscustomobject]@{ Victory = (Resolve-Path $victory).Path; Exe = (Resolve-Path $Exe).Path; Settings = $settings } }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
