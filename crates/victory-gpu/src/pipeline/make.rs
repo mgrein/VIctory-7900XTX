@@ -20,6 +20,10 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//!
+//! A program that fills in data once for the whole run is started when the
+//! title creates it and finished before its first dispatch, outside the
+//! frame's budget ([`fills_in_once`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -49,6 +53,25 @@ pub(crate) struct Pending {
     /// Why it is never made ([`left_out`]); its draws and dispatches are
     /// dropped as those of a pipeline the host refused.
     left_out: Option<&'static str>,
+    /// Its one dispatch must not be lost ([`fills_in_once`]).
+    once: bool,
+}
+
+/// Whether the pipeline of `shaders` fills in data the title keeps for the
+/// whole run with one dispatch: the program that maps the heads' blend
+/// shapes (`CS_ComputeBlendshapeMappings`). On a cold cache its pipeline
+/// was not there within the frame's budget, the dispatch was dropped, and
+/// every later skinning of a head read mappings nobody had written: faces
+/// stayed broken to the run's end, long after the workers had caught up.
+/// Such a pipeline is started when the title creates it and, if it is still
+/// not there at its first dispatch, made or waited for on that thread: one
+/// compile, once. (As the cool_fox fork's 700fc784 by Xyzstk, its PR #30.)
+/// On by default; `VICTORY_PIPELINE_ONCE=0`: within the frame's budget like
+/// every other, as before.
+fn fills_in_once(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_ONCE").is_none_or(|v| v != "0"))
+        && named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
 /// Whether one of the compute programs in `shaders` is `name`: the title's
@@ -137,6 +160,8 @@ impl Pending {
         }
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            // (Compute programs alone are looked through: one shader each.)
+            once: graphics.is_none() && fills_in_once(&shaders),
             left_out,
             shaders,
             graphics,
@@ -258,7 +283,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.once {
+            // Waits for the worker that is making it, or makes it here if
+            // none has taken it yet: the frame's budget cannot drop a
+            // dispatch that happens once.
+            let began = Instant::now();
+            p.make();
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = began.elapsed().as_millis() as u64,
+                made = p.made.get().is_some_and(|made| made.is_some()),
+                "a pipeline that fills in data once was finished before its first dispatch"
+            );
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -279,7 +318,11 @@ pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_some() {
         return;
     }
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.once {
+        // Before the others, whether an earlier run used it or not.
+        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        start(p, REQUESTED);
+    } else if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -784,6 +827,52 @@ mod tests {
         assert!(!now(&p));
         assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert!(p.made.get().is_none());
+    }
+
+    #[test]
+    fn the_blend_shape_mapping_is_a_pipeline_that_fills_in_once() {
+        if std::env::var_os("VICTORY_PIPELINE_ONCE").is_some_and(|v| v == "0") {
+            return; // switched off by the environment
+        }
+        let once = |stage, text: &[u8]| Pending::new(of_container(stage, text), None).once;
+        assert!(once("compute", b"CS_ComputeBlendshapeMappings_54139280_Wrapped"));
+        assert!(!once("pixel", b"CS_ComputeBlendshapeMappings_54139280_Wrapped"));
+        assert!(!once("compute", b"CS_PedStandardSkinning_0"));
+    }
+
+    /// The first dispatch of such a pipeline waits for the worker that is
+    /// making it past the frame's budget.
+    #[test]
+    fn a_pipeline_that_fills_in_once_is_waited_for_past_the_budget() {
+        let budget = wait_budget();
+        if budget > Duration::from_secs(2) {
+            return; // long by the environment
+        }
+        let mut p = Pending::new(Vec::new(), None);
+        p.once = true;
+        // A worker has taken it and is still in the driver.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let entered = std::sync::Barrier::new(2);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (returned, result) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let (worker, entered) = (p.clone(), &entered);
+            scope.spawn(move || {
+                worker.made.get_or_init(|| {
+                    entered.wait();
+                    gate.recv().unwrap();
+                    None
+                });
+            });
+            entered.wait();
+            scope.spawn(|| returned.send(ready(&p).is_some()).unwrap());
+            let early = result.recv_timeout(budget + Duration::from_millis(150));
+            release.send(()).unwrap();
+            assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+            assert!(!result.recv_timeout(Duration::from_secs(10)).unwrap());
+        });
+        assert!(matches!(p.made.get(), Some(None)));
     }
 
     #[test]
