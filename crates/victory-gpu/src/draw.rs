@@ -609,9 +609,12 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
-/// the spans and refreshes of their copies, the texture side.
+/// the spans and refreshes of their copies, the texture side; then of the
+/// first, waiting for the heap's sweep lock; and of every pass making
+/// textures picked by index ready (early ones too), the queue's upkeep up
+/// to the due slots, and making those ready.
 #[cfg(feature = "diagnostics")]
-pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static HEAP_SPLIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -899,6 +902,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    HEAP_SPLIT[3].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
@@ -2334,6 +2339,8 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let pass_began = std::time::Instant::now();
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2408,6 +2415,12 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        let queued = {
+            let now = std::time::Instant::now();
+            HEAP_SPLIT[4].fetch_add((now - pass_began).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
@@ -2854,6 +2867,8 @@ impl State {
         if let Some(mut budget) = slice {
             budget.1 += began.elapsed();
         }
+        #[cfg(feature = "diagnostics")]
+        HEAP_SPLIT[5].fetch_add(queued.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

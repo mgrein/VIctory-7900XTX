@@ -8665,12 +8665,17 @@ fn split_line(frames: f64) {
         s[3],
     );
     tracing::info!(
-        "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
-         first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
+        "the pass over the heap's views per frame: {:.1} ms looking at slots ({:.1} of it waiting for the sweep lock), {:.1} their \
+         copies' spans and refreshes, {:.1} textures; the first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for \
+         at the lists' close; every pass making textures picked by index ready (early ones too): {:.1} ms the queue's upkeep, {:.1} \
+         making the due slots ready",
         h[0],
+        h[3],
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+        h[4],
+        h[5],
     );
 }
 
