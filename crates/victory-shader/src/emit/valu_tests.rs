@@ -752,6 +752,29 @@ fn v_min3_max3_med3_integer_forms_match_rdna2() {
 }
 
 #[test]
+fn scalar_min_max_and_shift_add_set_scc_like_rdna2() {
+    // op s12, s0, s1; s_cselect_b32 s13, 1, 0; v_mov_b32 v0, s13 (v0 = SCC).
+    // s_min: SCC = S0 < S1; s_max: S0 > S1; s_lshl1_add_u32: the carry.
+    let cselect = sop2(0x0A, 13, 0x81, 0x80);
+    let cases = [[5u32, 3, 0, 0], [3, 5, 0, 0], [0, 7, 0, 0], [u32::MAX, 1, 0, 0], [4, 4, 0, 0]];
+    type Scc = fn(u32, u32) -> bool;
+    let ops: [(u8, &str, Scc); 5] = [
+        (6, "s_min_i32", |a, b| (a as i32) < (b as i32)),
+        (7, "s_min_u32", |a, b| a < b),
+        (8, "s_max_i32", |a, b| (a as i32) > (b as i32)),
+        (9, "s_max_u32", |a, b| a > b),
+        (0x2E, "s_lshl1_add_u32", |a, b| (a << 1).checked_add(b).is_none()),
+    ];
+    for (op, name, scc) in ops {
+        let shader = build_valu_cs(&[sop2(op, 12, 0, 1), cselect, vop1(0x001, 0, sgpr(13))]);
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let want = u32::from(scc(inp[0], inp[1]));
+            assert_eq!(got, want, "{backend}: SCC after {name} case {i} {inp:x?}: got {got}, want {want}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
@@ -2177,7 +2200,8 @@ fn rdna_card() -> bool {
 
 /// The forms written for the console's own kind of hardware give, on such a
 /// card, what the ones spelled out for every host give; a legacy product's
-/// zero may have the other sign.
+/// zero may have the other sign. (Not the legacy multiply-add: spelled out
+/// it is fused and counts a subnormal factor as zero, `legacy_fmad`.)
 #[test]
 fn rdna_forms_give_what_the_spelled_out_ones_give() {
     if !rdna_card() {
@@ -2189,7 +2213,7 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
     let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
     let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
-    let bodies: [(&str, Vec<u32>, bool); 14] = [
+    let bodies: [(&str, Vec<u32>, bool); 13] = [
         ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
         ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
         ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
@@ -2202,7 +2226,6 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
         ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
         ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
-        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
         ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
     ];
     let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
@@ -2231,5 +2254,115 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             let same = was == is || x.is_nan() && y.is_nan() || !exact && x == 0.0 && y == 0.0;
             assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
         }
+    }
+}
+
+/// `v_mad_legacy_f32` as the console runs it (`v_fma_legacy_f32`): a zero
+/// or subnormal factor makes the product +0 whatever the other factor is,
+/// and the product is fused with the add where the host fuses (either
+/// rounding is taken: DXIL leaves fusing to the driver).
+#[test]
+fn legacy_mad_takes_a_subnormal_factor_as_zero() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46: one rounding or two.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A subnormal factor and an infinite one: the product is +0.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        [0x7f80_0000, 0x807f_ffff, 0x3f80_0000, 0],
+        // A zero factor and an infinite or not-a-number one.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+        [0x7fc0_0000, 0x8000_0000, 0xc000_0000, 0],
+        // Neither is zero: an ordinary product and sum.
+        [0x4000_0000, 0x4040_0000, 0x3f80_0000, 0],
+        [0x0080_0000, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0, 0x3f80_0000, 0x3f80_0000, 0x3f80_0000, 0xc000_0000, 0x40e0_0000, 0x7f80_0000];
+    run_cases(&mad, &cases, |backend, i, inp, got| {
+        if i == 0 && got == 0 {
+            eprintln!("{backend}: the multiply-add is not fused by this host (product rounded first)");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i} {inp:x?}: got {got:#x}, want {:#x}", want[i]);
+    });
+}
+
+/// SDWA `v_add_f16 v0, v1, v2` writing WORD_0: dst_unused 1 (sext) copies
+/// bit 15 of the result upward, dst_unused 0 (pad) clears the high word
+/// (a 16-bit -1.0 written with sext came out as 0x0000BC00).
+#[test]
+fn sdwa_word_0_sign_extends_a_16_bit_result() {
+    let sdwa = |dst_unused: u32| {
+        [
+            vop2(0x32, 0, 0xF9, 2),
+            1 | 4 << 8 | dst_unused << 11 | 6 << 16 | 6 << 24,
+        ]
+    };
+    // -1.0 + 0, 1.0 + 0, -2.0 + 1.0 (high words of the sources are not read).
+    let cases = [[0xBC00u32, 0, 0, 0], [0x3C00, 0, 0, 0], [0x1234_C000, 0xFFFF_3C00, 0, 0]];
+    for (dst_unused, name) in [(1, "sext"), (0, "pad")] {
+        let shader = build_valu_cs(&sdwa(dst_unused));
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let sum = [0xBC00u32, 0x3C00, 0xBC00][i];
+            let want = if dst_unused == 1 { sum as u16 as i16 as i32 as u32 } else { sum };
+            assert_eq!(got, want, "{backend}: {name} case {i} {inp:x?}: got {got:#x}, want {want:#x}");
+        });
+    }
+}
+
+/// `ds_write_b8` over 64 threads, each writing byte `thread & 3` of LDS[0]
+/// with `0x11 + (thread & 3)`: every byte holds what its writers wrote and
+/// the writers of the other bytes of the dword lose nothing (one
+/// compare-exchange loop on the dword).
+#[test]
+fn lds_byte_writes_keep_the_other_bytes_of_their_dword() {
+    const DS_WRITE_B8: u8 = 0x1E;
+    let mut body = vec![vop1(0x001, 7, 0x80)]; // v_mov_b32 v7, 0
+    body.extend(ds(DS_WRITE_B32, 0, 7, 7));
+    body.push(S_BARRIER);
+    body.push(vop2(0x1B, 5, 0x83, 0)); // v_and_b32 v5, 3, v0
+    body.push(vop2(0x25, 6, 0x91, 5)); // v_add_nc_u32 v6, 17, v5
+    body.extend(ds(DS_WRITE_B8, 0, 5, 6));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 7, 0));
+    let shader = build_cs(&body, 64, 512);
+    run_cases(&shader, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0x1413_1211, "{backend}: got {got:#x}");
+    });
+}
+
+/// `ds_sub_u32`, and `ds_add_u32` of a negated value (which host compilers
+/// turn into a subtraction): DXIL has no atomic subtraction on group-shared
+/// memory and drivers refused the pipeline, so both are a compare-exchange
+/// loop. 64 threads each take `v2` from (or, subtracting `0 - v2`, add it
+/// to) LDS[0], which starts as `v1`.
+#[test]
+fn lds_subtraction_is_atomic_across_waves() {
+    const DS_ADD_U32: u8 = 0x00;
+    const DS_SUB_U32: u8 = 0x01;
+    for (op, negate, want, name) in [
+        (DS_ADD_U32, true, 100 - 64 * 3, "ds_add_u32 of 0 - x"),
+        (DS_SUB_U32, false, 100 - 64 * 3, "ds_sub_u32 of x"),
+        (DS_SUB_U32, true, 100 + 64 * 3, "ds_sub_u32 of 0 - x"),
+        (DS_ADD_U32, false, 100 + 64 * 3, "ds_add_u32 of x"),
+    ] {
+        let mut body = vec![vop1(0x001, 5, 0x80)];
+        body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        body.push(S_BARRIER);
+        let data = if negate {
+            body.push(vop2(0x26, 6, 0x80, 2)); // v_sub_nc_u32 v6, 0, v2
+            6
+        } else {
+            2
+        };
+        body.extend(ds(op, 0, 5, data));
+        body.push(S_BARRIER);
+        body.extend(ds(DS_READ_B32, 0, 5, 0));
+        let shader = build_cs(&body, 64, 512);
+        run_cases(&shader, &[[100, 3, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got as i32, want, "{backend}: {name} over 64 threads");
+        });
     }
 }

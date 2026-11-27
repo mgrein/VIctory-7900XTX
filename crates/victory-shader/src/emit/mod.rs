@@ -168,6 +168,27 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_NAN_GUARD=1`: a pixel program's colour export (`SV_Target`)
+/// that is not a number is written as 0, so one bad pixel does not spread
+/// through bloom or the temporal passes as a flickering square (after
+/// fxceless PR #837, KLBF Lab). Off by default: it hides whatever made the
+/// value, and costs a compare and a select per exported channel. Part of
+/// the translation: the shader cache keys on the switch when it is set.
+pub fn nan_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Whether pixel programs the console depth-tests before they run declare
+/// early depth and stencil tests (`lower::early_depth`): on unless
+/// `VICTORY_EARLY_DEPTH=0`, which gives the translation as it was before
+/// (the host tests after such a shader), for comparing. Part of the
+/// translation: the shader cache keys on the switch when it is set.
+pub fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -216,6 +237,24 @@ fn parse_group_sync(value: Option<&str>) -> u8 {
         Some("2") => 2,
         _ => 3,
     }
+}
+
+/// `VICTORY_COHERENT=1`: a program that orders memory across the groups of
+/// a dispatch, as the console marks it (cache-control bits GLC, DLC or SLC
+/// on a memory or scalar access, a memory atomic, or a cache invalidation:
+/// `lower::wants_coherent`), has every UAV globally coherent, and a
+/// compute one fences device memory around its memory atomics and at its
+/// cache invalidations. The console keeps such accesses coherent between
+/// groups; a plain host view may serve a stale copy from the SM's L1.
+/// Costs GPU time in those programs. Opt-in (after fxceless PR #914). Part
+/// of the translation: the shader cache keys on it when set.
+pub fn coherent_views() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COHERENT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT").is_some_and(|v| v == "1"))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -283,6 +322,47 @@ pub fn native_rt_matches(hash_hex: &str) -> bool {
     }
     let hay = hash_hex.to_ascii_lowercase();
     needles.iter().any(|n| hay.contains(n.as_str()))
+}
+
+/// The programs `VICTORY_WAVE_WIDE_ONLY=<hash>[,<hash>...]` names (parts
+/// of the 16 hex digits of their container's BLAKE3, as the pipeline logs
+/// print them): empty when unset.
+fn wave_wide_only_list() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY` names any program: translations are
+/// then tagged with their container's hash ([`with_shader_id`]), and the
+/// shader cache keys on the switch. Off by default.
+pub fn wave_wide_only() -> bool {
+    !wave_wide_only_list().is_empty()
+}
+
+/// Whether the wave64 program being translated on this thread takes the
+/// exact wave-wide form before the approximate ones, as `VICTORY_WAVE_WIDE=1`
+/// gives every program: `VICTORY_WAVE_WIDE_ONLY` names it (after fxceless
+/// e4245f3c: one program, e.g. an underwater one whose approximate form
+/// shows wrong, moved to the exact form without moving the two particle
+/// programs that lost the card in it).
+fn wave_wide_for_this() -> bool {
+    let list = wave_wide_only_list();
+    !list.is_empty()
+        && CURRENT_SHADER_ID.with(|cell| {
+            cell.borrow()
+                .as_deref()
+                .is_some_and(|id| list.iter().any(|n| id.to_ascii_lowercase().contains(n.as_str())))
+        })
 }
 
 thread_local! {
@@ -394,6 +474,8 @@ thread_local! {
     /// The tests' way to translate as with
     /// `VICTORY_COMPUTE_WINDOW_COHERENCE=1` ([`compute_window_coherence`]).
     pub(crate) static TEST_WINDOW_COHERENCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The tests' way to translate as with `VICTORY_COHERENT=1` or without.
+    pub(crate) static TEST_COHERENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_COMPUTE_WINDOW_COHERENCE=1`: in a compute program other than the
@@ -868,7 +950,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: for the programs it names only.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wave_wide_for_this();
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the barrier-free forms already take keep them (fork PR #1141, after
@@ -1567,6 +1650,79 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// A pixel program the console tests depth for before it runs
+    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
+    /// the title's glass prepass has it) declares ForceEarlyDepthStencil:
+    /// the module differs from the same program without the bit only by that
+    /// flag, and the validator, where there is one, accepts it. With a depth
+    /// output the bit is not declared (the host cannot test before a shader
+    /// that writes the depth).
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: db,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        // The rule alone: the bit, and no export of depth, stencil or coverage.
+        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
     }
 
     /// A level query (`image_get_lod`) of a 2D array passes no array slice:

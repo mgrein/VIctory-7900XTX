@@ -326,6 +326,15 @@ impl Module {
         }
     }
 
+    /// `x` when `v` is `sub 0, x` (an integer negation); `None` for anything else.
+    pub fn negated(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Sub, a, x) if self.int_value(a) == Some(0) => Some(x),
+            _ => None,
+        }
+    }
+
     /// The flags of every `dx.op.barrier` call, in order (tests).
     #[cfg(test)]
     pub fn barrier_modes(&self) -> Vec<u32> {

@@ -375,6 +375,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
             continue;
         };
+        // v_add_f16 reads the inline float constants (240..=248) as 16-bit
+        // floats, not as the f32 bits of `resource::inline` (VIctory-DXR
+        // ce9c8118).
+        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -392,6 +396,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                Operand::Const(c @ 240..=248) if f16_inline => {
+                    let h = [0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118][usize::from(c - 240)];
+                    one(Sym::K(h))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -407,8 +415,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             let l = lane_number(lane);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
+                // (a value from before the section is each lane's own:
+                // what one named lane holds is that lane's, not what every
+                // lane holds; DexNom PR #99, Castyan)
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
+                    .filter(|s| !matches!(s, Sym::Own(_)))
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
@@ -923,6 +935,24 @@ mod tests {
         crate::ir::build(&code, wave64, 256).unwrap()
     }
 
+    /// `v_readlane_b32 s1, v0, 4` inside a whole-wave section, of a VGPR
+    /// written before it: lane 4's value, not each lane's own `v0` (a
+    /// 32-lane host returned 1..64 where the console reads 4).
+    #[test]
+    fn a_lane_read_of_an_earlier_value_is_not_each_lanes_own() {
+        // (v0 has another use, so its lane 4 is no parked scalar, `ir::unspill`)
+        let mut w = vec![vop1(2, 0x01, 256)]; // v_mov_b32 v2, v0
+        w.push(sop1(0, 0x3D, 193)); // s_or_saveexec_b32 s0, -1
+        w.extend(vop3(1, 0x360, 256, 128 + 4, 0)); // v_readlane_b32 s1, v0, 4
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        assert_eq!(insts[2].name(), "v_readlane_b32");
+        let s1 = insts[2].write(Reg::S(1)).unwrap();
+        let section = &sections(&p, 0)[&1];
+        assert_eq!(section.shapes.get(&s1), None);
+    }
+
     #[test]
     fn dpp_lanes_follow_the_isa() {
         // row_shr:1 with bound_ctrl: lane 16 reads 0, lane 17 lane 16.
@@ -1287,6 +1317,38 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    /// An f16 sum reduction with an extra `v_add_f16 v1, <const>, v1`: 0 (code 128) is the
+    /// identity, the inline float constants (240..=248: 0.5, -0.5, 1.0, .., 1/(2 pi)) are not
+    /// (VIctory-DXR ce9c8118).
+    #[test]
+    fn v_add_f16_inline_float_constants_are_not_the_identity() {
+        let run = |src_const: u16| -> (Option<Shape>, Value, Value) {
+            let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+            w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
+            w.push(vop2(1, 0x32, src_const, 1)); // v_add_f16 v1, <const>, v1
+            for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+                w.push(vop2(1, 0x32, 0xFA, 1));
+                w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+            }
+            w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+            w.push(vop2(1, 0x32, 258, 1)); // v_add_f16 v1, v2, v1
+            w.extend(vop3(1, 0x360, 257, 128 + 31, 0)); // v_readlane_b32 s1, v1, 31
+            w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            let p = build(&w, false);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let v0_in = insts[1].read(Reg::V(0)).unwrap();
+            let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            (sec.shapes.get(&s1).copied(), v0_in, saved)
+        };
+        let (zero, v0_in, saved) = run(128);
+        assert_eq!(zero, Some(Shape::Active(Op::AddH, v0_in, saved, 0)));
+        for c in 240..=248u16 {
+            assert_eq!(run(c).0, None, "inline float constant {c} taken as the identity");
         }
     }
 }

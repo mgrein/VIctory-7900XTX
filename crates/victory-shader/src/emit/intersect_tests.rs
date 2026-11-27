@@ -1066,3 +1066,29 @@ fn mask_operations_on_a_joined_number_give_the_number() {
         eprintln!("not run on a device; lowered only");
     }
 }
+
+/// Wide accesses to title memory by address (a vector load and store, a
+/// scalar load) lower and validate with the second page lookup a run that
+/// crosses a 64 KiB page's end needs (fxceless PR #846).
+#[test]
+fn wide_accesses_by_address_look_up_the_next_page_too() {
+    let words = [
+        0x7E00_0200, // v_mov_b32 v0, s0
+        0x7E02_0201, // v_mov_b32 v1, s1
+        0xDC38_8000,
+        0x027D_0000, // global_load_dwordx4 v[2:5], v[0:1], off
+        0xF408_0100,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+        0x7E0C_0204, // v_mov_b32 v6, s4
+        0x7E0E_0205, // v_mov_b32 v7, s5
+        0x7E10_0206, // v_mov_b32 v8, s6
+        0xDC7C_8000,
+        0x007D_0600, // global_store_dwordx3 v[0:1], v[6:8], off
+        0xDC7C_8000,
+        0x007D_0300, // global_store_dwordx3 v[0:1], v[3:5], off
+        0xBF81_0000, // s_endpgm
+    ];
+    let (shader, _) = build_compute_shader(&native(&words)).expect("lowers by address");
+    assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+}

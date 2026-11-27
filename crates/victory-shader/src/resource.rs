@@ -224,9 +224,9 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -411,8 +411,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The instruction of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -654,7 +654,11 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                // (dword 0 of root constants is a number: used as an offset
+                // it is the computed term, not the address's base; with
+                // dword 1 as its high half it is still a memory pointer,
+                // which `address` settles before coming here)
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -945,10 +949,10 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
+        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
@@ -1114,7 +1118,7 @@ impl<'a> Tracer<'a> {
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1130,7 +1134,16 @@ impl<'a> Tracer<'a> {
             words = raw.to_vec();
         }
         // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // (and run it: an access behind EXEC is not run by the lanes that
+        // came the other way to a join, which need not have built the
+        // descriptor; cool_fox f4b48ad7, codec_d)
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l.guards[at.0][at.1] {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1282,7 +1295,10 @@ impl<'a> Tracer<'a> {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(guard) = lanes.guards[at.0][at.1] {
+            known.push((guard, true));
+        }
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -4075,5 +4091,151 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,    // v_mov_b32 v3, v2
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004,    // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380,    // s_mov_b32 s8, 0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xBE8A_0380,    // s_mov_b32 s10, 0
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02,    // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some(), "join access must carry an EXEC guard");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
+    }
+
+    /// Dword 0 of root constants added to a table's or a root descriptor's
+    /// address is an offset, not a pointer (VIctory-DXR c5396936).
+    #[test]
+    fn root_constant_zero_offsets_tables_and_root_descriptors() {
+        // RootType::Constants dword 0 (s0) as an SMEM soffset and via s_add_u32
+        // on a descriptor table base (s2).
+        let r = track_words(
+            &[
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0x0000_0020, // s_load_dwordx4 s[8:11], s[4:5], s0 offset:0x20
+                0x8006_0002, // s_add_u32 s6, s2, s0
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0303,
+                0xFA00_0040, // s_load_dwordx4 s[12:15], s[6:7], 0x40
+                0xE030_1000,
+                0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+                0xE070_1000,
+                0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Table, 2, 1)],
+            HwStage::Cs,
+        );
+        let c0 = r.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            r.scalar,
+            [
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 0x20,
+                        dynamic: Some(c0),
+                    },
+                ),
+                (
+                    (0, 5),
+                    Address {
+                        param: 1,
+                        offset: 0x40,
+                        dynamic: Some(c0),
+                    },
+                ),
+            ]
+        );
+        assert_eq!(r.descriptors.len(), 2);
+
+        // RootType::Constants dword 0 as byte offset on RootType::Descriptor
+        // (s_load_dword and global_load_dword), while (dword 0, dword 1) as a
+        // 64-bit pointer still classifies as MEMORY.
+        let desc = track_words(
+            &[
+                0xF400_0101,
+                0x0000_0008, // s_load_dword s4, s[2:3], s0 offset:0x8
+                0x7E02_0200, // v_mov_b32 v1, s0
+                0xDC30_800C,
+                0x0202_0001, // global_load_dword v2, v1, s[2:3] offset:12
+                0x4A06_0290, // v_add_nc_u32 v3, 16, v1
+                0xDC30_8004,
+                0x0402_0003, // global_load_dword v4, v3, s[2:3] offset:4
+                0xF400_0180,
+                0xFA00_0000, // s_load_dword s6, s[0:1], null
+                0xDC30_8000,
+                0x0500_0000, // global_load_dword v5, v0, s[0:1]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        let dc0 = desc.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(
+            desc.scalar,
+            [
+                (
+                    (0, 0),
+                    Address {
+                        param: 1,
+                        offset: 8,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 2),
+                    Address {
+                        param: 1,
+                        offset: 12,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                (
+                    (0, 4),
+                    Address {
+                        param: 1,
+                        offset: 20,
+                        dynamic: Some(dc0),
+                    },
+                ),
+                ((0, 5), at(MEMORY, 0)),
+                ((0, 6), at(MEMORY, 0)),
+            ]
+        );
     }
 }

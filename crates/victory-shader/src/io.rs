@@ -603,10 +603,18 @@ impl Halves<'_> {
                     attr,
                     ..
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
-                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
-                },
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => {
+                    // A first half with modifiers: the paired form never
+                    // lowers it, so each half evaluates on its own and its
+                    // modifiers apply (DexNom PR #81).
+                    if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                        kind = None;
+                    }
+                    match v.src.get(1) {
+                        Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
+                        _ => return Err("an interpolation without its first half"),
+                    }
+                }
                 _ => return Err("an interpolation without its first half"),
             };
             if a != *attr {
@@ -816,6 +824,34 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
+    }
+
+    /// A first half with clamp or omod makes both halves evaluate on their
+    /// own, so the modifiers apply (DexNom PR #81).
+    #[test]
+    fn f16_first_half_with_modifiers_falls_back_to_weighted() {
+        let pair = |w0: u32, w1: u32| {
+            let p = program(&[
+                w0,
+                w1,
+                0xD75A_0002,
+                (258 << 18) | (257 << 9), // v_interp_p2_f16 v2, v1, attr0.x, v2
+                S_ENDPGM,
+            ]);
+            let inputs = vec![PsInput {
+                fp16: true,
+                ..TEXCOORD
+            }];
+            raise(&p, &pixel(inputs, 2)).unwrap().interps
+        };
+        let (w0, w1) = (0xD742_0002, 256 << 9); // v_interp_p1ll_f16 v2, v0, attr0.x
+        let plain = pair(w0, w1);
+        assert!(matches!(&plain[..], [(_, Interp::Interpolated { .. })]));
+        for (w0, w1) in [(w0 | 1 << 15, w1), (w0, w1 | 1 << 27)] {
+            let io = pair(w0, w1);
+            assert_eq!(io.len(), 2);
+            assert!(io.iter().all(|(_, i)| matches!(i, Interp::Weighted { .. })));
+        }
     }
 
     #[test]

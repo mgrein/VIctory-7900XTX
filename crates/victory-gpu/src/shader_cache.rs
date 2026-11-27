@@ -41,6 +41,9 @@ static STALE: AtomicU64 = AtomicU64::new(0);
 static REFRESHED: AtomicU64 = AtomicU64::new(0);
 static CHANGED: AtomicU64 = AtomicU64::new(0);
 
+/// Refusals served from the cache instead of translating again.
+static REFUSALS_SERVED: AtomicU64 = AtomicU64::new(0);
+
 /// The build of the translator (the BLAKE3 of its sources, `build.rs`).
 const SOURCE: &str = env!("VICTORY_TRANSLATOR");
 
@@ -209,6 +212,12 @@ const SET_ONLY: &[&str] = &[
     "VICTORY_RESINFO_MSAA",
     "VICTORY_RESINFO_D16",
     "VICTORY_COMPUTE_WINDOW_COHERENCE",
+    "VICTORY_EARLY_DEPTH",
+    "VICTORY_WAVE_LOOP_SKIPS",
+    "VICTORY_NAN_GUARD",
+    "VICTORY_WAVE_WIDE_ONLY",
+    "VICTORY_THREAD_TICKET",
+    "VICTORY_COHERENT",
 ];
 
 /// What tells one set of translations from another ([`build`]).
@@ -234,9 +243,9 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 
 /// The translation of `container`, tagged with the first 16 hex digits of its
 /// BLAKE3 hash for `VICTORY_NATIVE_RT_FILTER` (only looked at with
-/// `VICTORY_NATIVE_RT=1`).
+/// `VICTORY_NATIVE_RT=1`) and `VICTORY_WAVE_WIDE_ONLY`.
 fn translate_tagged(container: &[u8]) -> Result<HostShader, String> {
-    if !victory_shader::emit::native_rt() {
+    if !victory_shader::emit::native_rt() && !victory_shader::emit::wave_wide_only() {
         return victory_shader::emit::translate(container).map_err(|e| e.to_string());
     }
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
@@ -272,8 +281,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+        // A refusal is kept too ([`encode_refusal`]): it is as final as a
+        // translation for this build of the translator.
+        Ok(match (self.translate)(&input[32..]) {
+            Ok(shader) => encode(&shader, self.source),
+            Err(why) => encode_refusal(&why, self.source),
+        })
     }
 }
 
@@ -309,7 +322,24 @@ fn cached_by(
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let bytes = std::fs::read(&path).ok();
+        if let Some((why, made_by)) = bytes.as_deref().and_then(decode_refusal) {
+            // Only this build's refusals are final: a later build of the
+            // translator (same version) may well translate the program, so
+            // an earlier build's refusal is always tried again.
+            if made_by == source.as_bytes() {
+                let ran = converter.ran.load(Ordering::Relaxed);
+                let counter = if ran { &MISSES } else { &HITS };
+                counter.fetch_add(1, Ordering::Relaxed);
+                if !ran {
+                    REFUSALS_SERVED.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(why);
+            }
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if let Some((shader, made_by)) = bytes.as_deref().and_then(decode) {
             let ran = converter.ran.load(Ordering::Relaxed);
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
@@ -448,6 +478,40 @@ fn encode(s: &HostShader, source: &str) -> Vec<u8> {
     }
     word(&mut out, u32::from(s.approximate));
     out
+}
+
+/// A program the translator refuses, kept so the next start does not
+/// translate it again to learn the same (after Belobug PR #230): `VSHR`,
+/// the build of the translator and the reason, both length-prefixed. Only
+/// served to the build that wrote it ([`cached_by`]).
+const REFUSAL: &[u8; 4] = b"VSHR";
+
+fn encode_refusal(why: &str, source: &str) -> Vec<u8> {
+    let mut out = REFUSAL.to_vec();
+    for text in [source, why] {
+        out.extend((text.len() as u32).to_le_bytes());
+        out.extend(text.as_bytes());
+    }
+    out
+}
+
+/// The reason and the build of the translator that refused.
+fn decode_refusal(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let mut rest = bytes.strip_prefix(REFUSAL)?;
+    let mut list = || {
+        let (n, tail) = rest.split_first_chunk::<4>()?;
+        let (head, tail) = tail.split_at_checked(u32::from_le_bytes(*n) as usize)?;
+        rest = tail;
+        Some(head.to_vec())
+    };
+    let made_by = list()?;
+    let why = String::from_utf8(list()?).ok()?;
+    rest.is_empty().then_some((why, made_by))
+}
+
+/// Refusals served from the cache since the start.
+pub fn refusals_served() -> u64 {
+    REFUSALS_SERVED.load(Ordering::Relaxed)
 }
 
 /// The shader and the build of the translator that made it.
@@ -607,9 +671,51 @@ mod tests {
         assert_eq!(decode(&encode(&approximate, "made by")), Some((approximate, b"made by".to_vec())));
         assert_eq!(decode(&encode(&shader(), "made by")), Some((shader(), b"made by".to_vec())));
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail, false).is_err());
+        // A refusal is stored too, and served to the same build without
+        // translating again.
+        let fails = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            fails.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("unsupported".to_owned())
+        };
+        assert_eq!(cached(&cache, &build, b"other", fail, false), Err("unsupported".to_owned()));
+        assert_eq!(cached(&cache, &build, b"other", fail, false), Err("unsupported".to_owned()));
+        assert_eq!(cached(&cache, &build, b"other", fail, true), Err("unsupported".to_owned()));
+        assert_eq!(fails.load(Ordering::Relaxed), 1);
+    }
+
+    /// A refusal of another build of the translator is not final: the
+    /// program is translated again, and what comes out replaces it.
+    #[test]
+    fn a_refusal_of_another_build_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [3u8; 32];
+        let container = b"refused by an earlier build".as_slice();
+        let runs = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("v_op is not supported".to_owned())
+        };
+        assert!(cached_by(&cache, &build, "build a", container, fail, false).is_err());
+        // Still refused by the next build: asked once, then kept as its own.
+        assert!(cached_by(&cache, &build, "build b", container, fail, false).is_err());
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert!(cached_by(&cache, &build, "build b", container, fail, false).is_err());
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // The build after translates it.
+        let now = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached_by(&cache, &build, "build c", container, now, false), Ok(shader()));
+        assert_eq!(cached_by(&cache, &build, "build c", container, now, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        assert_eq!(decode_refusal(&encode_refusal("why", "made by")), Some(("why".to_owned(), b"made by".to_vec())));
+        assert_eq!(decode_refusal(b"VSHR	   short"), None);
+        assert_eq!(decode_refusal(&encode(&shader(), "made by")), None);
+        assert_eq!(decode(&encode_refusal("why", "made by")), None);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

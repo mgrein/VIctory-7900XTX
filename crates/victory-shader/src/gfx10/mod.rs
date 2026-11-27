@@ -219,7 +219,15 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // v_nop, v_pipeflush and v_clrexcp take no source: the
+                // field is no literal or SDWA/DPP marker (the console
+                // compiler stores a shader hash there), so no second dword
+                // follows (DexNom PR #30, davutsimsekk).
+                let no_source = matches!(opcode, 0x000 | 0x01B | 0x041);
+                (Encoding::Vop1, opcode, if no_source { 1 } else { 1 + extra })
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -405,6 +413,38 @@ mod tests {
         ] {
             assert!(t.windows(2).all(|w| w[0].0 < w[1].0));
         }
+    }
+
+    #[test]
+    fn vop1_without_a_source_is_one_dword() {
+        assert_eq!(
+            summary(&[0x7E00_00FF, S_ENDPGM]),
+            [(0, 1, "v_nop"), (4, 1, "s_endpgm")]
+        );
+        assert_eq!(
+            summary(&[0x7E00_36FF, S_ENDPGM]),
+            [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]
+        );
+        assert_eq!(
+            summary(&[0x7E00_82F9, S_ENDPGM]),
+            [(0, 1, "v_clrexcp"), (4, 1, "s_endpgm")]
+        );
+        // One that has a source keeps its literal.
+        assert_eq!(
+            summary(&[0x7E00_02FF, 0x1234_5678, S_ENDPGM]),
+            [(0, 2, "v_mov_b32"), (8, 1, "s_endpgm")]
+        );
+    }
+
+    #[test]
+    fn vop3_cmpx_writes_exec() {
+        let code = bytes(&[0xD411_0005, 0x0001_E501, S_ENDPGM]);
+        let inst = &decode(&code).unwrap()[0];
+        assert_eq!(inst.name(), Some("v_cmpx_lt_f32"));
+        let Fields::Valu(v) = inst.fields(false) else {
+            panic!("not a VALU");
+        };
+        assert_eq!(v.dst, Some(Operand::Scalar { code: 126, dwords: 1 }));
     }
 
     #[test]

@@ -604,7 +604,10 @@ impl Instruction {
                     }
                 }
                 let vdst = w0 & 0xFF;
-                v.dst = Some(if compare {
+                v.dst = Some(if name.starts_with("v_cmpx") {
+                    // GFX10: a compare into EXEC ignores VDST.
+                    scalar(EXEC, lanes)
+                } else if compare {
                     scalar(vdst as u8, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)
