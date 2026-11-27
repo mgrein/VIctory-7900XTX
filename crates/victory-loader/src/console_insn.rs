@@ -671,6 +671,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
 mod tests {
     use super::*;
 
+    /// The tests that patch code take this: the handler only tries the patching lock, so one
+    /// patching in parallel would leave the other's instruction emulated and not replaced.
+    static PATCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_patching_test() -> std::sync::MutexGuard<'static, ()> {
+        PATCH_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn wait_instructions_are_replaced_inside_sixteen_aligned_bytes() {
         let word = u128::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 0x0f, 0x01, 0xfb, 11, 12, 13, 14, 15, 16]);
@@ -684,6 +692,7 @@ mod tests {
     /// and the page is protected as before.
     #[test]
     fn a_wait_faults_once_and_the_page_keeps_its_protection() {
+        let _one = one_patching_test();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualFree,
             VirtualProtect, VirtualQuery,
@@ -777,6 +786,7 @@ mod tests {
     /// and the pointer, the scratch register and the flags come out as from the loop.
     #[test]
     fn a_clzero_loop_becomes_plain_stores() {
+        let _one = one_patching_test();
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
         // Against rdx (rm rax, reg rdx) and against rcx, the scratch register.
         for (cmp, by) in [([0x48, 0x39, 0xd0], 2), ([0x48, 0x39, 0xc8], 1), ([0x4c, 0x39, 0xc0], 8)] {
