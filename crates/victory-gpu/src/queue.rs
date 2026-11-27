@@ -51,15 +51,16 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value (a reference of
+    /// ours: the title may release its own meanwhile).
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
 /// What a queue holds, apart from the queue: [`release_held`] works on it
@@ -373,8 +374,8 @@ pub(crate) fn release_held(all: bool) {
             while !line.retired.load(Ordering::Acquire) {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
                         break;
                     }
@@ -456,8 +457,8 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.as_this(), value) {
+                            crate::fence::set(fence.as_this(), value);
                         }
                     }
                 }
@@ -772,13 +773,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::retain(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -816,7 +817,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held.commands);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::retain(fence), value));
             }
             behind
         };
@@ -1389,7 +1390,7 @@ mod tests {
         let mut fence = null;
         assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
         // A wait that is never met, so nothing else runs past it.
-        lock(&queue(q).held.commands).push(Held::Wait(fence as usize, u64::MAX));
+        lock(&queue(q).held.commands).push(Held::Wait(crate::fence::FenceRef::retain(fence), u64::MAX));
         register(q);
         register(q);
         let copied = {
