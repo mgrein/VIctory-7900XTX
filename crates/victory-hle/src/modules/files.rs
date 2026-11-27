@@ -19,7 +19,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::Foundation::GENERIC_READ;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, GetLogicalDrives};
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -276,9 +277,29 @@ pub extern "system" fn CreateFileW(
         share,
         security,
         disposition,
-        flags,
+        flags & !dropped_flags(access, flags),
         template,
     )
+}
+
+/// The flags the host's open does not get: an open with `GENERIC_READ` and no
+/// other access, not overlapped, loses `FILE_FLAG_NO_BUFFERING`. On the host
+/// the flag keeps every read out of the system file cache, so a title that
+/// opens its packs with it reads the same bytes from the drive on every
+/// launch (VItoriaBr measured a cached relaunch to the first screen at 5.5 s
+/// for 37 s). A buffered handle returns the same bytes for the same aligned
+/// reads, and also takes the unaligned ones an unbuffered handle refuses. An
+/// overlapped open keeps the flag: `ReadFileScatter` takes only a handle with
+/// both. Only `CreateFileW` opens change. `VICTORY_FILE_CACHE=0` passes the
+/// flag on as given. (VItoriaBr PR #111, GaiuLulius.)
+fn dropped_flags(access: u32, flags: u32) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILE_CACHE").is_none_or(|v| v != "0"));
+    if on && access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
+        FILE_FLAG_NO_BUFFERING
+    } else {
+        0
+    }
 }
 
 pub extern "system" fn CreateFileA(
@@ -1016,5 +1037,34 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    /// A read-only open asking for no buffering reads through the cache: a
+    /// read of ten bytes, which an unbuffered handle refuses, succeeds. One
+    /// that writes too keeps the flag.
+    #[test]
+    fn a_read_only_unbuffered_open_accepts_an_unaligned_read() {
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        assert_eq!(dropped_flags(GENERIC_READ, FILE_FLAG_NO_BUFFERING), FILE_FLAG_NO_BUFFERING);
+        assert_eq!(dropped_flags(GENERIC_READ | GENERIC_WRITE, FILE_FLAG_NO_BUFFERING), 0);
+        assert_eq!(dropped_flags(GENERIC_READ, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED), 0);
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let null = std::ptr::null_mut();
+        let handle = CreateFileW(w(&path.to_string_lossy()).as_ptr(), GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, null);
+        assert_ne!(handle as isize, -1);
+        let (mut out, mut n) = ([0u8; 10], 0u32);
+        let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(Handle, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+            handle,
+            out.as_mut_ptr(),
+            10,
+            &mut n,
+            null,
+        );
+        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle);
+        assert_ne!(ok, 0);
+        assert_eq!(&out[..n as usize], b"0123456789");
     }
 }
