@@ -413,6 +413,65 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
+/// Whether a pipeline a worker has just made is handed out at once while a
+/// save has the library to itself, and stored when the save is over
+/// ([`store_later`]). A save serialises the whole library (1.3 to 1.5 GB)
+/// under [`Library::saving`], every 20 s while pipelines are being made, and
+/// every worker that finished a pipeline meanwhile waited for it with the
+/// pipeline in hand: the draws that wanted it were dropped for as long (and
+/// their threads waited out the frame's budget). (After the cool_fox fork's
+/// PR #22 by Esteban-V, `VICTORY_LIBRARY_STORE_LATER`.)
+/// On by default; `VICTORY_LIBRARY_STORE_LATER=0`: the store waits for the
+/// save, as before. A pipeline that arrives during the save at the run's end
+/// is not kept on disk (the driver's own cache still has it).
+fn stores_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_none_or(|v| v != "0"))
+}
+
+/// A pipeline made while a save was running, and its name: stored by
+/// [`store_later`].
+struct Later(HSTRING, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded; the name is plain memory.
+unsafe impl Send for Later {}
+
+static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+/// Pipelines handed out before they were stored, since the start.
+pub(crate) static STORED_LATER: AtomicU64 = AtomicU64::new(0);
+
+/// The stores' share of `saving`, or `None` while a save holds it (with
+/// `wait`: waits for the save instead).
+fn share(saving: &RwLock<()>, wait: bool) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+    if wait {
+        return Some(saving.read().unwrap_or_else(|e| e.into_inner()));
+    }
+    match saving.try_read() {
+        Ok(shared) => Some(shared),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Stores the pipelines that were made during a save ([`stores_later`]):
+/// before a save, so that it writes them, and after one.
+fn store_later(library: &Library) {
+    let list = std::mem::take(&mut *LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    if list.is_empty() {
+        return;
+    }
+    let _all = one_call();
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    for Later(name, pso) in &list {
+        // SAFETY: a live pipeline; a name already stored is refused, which
+        // leaves the library as it was.
+        if unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    crate::host::trail(|| format!("pipeline library: stored {} pipelines made during a save", list.len()));
+}
+
 /// Held by a load of the pipeline named `name`: loads of the same name
 /// wait for each other (the host's one exception to the library's thread
 /// safety: such a load may change that pipeline's entry). Names share 64
@@ -511,17 +570,86 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines the host answered "out of memory" for, and those of them made
+/// on a second try, since the start.
+pub(crate) static OUT_OF_MEMORY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Under this much commit headroom an "out of memory" from the host is
+/// taken for what it says.
+const SHORT_COMMIT: u64 = 2 << 30;
+
+/// Whether the PC is short of memory by its commit `headroom` (not known:
+/// not short).
+fn short(headroom: Option<u64>) -> bool {
+    headroom.is_some_and(|h| h < SHORT_COMMIT)
+}
+
+/// The host answered E_OUTOFMEMORY for a pipeline: whether to try once
+/// more. NVIDIA's driver gives that answer for a shader its compiler will
+/// not take as well as for a PC out of memory, and either way the pipeline
+/// was refused for the rest of the run. With commit headroom to spare it is
+/// the compiler's refusal (said so, and left at that: the same code gets the
+/// same answer); with little, it is memory: several compiles at once take
+/// hundreds of MB each for a while, so this one waits up to five seconds
+/// for the headroom to come back and is tried once more. (The idea of XCL
+/// 927adcc0, which reads the answer as a refusal; nothing of it is copied.
+/// We have no second form of a translation to retry with at this point.)
+/// `VICTORY_PIPELINE_OOM_RETRY=0`: refused at once, as before.
+fn retry_out_of_memory() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let seen = OUT_OF_MEMORY[0].fetch_add(1, Ordering::Relaxed);
+    let headroom = crate::host::commit_headroom();
+    let label = LABEL.with(|l| l.borrow().clone());
+    if !short(headroom) {
+        if seen < 16 {
+            tracing::warn!(
+                pipeline = %label,
+                headroom_mb = headroom.map(|h| h >> 20),
+                "the host answered out of memory for a pipeline with memory to spare: its compiler refuses the shader"
+            );
+        }
+        return false;
+    }
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_OOM_RETRY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let began = std::time::Instant::now();
+    while began.elapsed() < std::time::Duration::from_secs(5) && short(crate::host::commit_headroom()) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    tracing::warn!(
+        pipeline = %label,
+        headroom_mb = headroom.map(|h| h >> 20),
+        now_mb = crate::host::commit_headroom().map(|h| h >> 20),
+        waited_ms = began.elapsed().as_millis() as u64,
+        "the host answered out of memory for a pipeline while the PC was short of it: tried once more"
+    );
+    true
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl Fn() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let create = || {
-        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        let _traced = crate::pso_trace::scope(name, "create");
-        create()
+        let once = || {
+            let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+            let _traced = crate::pso_trace::scope(name, "create");
+            create()
+        };
+        match once() {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY && retry_out_of_memory() => {
+                let again = once();
+                if again.is_ok() {
+                    OUT_OF_MEMORY[1].fetch_add(1, Ordering::Relaxed);
+                }
+                again
+            }
+            made => made,
+        }
     };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
@@ -567,7 +695,13 @@ pub(crate) fn pipeline(
     });
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let Some(_stores) = share(&library.saving, !stores_later()) else {
+        // A save is serialising the library: the pipeline is handed out
+        // now and stored after it.
+        STORED_LATER.fetch_add(1, Ordering::Relaxed);
+        LATER.lock().unwrap_or_else(|e| e.into_inner()).push(Later(wide, pso.clone()));
+        return Ok(pso);
+    };
     let _call = call("store", name);
     storing.next("pipeline: store a PSO in the driver library");
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -578,8 +712,20 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// The least time between two saves while pipelines are being made:
+/// `VICTORY_LIBRARY_SAVE_S` seconds (20 by default, 1 at least). Each save
+/// writes the whole library again; a longer time writes less often and
+/// loses more to a run that ends without its last save.
+fn save_every() -> std::time::Duration {
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let s = std::env::var("VICTORY_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(20);
+        std::time::Duration::from_secs(s.max(1))
+    })
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and [`save_every`] has passed (or `now`).
 ///
 /// One save at a time: the library's temporary file is written under the
 /// library lock but renamed after it, so a second saver (a worker and the
@@ -591,7 +737,6 @@ pub(crate) fn pipeline(
 /// The early and slow lists are written even when the library is not.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     let mut last = if now {
         LAST.lock().unwrap_or_else(|e| e.into_inner())
@@ -602,11 +747,13 @@ pub(crate) fn save(now: bool) {
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         }
     };
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+    if !now && last.is_some_and(|t| t.elapsed() < save_every()) {
         return;
     }
     *last = Some(std::time::Instant::now());
     let _saving = crate::timeline::span("pipeline: save the library and early list");
+    // Those the save before this one kept out: this one writes them.
+    store_later(library);
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -671,6 +818,9 @@ pub(crate) fn save(now: bool) {
             }
         }
     }
+    // Those made while the library was being written: in it from now on,
+    // and on disk with the next save.
+    store_later(library);
     if !lists_changed {
         return;
     }
@@ -682,6 +832,7 @@ pub(crate) fn save(now: bool) {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
+            stored_later = STORED_LATER.load(Ordering::Relaxed),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -866,6 +1017,30 @@ b");
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A store does not wait for a save: it is told the library is taken.
+    #[test]
+    fn a_store_finds_the_library_taken_during_a_save() {
+        let saving = RwLock::new(());
+        assert!(share(&saving, false).is_some());
+        {
+            let _other_store = share(&saving, false).expect("stores share it");
+            assert!(share(&saving, false).is_some());
+        }
+        let save = saving.write().unwrap();
+        assert!(share(&saving, false).is_none());
+        drop(save);
+        assert!(share(&saving, false).is_some());
+        assert!(share(&saving, true).is_some());
+    }
+
+    #[test]
+    fn out_of_memory_counts_as_memory_only_when_the_pc_is_short() {
+        assert!(short(Some(SHORT_COMMIT - 1)));
+        assert!(!short(Some(SHORT_COMMIT)));
+        assert!(!short(Some(20 << 30)));
+        assert!(!short(None));
     }
 
     #[test]

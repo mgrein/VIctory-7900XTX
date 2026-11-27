@@ -48,7 +48,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         }
     }
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let bad = bad_keys(&bad, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -94,7 +94,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
             lock(&state).2 += 1;
         },
     )?;
@@ -138,6 +138,24 @@ fn only_one(dir: &Path) -> Result<std::fs::File> {
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("could not lock {}", path.display())),
     }
+}
+
+/// The keys `warm-bad.txt` (`listed`) names for this translator and driver
+/// (`fingerprint`, 16 hex digits, then the key of 32, then why). A compiler
+/// that crashed or hung on a pipeline need not do so on the next driver, and
+/// a new translation hands it other code: listed by key alone, such a
+/// pipeline was never tried again. Lines of that older form (the key first)
+/// count for no fingerprint: each is tried once more and listed anew if it
+/// still ends its process. (After Belobug/VIctory-Belobug-AMD PR #294.)
+fn bad_keys<'a>(listed: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    listed
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split(' ');
+            let (of, key) = (words.next()?, words.next()?);
+            (of == fingerprint && key.len() == 32).then_some(key)
+        })
+        .collect()
 }
 
 fn run_batches(
@@ -301,6 +319,24 @@ mod tests {
         drop(first);
         drop(only_one(&dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_pipelines_are_bad_for_one_translator_and_driver() {
+        let key = |c: char| c.to_string().repeat(32);
+        let listed = format!(
+            "0123456789abcdef {} hung for 180 s\nfedcba9876543210 {} exit code: 5\n{} exit code: 0xc0000005\n\n0123456789abcdef {}",
+            key('a'),
+            key('b'),
+            key('c'),
+            key('d')
+        );
+        let bad = bad_keys(&listed, "0123456789abcdef");
+        assert_eq!(bad.len(), 2);
+        assert!(bad.contains(key('a').as_str()) && bad.contains(key('d').as_str()));
+        // Another driver or translation: all are tried again, and so are
+        // those listed before fingerprints were.
+        assert!(bad_keys(&listed, "0000000000000000").is_empty());
     }
 
     #[test]
