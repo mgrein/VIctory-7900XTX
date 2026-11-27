@@ -7,6 +7,8 @@
 #               release: the plain build, faster to play (no copy counters, per-call timing or memory-map walks),
 #               logging warnings and errors only (VICTORY_LOG=warn, unless -More sets it);
 #               diag: the build all measurements are of, for measuring runs (its log lines at info, as before)
+# -ConstantAmbient  without -RayTracing: a constant stand-in light (0.8) in place of the estimate from the frame,
+#               and the air's light bounded by 1.5 times the light around (cool_fox's non-ray-traced profile)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Nvidia       the NVIDIA profile even where no NVIDIA card is found (it is taken by itself on one; README.md, "NVIDIA")
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
@@ -18,6 +20,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$SoftwareRT,
+    [switch]$ConstantAmbient,
     [ValidateSet('auto', 'diag', 'release')][string]$Build = 'auto',
     [hashtable]$More = @{},
     [switch]$Nvidia,
@@ -37,6 +40,15 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+elseif ($ConstantAmbient) {
+    # (starnotes-xj's cool_fox launcher, 22d4a742, 0c2ece78, 81a5b319: "the constant 0.8 the runs that read best used";
+    # the air bound cleared a milky haze indoors on an RTX 4060.) The estimate (VICTORY_AMBIENT=0.8, the
+    # default here) follows the hour and the room's lamps but can wash rooms out near bright doorways;
+    # the constant cannot follow the time of day. A/B screenshots indoors and out, day and night, before
+    # either becomes the default.
+    $settings.VICTORY_AMBIENT = 'constant:0.8'
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+}
 
 # The NVIDIA profile: on an NVIDIA card (or with -Nvidia).
 if (-not $Nvidia) {
