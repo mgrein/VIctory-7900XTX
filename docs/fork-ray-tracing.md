@@ -99,6 +99,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_MEMORY_FORGET=0` | copies of title buffers the title released are kept for the rest of the run, as before (their host and card memory too) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,

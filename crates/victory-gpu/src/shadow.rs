@@ -5389,6 +5389,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// Whether `shadow` is still the copy of a title buffer that exists: not
+/// once the title released the buffer ([`unregister`]) or the copy was let
+/// go in place ([`in_place_let_go`]). (Title memory by address,
+/// `crate::memory`, forgets those.)
+pub(crate) fn registered(shadow: &Arc<Shadow>) -> bool {
+    buffers_read()
+        .range((shadow.start, 0)..=(shadow.start, usize::MAX))
+        .any(|(_, entry)| entry.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, shadow)))
+}
+
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
