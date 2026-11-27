@@ -5,6 +5,14 @@
 //! come one after another, again and again. Each phase's frame times are
 //! logged at its end (the frames of its first second left out). A switch
 //! named here does not go by its own variable any more.
+//!
+//! `VICTORY_AB_FLIP=1` swaps every switch's halves: phase n has the bits
+//! phase n has without it turned over (the first phase all on). In a
+//! scripted scene the phases fall on the same stretches in every launch, and
+//! the scene's own difference between them reads as the switch's (about 5
+//! points either way on fxceless's runs); the mean of one launch each way
+//! has it taken out. After fxceless/victory-fork PR #1341
+//! (`VICTORY_ALT_FLIP`, by CarverXI), GPL-3.0-or-later.
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -21,9 +29,29 @@ fn parse(text: &str) -> Option<Asked> {
     (!switches.is_empty() && switches.len() <= 8).then_some(Asked { seconds, switches })
 }
 
+/// Whether the halves are swapped (`VICTORY_AB_FLIP=1`).
+fn flipped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_AB_FLIP"))
+}
+
+/// The bits of phase `number` of `switches` switches.
+fn phase_bits(number: u64, switches: usize, flip: bool) -> u32 {
+    let all = (1u32 << switches) - 1;
+    let bits = (number % (1 << switches)) as u32;
+    if flip { bits ^ all } else { bits }
+}
+
 fn asked() -> Option<&'static Asked> {
     static ASKED: OnceLock<Option<Asked>> = OnceLock::new();
-    ASKED.get_or_init(|| parse(&std::env::var("VICTORY_AB").ok()?)).as_ref()
+    ASKED
+        .get_or_init(|| {
+            let asked = parse(&std::env::var("VICTORY_AB").ok()?)?;
+            // The first phase's bits (all on when the halves are swapped).
+            BITS.store(phase_bits(0, asked.switches.len(), flipped()), Relaxed);
+            Some(asked)
+        })
+        .as_ref()
 }
 
 /// The switches that are on now, a bit each.
@@ -94,7 +122,7 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     if number == p.number {
         return;
     }
-    let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
+    let bits = |number: u64| phase_bits(number, asked.switches.len(), flipped());
     let (was, will) = (bits(p.number), bits(number));
     let (mean, median, most) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
@@ -127,5 +155,8 @@ mod tests {
         assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0));
         assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
         assert_eq!(pick("VICTORY_NONE_SUCH"), None);
+        assert_eq!((0..4).map(|n| phase_bits(n, 2, false)).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!((0..5).map(|n| phase_bits(n, 2, true)).collect::<Vec<_>>(), [3, 2, 1, 0, 3]);
+        assert_eq!(phase_bits(9, 8, true), 0xff ^ 9);
     }
 }
