@@ -371,6 +371,18 @@ fn give_back(at: usize) {
     unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
 }
 
+/// [`give_back`] of memory a copy of it, `copy`, was made of and given to
+/// nobody, once the copy is gone; unless another thread holds the copy at
+/// this moment (the card's pass over changed copies upgrades its weak
+/// references to every copy on the card and reads their memory): then the
+/// memory stays committed, as before (freed under it, that read faulted).
+fn give_back_under<T>(at: usize, copy: Arc<T>) {
+    if let Some(copy) = Arc::into_inner(copy) {
+        drop(copy);
+        give_back(at);
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -385,14 +397,13 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let made = (|| {
-            let directory = crate::shadow::by_address(entries as u64, bytes)?;
-            let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
-            Some((directory, faults, data))
-        })();
         // (Else the 16 MiB stayed committed, once per draw.)
-        let Some((directory, faults, data)) = made else {
+        let Some(directory) = crate::shadow::by_address(entries as u64, bytes) else {
             give_back(entries);
+            return None;
+        };
+        let Some((faults, data)) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4) else {
+            give_back_under(entries, directory);
             return None;
         };
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
@@ -653,9 +664,13 @@ impl Memory {
             return false;
         }
         let made = crate::upload::reserve(ARENA as usize).and_then(|at| {
-            let n = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s));
-            if n.is_none() {
+            let Some(shadow) = crate::shadow::by_address(at as u64, ARENA) else {
                 give_back(at);
+                return None;
+            };
+            let n = self.number(shadow.clone());
+            if n.is_none() {
+                give_back_under(at, shadow);
             }
             Some((n?, at))
         });
@@ -1636,6 +1651,31 @@ mod tests {
         freed.take();
         freed.settle();
         assert_eq!((freed.next(), freed.cooling.len()), (None, 0));
+    }
+
+    /// Reserved memory is given back only once nothing else holds the copy
+    /// made of it.
+    #[cfg(windows)]
+    #[test]
+    fn memory_is_given_back_once_its_copy_is_held_by_nothing_else() {
+        use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let state = |at: usize| {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a query of an address, into a local.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+            assert_ne!(n, 0);
+            info.State
+        };
+        let at = crate::upload::reserve(1 << 16).expect("reserved");
+        let copy = Arc::new(());
+        // Another thread holds it.
+        let other = copy.clone();
+        give_back_under(at, copy);
+        assert_ne!(state(at), MEM_FREE);
+        // SAFETY: still committed, ours.
+        unsafe { (at as *mut u8).write_volatile(1) };
+        give_back_under(at, other);
+        assert_eq!(state(at), MEM_FREE);
     }
 
     /// A failed try is not tried again for [`RETRY`] frames.
