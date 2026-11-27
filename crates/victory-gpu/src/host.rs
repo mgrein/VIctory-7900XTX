@@ -1577,6 +1577,9 @@ pub(crate) struct HostList {
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
+    /// The views of twins its depth-plane passes read, its own until it
+    /// forgets its recording ([`PlaneSlots`]).
+    plane_slots: Mutex<PlaneSlots>,
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
@@ -1789,10 +1792,47 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
-/// Views of twins the pass reads, in a heap of ours used as a ring.
+/// Views of twins the pass reads, in a heap of ours used as a ring, for a
+/// list that found none of [`PLANE_OWNED`] free.
 /// shortcut: a view must last until its list has run; with one or two
 /// passes a frame the ring is far from coming round.
 const PLANE_VIEWS: u32 = 256;
+
+/// Views of twins after the ring's in the same heap, each a list's own from
+/// the pass it records to the list's reset ([`PlaneSlots`]): with many
+/// lists recorded ahead and in flight the ring could come round to a view a
+/// list that has not run yet still names (after fxceless/victory-fork
+/// PR #1377, spk-c).
+const PLANE_OWNED: u32 = 1024;
+
+/// The views of [`PLANE_OWNED`] a host list's recording took; they are free
+/// again when this goes, which is when the list forgets its recording (it
+/// has run by then) or goes itself.
+#[derive(Default)]
+struct PlaneSlots(Vec<u32>);
+
+impl Drop for PlaneSlots {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        if let Some(pass) = plane_pass() {
+            pass.free.lock().unwrap_or_else(|e| e.into_inner()).append(&mut self.0);
+        }
+    }
+}
+
+/// A view's slot for a pass recorded now: one of the free ones, noted in
+/// `mine` (the list's own), or with none free the ring's next.
+fn plane_slot(free: &Mutex<Vec<u32>>, next: &AtomicU32, mine: &mut Vec<u32>) -> u32 {
+    match free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        Some(slot) => {
+            mine.push(slot);
+            slot
+        }
+        None => next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS,
+    }
+}
 
 /// What the pass draws with: the heap of its views of twins, and per kind
 /// of twin (16-bit steps or floats) and depth format the root signature
@@ -1803,6 +1843,8 @@ struct PlanePass {
     gpu: u64,
     step: u32,
     next: AtomicU32,
+    /// The slots of [`PLANE_OWNED`] no list holds.
+    free: Mutex<Vec<u32>>,
     made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
 }
 
@@ -1826,7 +1868,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                 .device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
+                    NumDescriptors: PLANE_VIEWS + PLANE_OWNED,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })
@@ -1837,6 +1879,7 @@ fn plane_pass() -> Option<&'static PlanePass> {
                 step: host.device.GetDescriptorHandleIncrementSize(kind),
                 views,
                 next: AtomicU32::new(0),
+                free: Mutex::new((PLANE_VIEWS..PLANE_VIEWS + PLANE_OWNED).rev().collect()),
                 made: Mutex::default(),
             })
         }
@@ -1967,11 +2010,13 @@ impl PlanePass {
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
+/// records nothing of the title's after it. The views it makes are noted in
+/// `mine`, which lives until `list` has run.
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
+    mine: &mut Vec<u32>,
 ) {
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
@@ -1992,7 +2037,7 @@ fn record_plane_pass(
     };
     for slice in 0..u32::from(of.DepthOrArraySize) {
         for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+            let slot = plane_slot(&pass.free, &pass.next, mine);
             let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -4811,6 +4856,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
+                plane_slots: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 stale: std::sync::atomic::AtomicBool::new(false),
@@ -5664,7 +5710,9 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
-                    landed.push((flight.lists, flight.order));
+                    let mut flight_lists = flight.lists;
+                    flight_lists.iter_mut().for_each(crate::list::Detached::release_tables);
+                    landed.push((flight_lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -6145,7 +6193,9 @@ impl Host {
                         if let Some(dxr) = flight.dxr {
                             crate::dxr::finish_submission(dxr);
                         }
-                        landed.push((flight.lists, flight.order));
+                        let mut flight_lists = flight.lists;
+                        flight_lists.iter_mut().for_each(crate::list::Detached::release_tables);
+                        landed.push((flight_lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -7249,6 +7299,8 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Every submission of the list has run: its passes' views are free.
+        drop(std::mem::take(&mut *self.plane_slots.lock().unwrap_or_else(|e| e.into_inner())));
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
