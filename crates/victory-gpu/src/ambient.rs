@@ -33,6 +33,24 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! The reflections are traced too: without rays they are the sky's,
+//! unoccluded, on every glossy surface, so indoors a wooden floor wears a
+//! white glaze many times brighter than the room. `VICTORY_AMBIENT_REFLECT=
+//! <ceiling>[,<floor>]` holds what the title's last reflection program
+//! (`CS_UpdateHistory`) leaves to between those parts of the light around
+//! (unset or 0: the title's own). beloooo's find (VIctory-Belobug-AMD
+//! 44dcd437, c3bd5612; VItoriaBr 692bce43; GPL-3.0-or-later), there held to
+//! a constant level, here to the estimate at that place.
+//!
+//! `VICTORY_AMBIENT_MAGENTA=1` drops what the resolve left where it is
+//! magenta (green under half of red and blue): probes of memory nobody
+//! wrote (beloooo, e9428969). Off by default.
+//!
+//! `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds): the file is read
+//! twice a second, lines of `VICTORY_AMBIENT...=<value>` as above (the
+//! `VICTORY_` may be left out), each over what the environment set, to tune
+//! by eye in a running title (an idea of XCL's f968bfb5, written anew).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -51,6 +69,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the reflections for the last time in a frame.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +82,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -75,6 +97,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the last reflection program writes the reflections (R9G9B9E5 as
+/// 32-bit integers, as the resolve's light).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -92,9 +117,123 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// The stand-in's settings that can be tuned while the title runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Tuning {
+    set: Set,
+    /// Strength and radius of the creases' shade.
+    shade: [f32; 2],
+    /// The most the air scatters, as a multiple of the light around (0:
+    /// what the title has).
+    air: f32,
+    /// The most and the least of the reflections, as parts of the light
+    /// around (0: no bound).
+    reflect: [f32; 2],
+    /// Whether magenta left by the resolve is dropped.
+    magenta: bool,
+}
+
+impl Tuning {
+    const DEFAULT: Tuning = Tuning { set: Set::Off, shade: [1.0, 0.6], air: 0.0, reflect: [0.0; 2], magenta: false };
+
+    /// Takes `key=value`, the key as the environment's name with or
+    /// without `VICTORY_`; false if the key is not one of the stand-in's.
+    fn take(&mut self, key: &str, value: &str) -> bool {
+        let key = key.trim();
+        let key = key.strip_prefix("VICTORY_").unwrap_or(key);
+        let positive =
+            |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+        match key {
+            "AMBIENT" => self.set = parse(value),
+            "AMBIENT_SHADE" => {
+                for (to, v) in self.shade.iter_mut().zip(value.split(',')) {
+                    if let Ok(v) = v.trim().parse::<f32>()
+                        && v.is_finite()
+                    {
+                        *to = v;
+                    }
+                }
+            }
+            "AMBIENT_AIR" => self.air = positive(value),
+            "AMBIENT_REFLECT" => {
+                let mut parts = value.split(',');
+                let most = parts.next().map_or(0.0, positive);
+                let least = parts.next().map_or(0.0, positive);
+                // A floor above the ceiling would raise what it holds down.
+                self.reflect = [most, if most > 0.0 { least.min(most) } else { least }];
+            }
+            "AMBIENT_MAGENTA" => self.magenta = matches!(value.trim(), "1" | "on" | "true"),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The lines of an ambient file over these settings.
+    fn over(mut self, text: &str) -> Tuning {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                self.take(key, value);
+            }
+        }
+        self
+    }
+}
+
+/// What the environment set.
+fn from_env() -> Tuning {
+    static SET: OnceLock<Tuning> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let mut t = Tuning::DEFAULT;
+        for key in ["AMBIENT", "AMBIENT_SHADE", "AMBIENT_AIR", "AMBIENT_REFLECT", "AMBIENT_MAGENTA"] {
+            if let Ok(value) = std::env::var(format!("VICTORY_{key}")) {
+                t.take(key, &value);
+            }
+        }
+        t
+    })
+}
+
+/// The settings last read from `VICTORY_AMBIENT_FILE`, if any.
+static LIVE: Mutex<Option<Tuning>> = Mutex::new(None);
+
+/// The settings now: the ambient file's (diagnostics builds, read twice a
+/// second by a thread started on the first call), else the environment's.
+fn tuning() -> Tuning {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else {
+            return;
+        };
+        let spawned = std::thread::Builder::new().name("victory-ambient-file".into()).spawn(move || {
+            let mut last = None;
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&file)
+                    && last.as_ref() != Some(&text)
+                {
+                    let t = from_env().over(&text);
+                    tracing::info!(?t, "the stand-in for the indirect light set from the ambient file");
+                    *LIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+                    last = Some(text);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "the ambient file is not read");
+        }
+    });
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(from_env)
+}
+
 fn set() -> Set {
-    static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    tuning().set
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -105,11 +244,7 @@ pub(crate) fn on() -> bool {
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    tuning().air
 }
 
 /// How the slow mean of the light around follows the frames
@@ -185,21 +320,11 @@ fn frame_ms(role: Role) -> f32 {
 
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
-    static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (to, v) in shade.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
-            }
-        }
-        shade
-    })
+    tuning().shade
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -210,6 +335,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt;
+    float reflect_most; float reflect_least; uint magenta;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -403,6 +529,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // (`magenta`: probes of memory nobody wrote show magenta; they count
+    // for nothing.)
+    if (magenta != 0 && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -423,6 +552,30 @@ void raise(uint3 at : SV_DispatchThreadID) {
         stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
     }
 }
+// The reflections (in `light`, of any size) held between parts of the light
+// around that place: the points' mean there (or the constant).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    light.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float3 around;
+    if (constant > 0.0) {
+        around = float3(1.0, 0.98, 0.94) * constant;
+    } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        around = max(float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w), 0.0) * level;
+    }
+    float3 was = unpack(light[at.xy]);
+    float has = dot(was, LUMA);
+    float most = dot(around, LUMA) * reflect_most;
+    float3 c = was;
+    if (reflect_most > 0.0 && has > most) c = was * (most / max(has, 1e-6));
+    if (reflect_least > 0.0) c = max(c, around * reflect_least);
+    if (any(c != was)) light[at.xy] = pack(c);
+}
 #endif
 "#;
 
@@ -440,6 +593,7 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     air: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
@@ -472,6 +626,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    let hold = pipeline("RAISE", s!("hold"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
@@ -481,6 +636,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         place,
         gather,
         raise,
+        hold,
         air,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
@@ -517,6 +673,9 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the points have been gathered: the reflections have something
+/// to be held to.
+static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
@@ -548,6 +707,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    let tuning = tuning();
+    if role == Role::Reflect && (tuning.reflect == [0.0; 2] || (constant == 0.0 && !GATHERED.load(Ordering::Relaxed)))
+    {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -561,7 +725,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 18];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -574,6 +738,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = tuning.reflect[0].to_bits();
+    words[16] = tuning.reflect[1].to_bits();
+    words[17] = u32::from(tuning.magenta);
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -581,7 +748,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -603,9 +770,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
+                    GATHERED.store(true, Ordering::Relaxed);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
+            Role::Reflect => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
         }
     }
     true
@@ -630,7 +799,27 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_UpdateHistory_0b1c.."), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    #[test]
+    fn tuning_from_a_file() {
+        let base = Tuning::DEFAULT;
+        assert_eq!(base.over(""), base);
+        let t = base.over(
+            "# tuning\nVICTORY_AMBIENT=0.8\nAMBIENT_REFLECT=0.5,0.1\n AMBIENT_SHADE = 0.5\nAMBIENT_MAGENTA=1\nOTHER=3\n",
+        );
+        assert_eq!(t.set, Set::Estimate(0.8));
+        assert_eq!(t.reflect, [0.5, 0.1]);
+        assert_eq!(t.shade, [0.5, 0.6]);
+        assert!(t.magenta);
+        assert_eq!(t.air, 0.0);
+        // The floor is no higher than the ceiling; alone it stays.
+        assert_eq!(base.over("AMBIENT_REFLECT=0.2,0.9").reflect, [0.2, 0.2]);
+        assert_eq!(base.over("AMBIENT_REFLECT=0,0.3").reflect, [0.0, 0.3]);
+        assert_eq!(base.over("AMBIENT_REFLECT=nan").reflect, [0.0, 0.0]);
+        assert_eq!(base.over("AMBIENT=constant:0.3\nAMBIENT_AIR=2").air, 2.0);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
