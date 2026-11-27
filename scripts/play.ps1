@@ -14,6 +14,7 @@
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
 # -Fps <n>      n frames a second: our frame clock and the title's own frame rate setting (VICTORY_FRAME_INTERVAL_MS=1000/n; 0: no pacing wait)
 # -SmoothMotion start a copy named victory_sm.exe, so that a Smooth Motion profile set for it in the NVIDIA App applies
+# -SeriesS      the Series S profile (--console series-s): smaller targets, the profile that plays best on a 12 GB card
 # -NvProfile    start a copy named victory_heap.exe, first put into an NVIDIA driver profile of its own with a 2 GB heap
 #               for shader code (`victory nv-profile install`; asks for administrator rights each time it is given)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -29,6 +30,7 @@ param(
     [switch]$CardAwake,
     [ValidateRange(0, 1000)][int]$Fps,
     [switch]$SmoothMotion,
+    [switch]$SeriesS,
     # Start nothing: give back the executable and the settings (scripts\bench.ps1 runs them itself).
     [switch]$Print,
     [switch]$NvProfile
@@ -169,4 +171,5 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+$profile_args = if ($SeriesS) { @('--console', 'series-s') } else { @() }
+try { & $victory run $Exe --execute @profile_args } finally { Pop-Location }
