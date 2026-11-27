@@ -117,6 +117,87 @@ thread_local! {
     static CODE: Cell<[(usize, usize); 8]> = const { Cell::new([(0, 0); 8]) };
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtReadVirtualMemory(process: isize, address: *const u8, buffer: *mut u8, size: usize, copied: *mut usize) -> i32;
+    fn NtWriteVirtualMemory(process: isize, address: *mut u8, buffer: *const u8, size: usize, copied: *mut usize) -> i32;
+}
+
+/// Zeroes this process's memory from `at` to `to` through the kernel, which checks the
+/// mapping and its protection as it copies (and, unlike `WriteProcessMemory`, does not make
+/// read-only pages writable for it): memory freed or protected since Windows said it was
+/// writable fails the copy instead of faulting inside the handler. The bytes zeroed from `at`.
+///
+/// A copy that fails forgets the remembered regions ([`writable_to`]). Where the memory is
+/// still there but now read-only (a page the GPU's write watch protected after the region was
+/// remembered), one byte of it is stored to the plain way, once: the watch's guard takes that
+/// fault and opens the page as it does for any of the title's stores (and memory read-only for
+/// another reason faults as the real instruction would), and the copy goes on.
+fn zero(at: usize, to: usize) -> usize {
+    static ZEROES: [u8; 65536] = [0; 65536];
+    let mut done = at;
+    let mut stored = false;
+    while done < to {
+        let n = (to - done).min(ZEROES.len());
+        let mut copied = 0usize;
+        // SAFETY: zeroes of our own for `n` bytes; -1 is the current process; the kernel
+        // checks the destination.
+        let status = unsafe { NtWriteVirtualMemory(-1, done as *mut u8, ZEROES.as_ptr(), n, &mut copied) };
+        if status >= 0 {
+            done += n;
+            continue;
+        }
+        done += copied.min(n);
+        WRITABLE.with(|w| w.set(([(0, 0); 4], 0)));
+        if stored || done >= to || !readable(done, 1) {
+            break;
+        }
+        stored = true;
+        // SAFETY: committed and readable a moment ago, and the byte is one this instruction
+        // zeroes; a store refused there faults as the instruction itself would.
+        unsafe { std::ptr::write_volatile(done as *mut u8, 0) };
+    }
+    done - at
+}
+
+/// Copies up to `out.len()` bytes of this process's memory at `at` into `out` through the
+/// kernel, which checks the mapping as it copies: memory unmapped or protected since it was
+/// looked at fails the copy instead of faulting inside the handler. The bytes copied.
+fn copy_in(at: usize, out: &mut [u8]) -> usize {
+    let mut copied = 0usize;
+    // SAFETY: `out` is ours and as long as asked; -1 is the current process.
+    let status = unsafe { NtReadVirtualMemory(-1, at as *const u8, out.as_mut_ptr(), out.len(), &mut copied) };
+    if status < 0 { copied.min(out.len()) } else { out.len() }
+}
+
+/// The code bytes at `rip` (up to 16) into `out`: those in the faulting instruction's page
+/// (the processor just fetched from it), and those of the next page where Windows says it is
+/// readable (asked once per place, [`remembers`]). Copied through [`copy_in`], never read in
+/// place. The bytes there.
+fn fetch_code(rip: usize, out: &mut [u8; 16]) -> usize {
+    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
+    let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
+        Some(&(_, n)) => n,
+        None => {
+            let in_page = (4096 - (rip & 4095)).min(16);
+            let n = if in_page < 16 && readable(rip + in_page, 16 - in_page) { 16 } else { in_page };
+            if remembers() {
+                let mut known = known;
+                known.rotate_right(1);
+                known[0] = (rip, n);
+                CODE.with(|c| c.set(known));
+            }
+            n
+        }
+    };
+    let got = copy_in(rip, &mut out[..n]);
+    if got < n && remembers() {
+        // Changed since: asked again at the next fault here.
+        CODE.with(|c| c.set([(0, 0); 8]));
+    }
+    got
+}
+
 /// Instructions emulated, the times Windows was asked about memory for them, and the bytes
 /// `clzero` loops zeroed, since the start.
 static EMULATED: AtomicU64 = AtomicU64::new(0);
@@ -396,10 +477,9 @@ fn writable(va: usize, bytes: usize) -> bool {
 
 /// Where the committed, writable memory that `va` lies in ends, at most `end`; None if `va`
 /// is not in such memory. A region found is remembered ([`remembers`]).
-/// shortcut: a remembered region that was freed or protected since is written all the same
-/// for up to [`ANSWERS`] answers: the write then faults inside the handler, which the guard
-/// on view memory opens as it does any write, and which is a crash otherwise (as the
-/// unchecked single-line emulation behind this one already is).
+/// shortcut: a remembered region that was freed or protected since is written to all the same
+/// for up to [`ANSWERS`] answers, through [`zero`]: the kernel refuses that write instead of
+/// it faulting inside the handler.
 fn writable_to(va: usize, end: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
     let remember = remembers();
@@ -440,25 +520,9 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their bytes are asked about once.
-    let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
-    let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
-        Some(&(_, n)) => n,
-        None => {
-            if !readable(rip, 1) {
-                return 0;
-            }
-            let n = (1..=16).rev().find(|&n| readable(rip, n)).unwrap_or(0);
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
-            }
-            n
-        }
-    };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
+    let mut bytes = [0u8; 16];
+    let n = fetch_code(rip, &mut bytes);
+    let code = &bytes[..n];
     let Some((what, len)) = decode::decode(code) else { return 0 };
     // Logged by `report`, outside the handler.
     let _ = FIRST[kind(what)].compare_exchange(0, rip, Relaxed, Relaxed);
@@ -500,11 +564,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
+            if !writable(line, 64) || zero(line, line + 64) < 64 {
                 return 0; // the real instruction faults there too
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
@@ -537,9 +599,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             let mut at = first;
             while at < stop {
                 let Some(to) = writable_to(at, stop) else { break };
-                // SAFETY: committed and writable from `at` to `to`.
-                unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                at = to;
+                let zeroed = zero(at, to);
+                at += zeroed;
+                if at < to {
+                    break;
+                }
             }
             let done = (at - first) / 64;
             if done == 0 {
@@ -657,6 +721,55 @@ mod tests {
             VirtualQuery(page.cast(), &mut m, size_of_val(&m));
             assert_eq!(m.Protect, PAGE_EXECUTE_READ);
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// Code bytes are copied, not read in place: an instruction at the end of its page, with
+    /// nothing mapped after it, is read up to the page's end and emulated; one with readable
+    /// code after it gets its 16 bytes.
+    #[test]
+    fn code_is_read_up_to_an_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: memory of our own: the first page committed, the second only reserved.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_ne!(VirtualAlloc(base as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            // `monitorx` in the page's last three bytes.
+            let at = base + 4093;
+            std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfa].as_ptr(), at as *mut u8, 3);
+            let mut bytes = [0u8; 16];
+            assert_eq!(fetch_code(at, &mut bytes), 3);
+            assert_eq!(bytes[..3], [0x0f, 0x01, 0xfa]);
+            assert_eq!(fetch_code(base + 100, &mut bytes), 16);
+            // Not code of our own: nothing at all.
+            assert_eq!(fetch_code(base + 4096, &mut bytes), 0);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = at as u64;
+            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+            assert_eq!(context.Rip, at as u64 + 3);
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Zeroing goes through the kernel: up to memory that is not there it zeroes, and there
+    /// it stops instead of faulting, remembered regions or not.
+    #[test]
+    fn zeroing_stops_where_memory_ends() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: memory of our own: the first page committed, the second only reserved.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_ne!(VirtualAlloc(base as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            std::ptr::write_bytes(base as *mut u8, 0xAB, 4096);
+            assert_eq!(zero(base + 64, base + 128), 64);
+            assert_eq!(*((base + 63) as *const u8), 0xAB);
+            assert_eq!(*((base + 128) as *const u8), 0xAB);
+            assert!(std::slice::from_raw_parts((base + 64) as *const u8, 64).iter().all(|&b| b == 0));
+            assert_eq!(zero(base + 4032, base + 8192), 64);
+            assert_eq!(zero(base + 4096, base + 4160), 0);
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
         }
     }
 
