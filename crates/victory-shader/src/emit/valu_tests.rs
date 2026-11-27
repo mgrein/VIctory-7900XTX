@@ -2177,7 +2177,8 @@ fn rdna_card() -> bool {
 
 /// The forms written for the console's own kind of hardware give, on such a
 /// card, what the ones spelled out for every host give; a legacy product's
-/// zero may have the other sign.
+/// zero may have the other sign. (Not the legacy multiply-add: spelled out
+/// it is fused and counts a subnormal factor as zero, `legacy_fmad`.)
 #[test]
 fn rdna_forms_give_what_the_spelled_out_ones_give() {
     if !rdna_card() {
@@ -2189,7 +2190,7 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
     let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
     let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
-    let bodies: [(&str, Vec<u32>, bool); 14] = [
+    let bodies: [(&str, Vec<u32>, bool); 13] = [
         ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
         ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
         ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
@@ -2202,7 +2203,6 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
         ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
         ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
-        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
         ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
     ];
     let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
@@ -2232,4 +2232,36 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
         }
     }
+}
+
+/// `v_mad_legacy_f32` as the console runs it (`v_fma_legacy_f32`): a zero
+/// or subnormal factor makes the product +0 whatever the other factor is,
+/// and the product is fused with the add where the host fuses (either
+/// rounding is taken: DXIL leaves fusing to the driver).
+#[test]
+fn legacy_mad_takes_a_subnormal_factor_as_zero() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46: one rounding or two.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A subnormal factor and an infinite one: the product is +0.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        [0x7f80_0000, 0x807f_ffff, 0x3f80_0000, 0],
+        // A zero factor and an infinite or not-a-number one.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+        [0x7fc0_0000, 0x8000_0000, 0xc000_0000, 0],
+        // Neither is zero: an ordinary product and sum.
+        [0x4000_0000, 0x4040_0000, 0x3f80_0000, 0],
+        [0x0080_0000, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0, 0x3f80_0000, 0x3f80_0000, 0x3f80_0000, 0xc000_0000, 0x40e0_0000, 0x7f80_0000];
+    run_cases(&mad, &cases, |backend, i, inp, got| {
+        if i == 0 && got == 0 {
+            eprintln!("{backend}: the multiply-add is not fused by this host (product rounded first)");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i} {inp:x?}: got {got:#x}, want {:#x}", want[i]);
+    });
 }
