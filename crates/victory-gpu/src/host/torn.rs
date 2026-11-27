@@ -22,7 +22,7 @@
 //! of one, and 64 KiB of what came down are hashed (some 4 us) just before
 //! they are merged, on the thread that merges them (`crate::land`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU8;
 
 use super::*;
@@ -42,28 +42,55 @@ pub(super) type Piece = (u64, u32);
 /// suspect, and those fetched because an earlier fetch was.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The pieces whose last fetch was not what a flight ended with.
+/// The pieces whose last fetch was not what a flight ended with, each with
+/// its copy, to tell when the copy is gone: copies come and go as the title
+/// streams and their numbers are never used again, so a suspect piece of a
+/// copy gone would never be fetched (and found whole) again.
 #[derive(Default)]
-pub(super) struct Suspects(HashSet<Piece>);
+pub(super) struct Suspects {
+    pieces: HashMap<Piece, std::sync::Weak<crate::shadow::Shadow>>,
+    /// Landings done since the last time suspects of copies gone were let go.
+    landings: u32,
+}
+
+/// Every how many landings suspects of copies gone are let go of.
+const PRUNE_EVERY: u32 = 256;
 
 impl Suspects {
     /// Whether a flight that may write `piece` fetches it, its compare
     /// having flagged it or not.
     pub(super) fn wanted(&self, piece: Piece, flagged: bool) -> bool {
-        flagged || (!self.0.is_empty() && self.0.contains(&piece))
+        flagged || (!self.pieces.is_empty() && self.pieces.contains_key(&piece))
     }
 
-    /// `piece` was fetched; `same`: it was what the last of the flights
-    /// landed ended with.
-    pub(super) fn fetched(&mut self, piece: Piece, same: bool) {
+    /// `piece` of `copy` was fetched; `same`: it was what the last of the
+    /// flights landed ended with.
+    pub(super) fn fetched(&mut self, piece: Piece, same: bool, copy: impl FnOnce() -> std::sync::Weak<crate::shadow::Shadow>) {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         if same {
-            if self.0.remove(&piece) {
+            if self.pieces.remove(&piece).is_some() {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
         } else {
-            self.0.insert(piece);
+            self.pieces.entry(piece).or_insert_with(copy);
             STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A landing is done: every [`PRUNE_EVERY`] of them, suspects of copies
+    /// gone are let go of.
+    fn landed(&mut self) {
+        self.landings += 1;
+        if self.landings >= PRUNE_EVERY {
+            self.landings = 0;
+            self.prune();
+        }
+    }
+
+    /// Lets go of the suspect pieces of copies gone.
+    fn prune(&mut self) {
+        if !self.pieces.is_empty() {
+            self.pieces.retain(|_, copy| copy.strong_count() > 0);
         }
     }
 }
@@ -144,13 +171,14 @@ impl Check {
 
     /// All is landed: what was found is kept for later flights.
     pub(super) fn done(&self, suspects: &mut Suspects) {
-        for ((piece, _), found) in self.of.iter().zip(&self.found) {
+        for (((piece, _), found), (copy, ..)) in self.of.iter().zip(&self.found).zip(&self.copies) {
             match found.load(Ordering::Relaxed) {
                 // Not compared on the card: fetched by every flight.
                 0 => {}
-                found => suspects.fetched(*piece, found == 1),
+                found => suspects.fetched(*piece, found == 1, || std::sync::Arc::downgrade(copy)),
             }
         }
+        suspects.landed();
     }
 }
 
@@ -278,7 +306,7 @@ mod tests {
             let (at, step) = seen[f];
             assert!(at >= f);
             held = flights[at][step];
-            suspects.fetched(piece, held == ended);
+            suspects.fetched(piece, held == ended, std::sync::Weak::new);
         }
         (held, fetches)
     }
@@ -298,6 +326,23 @@ mod tests {
         // Fetched whole: no more fetches than without the check.
         assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], true), (5, 1));
         assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], false), (5, 1));
+    }
+
+    /// Suspect pieces of copies gone are let go of; a landing lets go of
+    /// them only every so often.
+    #[test]
+    fn suspects_of_copies_gone_go() {
+        let mut suspects = Suspects::default();
+        suspects.fetched((1, 0), false, std::sync::Weak::new);
+        suspects.fetched((1, 3), false, std::sync::Weak::new);
+        assert!(suspects.wanted((1, 3), false));
+        for _ in 1..PRUNE_EVERY {
+            suspects.landed();
+        }
+        assert_eq!(suspects.pieces.len(), 2);
+        suspects.landed();
+        assert!(suspects.pieces.is_empty());
+        assert!(!suspects.wanted((1, 3), false));
     }
 
     /// What the hash costs (ignored: a measurement): pieces that just came
