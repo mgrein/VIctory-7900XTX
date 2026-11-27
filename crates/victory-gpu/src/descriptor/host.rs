@@ -2924,6 +2924,29 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes slot `index` (a dynamic one) from `view` as
+    /// [`HostHeap::make_at`] does, for a UAV clear, which also needs a
+    /// descriptor of the view in a heap the card does not see: that (this
+    /// thread's staging slot, [`staged`]), and the host resource the view is
+    /// of. `None`, with the slot left as it was, if the host cannot make the
+    /// view or descriptors are made in place (`VICTORY_VIEW_COPY=0`).
+    pub(crate) fn make_for_clear(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        if self.sampler {
+            return None;
+        }
+        let cpu = staged(false, 0)?;
+        let held = make_twinned(view, cpu, self.twin(index)).flatten()?;
+        self.put(index);
+        self.twin_made(index, twinned(view));
+        let resource = held.resource.clone();
+        self.keep(index, Some(held));
+        Some((cpu, resource))
+    }
+
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
     /// from this thread's descriptor of it if the recording `recording` has
     /// made one, else as [`HostHeap::make_at`] does, and keeps that

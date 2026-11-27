@@ -1525,29 +1525,9 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a root SRV it reads
-    /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        let l = &list.list;
-        // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
-        if crate::host::walls_trace() {
-            self.walls_census(p, compute);
-        }
-        // A list without a view heap: one of the title's for the views the
-        // host itself puts into heap slots.
-        if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
-            && let Some(heap) = crate::descriptor::lent_heap()
-        {
-            once!("a dispatch without a view heap that needs one gets the title's");
-            self.heaps[0] = heap;
-        }
+    /// Sets the list's heaps on the host list if they changed since they
+    /// were last set there.
+    fn bind_heaps(&mut self, list: &HostList) {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
         // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
@@ -1587,12 +1567,68 @@ impl State {
             }
             if !heaps.is_empty() {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { list.list.SetDescriptorHeaps(&heaps) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// A dynamic slot of the bound view heap made the view `view`, for a
+    /// UAV clear of the title's slot `gpu` (which must name the same view):
+    /// D3D12 reads the shader-visible descriptor when the clear runs, so the
+    /// copy stays the recording's until it retires. Also gives the CPU-only
+    /// descriptor of the view (this thread's staging slot, valid until it
+    /// next makes a view) and the host resource it views. Binds the heaps.
+    #[cfg(windows)]
+    pub(crate) fn clear_slot(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        view: &View,
+    ) -> Option<(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        let address = self.heaps[0];
+        if address == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(address as This);
+        let index = heap.index(gpu)?;
+        if heap.handle(index)? != gpu || crate::descriptor::view(gpu).as_ref() != Some(view) {
+            return None;
+        }
+        let host = heap.host()?;
+        let slot = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        let (cpu, resource) = host.make_for_clear(slot, view)?;
+        self.bind_heaps(list);
+        Some((host.gpu_handle(slot), cpu, resource))
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a root SRV it reads
+    /// could not be given a view.
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let l = &list.list;
+        // Textures picked by index, before anything asks for them.
+        self.early_textures(list, p, compute);
+        if crate::host::walls_trace() {
+            self.walls_census(p, compute);
+        }
+        // A list without a view heap: one of the title's for the views the
+        // host itself puts into heap slots.
+        if self.heaps[0] == 0
+            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
+            && let Some(heap) = crate::descriptor::lent_heap()
+        {
+            once!("a dispatch without a view heap that needs one gets the title's");
+            self.heaps[0] = heap;
+        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
