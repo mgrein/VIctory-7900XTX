@@ -3102,6 +3102,27 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
+/// Whether a fence that was to reach `sent` did: `Err` when it stands
+/// short of it or at `u64::MAX`, which is what the system sets every fence
+/// of a removed device to (and it wakes the waits on them). A fetch's
+/// buffer is then not what the card wrote and must not be merged into
+/// title memory (after Belobug PR #249, and VIctory b58b779 by way of
+/// VItoriaBr c1689786).
+fn fence_ran(completed: u64, sent: u64) -> bool {
+    completed != u64::MAX && completed >= sent
+}
+
+/// [`fence_ran`] for a relay fetch's fence, as a host error.
+#[cfg(windows)]
+fn fetch_ran(fence: &ID3D12Fence, sent: u64) -> windows::core::Result<()> {
+    // SAFETY: a plain query.
+    if fence_ran(unsafe { fence.GetCompletedValue() }, sent) {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_hresult(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED))
+    }
+}
+
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
@@ -3119,6 +3140,20 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     pieces.sort_unstable();
     pieces.dedup();
     pieces
+}
+
+#[cfg(test)]
+mod fence_ran_tests {
+    /// The removed device's fence value is not a completion, nor is a
+    /// value short of the one sent.
+    #[test]
+    fn a_removed_device_s_fence_is_not_a_fetch_that_ran() {
+        use super::fence_ran;
+        assert!(fence_ran(5, 5));
+        assert!(fence_ran(6, 5));
+        assert!(!fence_ran(4, 5));
+        assert!(!fence_ran(u64::MAX, 5));
+    }
 }
 
 #[cfg(test)]
@@ -5531,6 +5566,7 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    fetch_ran(&fence, sent)?;
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -5546,6 +5582,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                fetch_ran(&fence, sent)?;
                 Ok(after)
             })()
         };
