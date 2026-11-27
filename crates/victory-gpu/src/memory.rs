@@ -62,6 +62,11 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
+//! A title buffer's copy is forgotten once the title released the buffer or
+//! the copy was let go in place ([`forgets`]): its directory entries are
+//! emptied and its number is given to another copy once nothing holds the
+//! old one any more.
+//!
 //! shortcut: a page held for anything else is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
@@ -139,6 +144,22 @@ const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// After what title memory by address needs could not be made (all of it,
+/// or another arena), so many frames before it is tried again: each try
+/// commits memory (16 MiB, 64 MiB) and draws come hundreds of times a frame.
+const RETRY: u64 = 300;
+/// Frames over which every title buffer's copy is looked at once, to forget
+/// those whose buffer the title released ([`forgets`]).
+const FORGET_SWEEP: usize = 16;
+
+/// Whether the copies of title buffers the title released (or whose copy
+/// was let go in place) are forgotten (`VICTORY_MEMORY_FORGET=0`: not, as
+/// before: each was kept for the rest of the run with its host memory, its
+/// buffer on the card and its directory entries, which then gave a buffer
+/// the title put at the same address the dead copy).
+fn forgets() -> bool {
+    crate::toggled!("VICTORY_MEMORY_FORGET")
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -165,6 +186,86 @@ struct Held {
     theirs: bool,
 }
 
+/// Keys (pages, addresses) in the order they came, each once, and where the
+/// sweep over them is. A key that comes again while it is in keeps its
+/// place: a slot the title streams into again and again at the same address
+/// added one more each time, and those were taken out only by a sweep that
+/// came to them while the slot was empty.
+#[derive(Default)]
+struct Order {
+    keys: Vec<u64>,
+    has: std::collections::HashSet<u64>,
+    at: usize,
+}
+
+impl Order {
+    fn push(&mut self, key: u64) {
+        if self.has.insert(key) {
+            self.keys.push(key);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The sweep's next key.
+    fn next(&mut self) -> Option<u64> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        self.at = (self.at + 1) % self.keys.len();
+        Some(self.keys[self.at])
+    }
+
+    /// Takes out the key [`Order::next`] gave last.
+    fn take_last(&mut self) {
+        let key = self.keys.swap_remove(self.at);
+        self.has.remove(&key);
+    }
+}
+
+/// Numbers of copies forgotten: each is given out again once nothing holds
+/// its old copy (no list that may still read its view slot, no retirement).
+struct Freed<T> {
+    cooling: Vec<(usize, std::sync::Weak<T>)>,
+    free: Vec<usize>,
+}
+
+impl<T> Default for Freed<T> {
+    fn default() -> Self {
+        Freed { cooling: Vec::new(), free: Vec::new() }
+    }
+}
+
+impl<T> Freed<T> {
+    /// Number `n`'s copy, `old`, is forgotten.
+    fn cool(&mut self, n: usize, old: std::sync::Weak<T>) {
+        self.cooling.push((n, old));
+    }
+
+    /// The numbers whose old copy is gone are free.
+    fn settle(&mut self) {
+        let free = &mut self.free;
+        self.cooling.retain(|(n, old)| {
+            let gone = old.strong_count() == 0;
+            if gone {
+                free.push(*n);
+            }
+            !gone
+        });
+    }
+
+    /// A free number, if there is one (taken with [`Freed::take`]).
+    fn next(&self) -> Option<usize> {
+        self.free.last().copied()
+    }
+
+    fn take(&mut self) {
+        self.free.pop();
+    }
+}
+
 /// A packed structure the builder came to.
 struct Packed {
     /// The frame it last did.
@@ -178,24 +279,30 @@ struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
-    /// Places of title buffers' copies among `copies`.
+    /// Copy `n` is `copies[n - 1]` (None: forgotten, [`forgets`]).
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// Places of copies among `copies`, by the copy's address.
     numbers: HashMap<usize, usize>,
+    /// Places among `copies` of title buffers' copies ([`Memory::map`]),
+    /// looked at in turn for those the title's buffer no longer has.
+    buffer_copies: Order,
+    /// Places of copies forgotten.
+    freed: Freed<Shadow>,
+    /// How often a copy was given a number (new or given out again): a list
+    /// brings every copy up to date again after one was.
+    numbered: usize,
     /// Arenas: place in `copies`, address.
     arenas: Vec<(usize, usize)>,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
-    order: Vec<u64>,
-    sweep: usize,
+    order: Order,
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
     /// Packed structures the builder came to: the frame it last did.
     packed: HashMap<u64, Packed>,
     /// Their addresses in the order they came, and where the sweep is.
-    packed_order: Vec<u64>,
-    packed_sweep: usize,
+    packed_order: Order,
     /// Places of pages that are free: the copy, the address in the arena.
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
@@ -209,6 +316,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// The frame another arena last could not be made in ([`RETRY`]).
+    no_arena: Option<u64>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -230,6 +339,8 @@ struct Stats {
     packed: u64,
     packed_bytes: u64,
     gone: u64,
+    /// Copies of title buffers the title released, forgotten.
+    forgotten: u64,
     /// Pages that came for an address in constants, a written view, another
     /// view, a structure named in upload memory.
     came: [u64; 4],
@@ -241,6 +352,36 @@ struct Stats {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// The frame [`Memory::new`] last failed in (`u64::MAX`: never), under
+/// [`MEMORY`]'s lock ([`RETRY`]).
+static NEW_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether a try that failed in frame `failed` (`u64::MAX`: none did) is
+/// too recent to try again in frame `frame`.
+fn too_soon(failed: u64, frame: u64) -> bool {
+    failed != u64::MAX && frame >= failed && frame - failed < RETRY
+}
+
+/// Memory [`crate::upload::reserve`] gave that is not used after all.
+fn give_back(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    // SAFETY: a whole reservation of ours; nothing holds it (what was made
+    // over it was dropped).
+    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+}
+
+/// [`give_back`] of memory a copy of it, `copy`, was made of and given to
+/// nobody, once the copy is gone; unless another thread holds the copy at
+/// this moment (the card's pass over changed copies upgrades its weak
+/// references to every copy on the card and reads their memory): then the
+/// memory stays committed, as before (freed under it, that read faulted).
+fn give_back_under<T>(at: usize, copy: Arc<T>) {
+    if let Some(copy) = Arc::into_inner(copy) {
+        drop(copy);
+        give_back(at);
+    }
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -256,9 +397,16 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        // (Else the 16 MiB stayed committed, once per draw.)
+        let Some(directory) = crate::shadow::by_address(entries as u64, bytes) else {
+            give_back(entries);
+            return None;
+        };
+        let Some((faults, data)) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4) else {
+            give_back_under(entries, directory);
+            return None;
+        };
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
         unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
@@ -270,20 +418,22 @@ impl Memory {
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
             numbers: HashMap::new(),
+            buffer_copies: Order::default(),
+            freed: Freed::default(),
+            numbered: 0,
             arenas: Vec::new(),
             pages: HashMap::new(),
-            order: Vec::new(),
-            sweep: 0,
+            order: Order::default(),
             windows: 0,
             packed: HashMap::new(),
-            packed_order: Vec::new(),
-            packed_sweep: 0,
+            packed_order: Order::default(),
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            no_arena: None,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -333,7 +483,8 @@ impl Memory {
         if let Some(&n) = self.numbers.get(&key) {
             return Some(n);
         }
-        if self.copies.len() >= COPIES as usize {
+        let again = self.freed.next();
+        if again.is_none() && self.copies.len() >= COPIES as usize {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
             return None;
@@ -343,10 +494,89 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return None;
         }
-        self.copies.push(shadow);
-        let n = self.copies.len() - 1;
+        let n = match again {
+            Some(n) if self.views_at(n, &shadow) => {
+                self.freed.take();
+                self.copies[n] = Some(shadow);
+                n
+            }
+            _ if self.copies.len() < COPIES as usize => {
+                self.copies.push(Some(shadow));
+                self.copies.len() - 1
+            }
+            _ => return None,
+        };
         self.numbers.insert(key, n);
+        self.numbered += 1;
         Some(n)
+    }
+
+    /// Number `n`, given out again, shows `shadow` in every view heap whose
+    /// run has its slot written already (the others write it when a draw
+    /// comes with them). Nothing reads the slot now: lists that knew the old
+    /// copy are through (it is gone), and those since found no page with
+    /// that number. False, and nothing written, if the heaps cannot be had at
+    /// once.
+    fn views_at(&self, n: usize, shadow: &Shadow) -> bool {
+        let heaps = &self.heaps;
+        if heaps.values().all(|&(_, made)| made as usize <= n) {
+            return true;
+        }
+        let (_, len) = shadow.span();
+        crate::descriptor::try_each_view_heap(|heap| {
+            if let Some(&(base, made)) = heaps.get(&(std::ptr::from_ref(heap) as usize))
+                && (n as u32) < made
+            {
+                heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+            }
+        })
+    }
+
+    /// The copy `n` that is an arena, or held for good (never forgotten).
+    fn kept(&self, n: usize) -> &Arc<Shadow> {
+        self.copies[n].as_ref().expect("only title buffers' copies are forgotten")
+    }
+
+    /// Forgets the copies of title buffers the title released, or whose copy
+    /// was let go in place, some each frame ([`forgets`]); and gives out
+    /// again the numbers of those nothing holds any more.
+    fn forget_released(&mut self) {
+        self.freed.settle();
+        if !forgets() {
+            return;
+        }
+        for _ in 0..self.buffer_copies.len().div_ceil(FORGET_SWEEP) {
+            let Some(n) = self.buffer_copies.next() else { break };
+            let n = n as usize;
+            if self.copies[n].as_ref().is_none_or(|s| !crate::shadow::registered(s)) {
+                self.buffer_copies.take_last();
+                self.forget(n);
+            }
+        }
+    }
+
+    /// Copy `n` is no title buffer's any more: its pages are emptied in the
+    /// directory, and it goes once no list holds it (lists recorded before
+    /// hold it, and read it through the directory they were sent with).
+    fn forget(&mut self, n: usize) {
+        let Some(shadow) = self.copies[n].take() else { return };
+        let (first, len) = shadow.span();
+        // The pages [`Memory::map`] and [`Memory::opens`] gave it, those it
+        // holds in part (the page asked for) among them.
+        let end = (first + len).div_ceil(PAGE).min(u64::from(MEMORY_PAGES));
+        for page in first / PAGE..end {
+            if self.copy_of(page) == Some(n) {
+                let entry = self.entry(page);
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe { entry.write_volatile(0) };
+                crate::watch::wrote(entry as usize, 8);
+            }
+        }
+        self.numbers.remove(&(Arc::as_ptr(&shadow) as usize));
+        self.open.remove(&n);
+        self.freed.cool(n, Arc::downgrade(&shadow));
+        self.stats.forgotten += 1;
+        crate::host::retire(shadow);
     }
 
     /// Gives `page` a place, if it has none and the memory is the title's;
@@ -371,6 +601,7 @@ impl Memory {
             // shortcut: a page of a title buffer inside this one that has a
             // copy of its own is given this copy too.
             if fresh {
+                self.buffer_copies.push(n as u64);
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
@@ -419,12 +650,34 @@ impl Memory {
         true
     }
 
-    /// Another arena's pages.
+    /// Whether another copy can be given a number.
+    fn numbers_left(&self) -> bool {
+        self.copies.len() < COPIES as usize || self.freed.next().is_some()
+    }
+
+    /// Another arena's pages. Not tried for [`RETRY`] frames after a try
+    /// failed: what a try commits is given back, but it costs 64 MiB of
+    /// commit and two buffers of as much, and it comes with every dispatch
+    /// of the builder.
     fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+        if self.no_arena.is_some_and(|failed| too_soon(failed, self.frame)) || !self.numbers_left() {
             return false;
-        };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        }
+        let made = crate::upload::reserve(ARENA as usize).and_then(|at| {
+            let Some(shadow) = crate::shadow::by_address(at as u64, ARENA) else {
+                give_back(at);
+                return None;
+            };
+            let n = self.number(shadow.clone());
+            if n.is_none() {
+                give_back_under(at, shadow);
+            }
+            Some((n?, at))
+        });
+        let Some((n, at)) = made else {
+            self.no_arena = Some(self.frame);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(RETRY, "title memory by address: another arena could not be made; tried again so many frames later"));
             return false;
         };
         self.arenas.push((n, at));
@@ -437,7 +690,7 @@ impl Memory {
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
-        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        fill(self.entry(page), copy, at as u64 - self.kept(copy).span().0);
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -469,25 +722,17 @@ impl Memory {
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
         for _ in 0..self.order.len().div_ceil(SWEEP) {
-            self.sweep = (self.sweep + 1) % self.order.len();
-            let page = self.order[self.sweep];
+            let Some(page) = self.order.next() else { break };
             if self.pages.contains_key(&page) {
                 self.bring(page, page + 1);
             } else {
-                self.order.swap_remove(self.sweep);
-                if self.order.is_empty() {
-                    break;
-                }
+                self.order.take_last();
             }
         }
         for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
-            self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
-            let address = self.packed_order[self.packed_sweep];
+            let Some(address) = self.packed_order.next() else { break };
             if !self.packed.contains_key(&address) {
-                self.packed_order.swap_remove(self.packed_sweep);
-                if self.packed_order.is_empty() {
-                    break;
-                }
+                self.packed_order.take_last();
             } else if !self.there(address) {
                 self.gone(address);
             }
@@ -500,12 +745,13 @@ impl Memory {
         let Some(n) = self.map(address / PAGE).then(|| self.copy_of(address / PAGE)).flatten() else {
             return;
         };
+        let Some(copy) = self.copies[n].clone() else { return };
         if self.pages.contains_key(&(address / PAGE)) || !self.open.insert(n) {
             return;
         }
         // (Its pages hold what the CPU writes beside the builder's scratch.)
-        self.copies[n].keep_stores();
-        let (first, len) = self.copies[n].span();
+        copy.keep_stores();
+        let (first, len) = copy.span();
         tracing::info!(
             start = format_args!("{first:#x}"),
             len,
@@ -558,7 +804,7 @@ impl Memory {
                 continue;
             }
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
-            let shadow = &self.copies[held.copy];
+            let Some(shadow) = &self.copies[held.copy] else { continue };
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
@@ -666,7 +912,7 @@ impl Memory {
     /// or not.
     fn take(&mut self, page: u64, from: usize, to: usize, whole: bool) {
         let Some(held) = self.pages.get(&page) else { return };
-        let shadow = &self.copies[held.copy];
+        let Some(shadow) = &self.copies[held.copy] else { return };
         let base = held.at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
         let mut at = from;
@@ -763,9 +1009,10 @@ impl Memory {
             self.map(page);
             if let Some(k) = self.copy_of(page)
                 && !self.pages.contains_key(&page)
+                && let Some(copy) = &self.copies[k]
             {
-                self.copies[k].refresh(list, at, n);
-                self.copies[k].gpu_writes(list, at, n);
+                copy.refresh(list, at, n);
+                copy.gpu_writes(list, at, n);
                 self.stats.back += 1;
             }
             at += n;
@@ -777,7 +1024,7 @@ impl Memory {
     fn bring_up(&self, list: &HostList) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        for shadow in self.copies.iter().flatten() {
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -793,14 +1040,15 @@ impl Memory {
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
-            "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
+            "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all ({} of released title buffers forgotten since the last line); per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
-            self.copies.len(),
+            self.copies.iter().flatten().count(),
+            s.forgotten,
             s.uses[0] as f64 / frames,
             s.uses[1] as f64 / frames,
             s.faults as f64 / frames,
@@ -935,14 +1183,23 @@ pub(crate) fn ready(
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let frame = crate::frame::current();
     if guard.is_none() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Not with every draw: each try commits the directory's 16 MiB.
+        if too_soon(NEW_FAILED.load(Relaxed), frame) {
+            return None;
+        }
         *guard = Memory::new();
+        if guard.is_none() {
+            NEW_FAILED.store(frame, Relaxed);
+        }
     }
     let m = guard.as_mut()?;
-    let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        m.forget_released();
         m.take_faults();
         m.look_again();
         m.report();
@@ -1070,6 +1327,9 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+        // (A number forgotten: its slot stays as it is until it is given
+        // out again, [`Memory::views_at`].)
+        let Some(shadow) = shadow else { continue };
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
@@ -1081,7 +1341,7 @@ pub(crate) fn ready(
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
     let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+    if list.first_use(usize::MAX - (6 << 33) - (m.numbered & 0xFFFF_FFFF)) {
         m.bring_up(list);
     }
     if first_read {
@@ -1287,7 +1547,7 @@ mod dump {
             let Some(host) = host() else { return };
             let mut copies = Vec::new();
             for &(n, _) in &self.arenas {
-                let buffer = &self.copies[n].buffer;
+                let buffer = &self.kept(n).buffer;
                 let Some((to, data)) = host.shared_buffer(ARENA) else { break };
                 // SAFETY: an open list; live buffers of those sizes. The list
                 // has not used the arena yet.
@@ -1338,6 +1598,96 @@ mod tests {
         // The switch wins.
         assert_eq!(pages_most(Some(11 * GIB), Some(3072)), 3 << 14);
         assert_eq!(pages_most(Some(24 * GIB), Some(512)), pages(512));
+    }
+
+    /// A key that comes again while it is in keeps its one place; one the
+    /// sweep took out comes in again.
+    #[test]
+    fn a_key_is_in_the_order_once() {
+        let mut order = Order::default();
+        assert_eq!(order.next(), None);
+        for key in [5, 6, 5, 5, 7, 6] {
+            order.push(key);
+        }
+        assert_eq!(order.len(), 3);
+        let mut seen: Vec<u64> = (0..3).filter_map(|_| order.next()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [5, 6, 7]);
+        // The sweep takes one out.
+        while order.next() != Some(6) {}
+        order.take_last();
+        assert_eq!(order.len(), 2);
+        order.push(5);
+        assert_eq!(order.len(), 2);
+        order.push(6);
+        assert_eq!(order.len(), 3);
+        // All of them out, one at a time.
+        for _ in 0..3 {
+            order.next();
+            order.take_last();
+        }
+        assert_eq!((order.len(), order.next()), (0, None));
+        assert!(order.has.is_empty());
+    }
+
+    /// A forgotten copy's number is free only once nothing holds the copy.
+    #[test]
+    fn a_number_is_free_once_its_old_copy_is_gone() {
+        let mut freed: Freed<u32> = Freed::default();
+        assert_eq!(freed.next(), None);
+        let (a, b) = (Arc::new(1), Arc::new(2));
+        // A list still holds `a`.
+        let list = a.clone();
+        freed.cool(3, Arc::downgrade(&a));
+        freed.cool(5, Arc::downgrade(&b));
+        drop((a, b));
+        freed.settle();
+        assert_eq!(freed.next(), Some(5));
+        freed.take();
+        assert_eq!(freed.next(), None);
+        drop(list);
+        freed.settle();
+        assert_eq!(freed.next(), Some(3));
+        freed.take();
+        freed.settle();
+        assert_eq!((freed.next(), freed.cooling.len()), (None, 0));
+    }
+
+    /// Reserved memory is given back only once nothing else holds the copy
+    /// made of it.
+    #[cfg(windows)]
+    #[test]
+    fn memory_is_given_back_once_its_copy_is_held_by_nothing_else() {
+        use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let state = |at: usize| {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a query of an address, into a local.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+            assert_ne!(n, 0);
+            info.State
+        };
+        let at = crate::upload::reserve(1 << 16).expect("reserved");
+        let copy = Arc::new(());
+        // Another thread holds it.
+        let other = copy.clone();
+        give_back_under(at, copy);
+        assert_ne!(state(at), MEM_FREE);
+        // SAFETY: still committed, ours.
+        unsafe { (at as *mut u8).write_volatile(1) };
+        give_back_under(at, other);
+        assert_eq!(state(at), MEM_FREE);
+    }
+
+    /// A failed try is not tried again for [`RETRY`] frames.
+    #[test]
+    fn a_failed_try_waits() {
+        assert!(!too_soon(u64::MAX, 0));
+        assert!(!too_soon(u64::MAX, 5));
+        assert!(too_soon(7, 7));
+        assert!(too_soon(7, 7 + RETRY - 1));
+        assert!(!too_soon(7, 7 + RETRY));
+        // A frame counter that went back: tried.
+        assert!(!too_soon(7, 3));
     }
 
     #[test]

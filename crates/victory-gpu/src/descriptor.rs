@@ -885,6 +885,25 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
     Some(f(host))
 }
 
+/// `f` of the host heap of every title view heap that has one, if the table
+/// of heaps can be had at once (else nothing is done: false).
+#[cfg(windows)]
+pub(crate) fn try_each_view_heap(mut f: impl FnMut(&host::HostHeap)) -> bool {
+    let Ok(heaps) = SHADER_HEAPS.try_read() else {
+        return false;
+    };
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if !heap.samplers()
+            && let Some(Some(host)) = heap.host.get()
+        {
+            f(host);
+        }
+    }
+    true
+}
+
 /// Makes dynamic slot `index` of the host heap behind the title heap at
 /// `heap`, if that heap still exists, the constant buffer view of `size`
 /// bytes of `buffer` at `gpu`.
