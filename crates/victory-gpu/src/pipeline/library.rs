@@ -570,16 +570,85 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines the host answered "out of memory" for, and those of them made
+/// on a second try, since the start.
+pub(crate) static OUT_OF_MEMORY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Under this much commit headroom an "out of memory" from the host is
+/// taken for what it says.
+const SHORT_COMMIT: u64 = 2 << 30;
+
+/// Whether the PC is short of memory by its commit `headroom` (not known:
+/// not short).
+fn short(headroom: Option<u64>) -> bool {
+    headroom.is_some_and(|h| h < SHORT_COMMIT)
+}
+
+/// The host answered E_OUTOFMEMORY for a pipeline: whether to try once
+/// more. NVIDIA's driver gives that answer for a shader its compiler will
+/// not take as well as for a PC out of memory, and either way the pipeline
+/// was refused for the rest of the run. With commit headroom to spare it is
+/// the compiler's refusal (said so, and left at that: the same code gets the
+/// same answer); with little, it is memory: several compiles at once take
+/// hundreds of MB each for a while, so this one waits up to five seconds
+/// for the headroom to come back and is tried once more. (The idea of XCL
+/// 927adcc0, which reads the answer as a refusal; nothing of it is copied.
+/// We have no second form of a translation to retry with at this point.)
+/// `VICTORY_PIPELINE_OOM_RETRY=0`: refused at once, as before.
+fn retry_out_of_memory() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let seen = OUT_OF_MEMORY[0].fetch_add(1, Ordering::Relaxed);
+    let headroom = crate::host::commit_headroom();
+    let label = LABEL.with(|l| l.borrow().clone());
+    if !short(headroom) {
+        if seen < 16 {
+            tracing::warn!(
+                pipeline = %label,
+                headroom_mb = headroom.map(|h| h >> 20),
+                "the host answered out of memory for a pipeline with memory to spare: its compiler refuses the shader"
+            );
+        }
+        return false;
+    }
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_OOM_RETRY").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let began = std::time::Instant::now();
+    while began.elapsed() < std::time::Duration::from_secs(5) && short(crate::host::commit_headroom()) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    tracing::warn!(
+        pipeline = %label,
+        headroom_mb = headroom.map(|h| h >> 20),
+        now_mb = crate::host::commit_headroom().map(|h| h >> 20),
+        waited_ms = began.elapsed().as_millis() as u64,
+        "the host answered out of memory for a pipeline while the PC was short of it: tried once more"
+    );
+    true
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl Fn() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let create = || {
-        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        create()
+        let once = || {
+            let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+            create()
+        };
+        match once() {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY && retry_out_of_memory() => {
+                let again = once();
+                if again.is_ok() {
+                    OUT_OF_MEMORY[1].fetch_add(1, Ordering::Relaxed);
+                }
+                again
+            }
+            made => made,
+        }
     };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
@@ -901,6 +970,14 @@ mod tests {
         drop(save);
         assert!(share(&saving, false).is_some());
         assert!(share(&saving, true).is_some());
+    }
+
+    #[test]
+    fn out_of_memory_counts_as_memory_only_when_the_pc_is_short() {
+        assert!(short(Some(SHORT_COMMIT - 1)));
+        assert!(!short(Some(SHORT_COMMIT)));
+        assert!(!short(Some(20 << 30)));
+        assert!(!short(None));
     }
 
     #[test]
