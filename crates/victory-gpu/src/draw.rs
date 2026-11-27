@@ -272,8 +272,52 @@ static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+/// The last three are further permutations of the ped texture compositor
+/// (from cool_fox f4b48ad7).
+const BAKE_PIXEL_SHADERS: [&str; 7] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+];
+
+/// Geometry stages every permutation of the ped texture compositor and the
+/// decoration bake shares (a full-screen triangle vertex shader and the
+/// decoration projection mesh shader, from cool_fox f4b48ad7): they catch
+/// pixel shader permutations [`BAKE_PIXEL_SHADERS`] does not list.
+const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
+
+/// Whether a draw counts as one of the title's bakes for the pass before
+/// a bake ([`State::early_textures`]) by its shaders: a listed bake pixel
+/// shader, or (unless `VICTORY_BAKE_GEOMETRY=0`) a listed bake geometry
+/// stage. With `VICTORY_BAKE_SHAPE=1` (off by default: it may also take
+/// passes that are no bake, each costing a share of the frame's bake
+/// budget) a draw with no depth into four or more targets, the first a
+/// square of at least 512, counts too.
+fn bake_by_shaders(p: &HostPipeline) -> bool {
+    static GEOMETRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let geometry = *GEOMETRY
+        .get_or_init(|| std::env::var_os("VICTORY_BAKE_GEOMETRY").is_none_or(|v| v != "0"));
+    p.stages.iter().any(|s| {
+        let h = s.shader.hash.as_str();
+        BAKE_PIXEL_SHADERS.contains(&h) || (geometry && BAKE_GEOMETRY_SHADERS.contains(&h))
+    })
+}
+
+/// See [`bake_by_shaders`]: `VICTORY_BAKE_SHAPE=1`.
+fn bake_shape() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SHAPE").is_some_and(|v| v == "1"))
+}
+
+/// Whether bound targets have a bake's shape ([`bake_shape`]): no depth,
+/// four or more targets, the first a square texture of at least 512.
+fn bake_shaped(depth: usize, first_target: Option<(u64, u32)>, targets: usize) -> bool {
+    depth == 0 && targets >= 4 && first_target.is_some_and(|(w, h)| w >= 512 && w == u64::from(h))
+}
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -2255,7 +2299,16 @@ impl State {
         // (Moved at every frame's first draw, whatever is done here.)
         let last_draws = last_frame_draws(crate::frame::current());
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && (bake_by_shaders(p)
+                || (bake_shape()
+                    && bake_shaped(
+                        self.depth,
+                        self.targets
+                            .first()
+                            .and_then(|&t| crate::resource::texture_kind(t as This))
+                            .map(|(w, h, _)| (w, h)),
+                        self.targets.iter().filter(|&&t| t != 0).count(),
+                    )));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -5175,7 +5228,18 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{bake_shaped, staging_budget_per_frame};
+
+    #[test]
+    fn bake_shape_needs_no_depth_four_targets_and_a_large_square() {
+        assert!(bake_shaped(0, Some((2048, 2048)), 4));
+        assert!(bake_shaped(0, Some((512, 512)), 5));
+        assert!(!bake_shaped(7, Some((2048, 2048)), 4));
+        assert!(!bake_shaped(0, Some((2048, 2048)), 3));
+        assert!(!bake_shaped(0, Some((256, 256)), 4));
+        assert!(!bake_shaped(0, Some((2048, 1024)), 4));
+        assert!(!bake_shaped(0, None, 4));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
