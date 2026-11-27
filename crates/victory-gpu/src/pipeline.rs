@@ -573,6 +573,25 @@ pub(crate) fn no_draws() -> bool {
     })
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound render target view has another format
+/// than the title's pipeline declares for its slot
+/// (`host::formats_differ`), the host pipeline of the same shaders and
+/// state made for the bound formats (`make::for_formats`,
+/// `VICTORY_TARGET_VARIANTS`). A draw whose views are as declared pays one
+/// comparison of nine words. (After fxceless a35c5573.)
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() || no_draws() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -585,7 +604,10 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// (`VICTORY_SKIP_PIPELINES` works in release builds too, as a
+/// containment switch for a shader that breaks the picture: after
+/// Belobug cf62e1ae, which un-gated it there.)
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -605,7 +627,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -621,7 +643,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
