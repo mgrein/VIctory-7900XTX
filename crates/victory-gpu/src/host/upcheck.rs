@@ -270,28 +270,52 @@ fn line(stale: &mut BTreeMap<(u64, u64), Stale>) {
 }
 
 /// Of a copy: the ranges shaders were declared to write (joined), and the
-/// frame each piece was last fetched in.
+/// frame each piece was last fetched in; and the copy, to tell when it is
+/// gone.
 #[derive(Default)]
 struct Known {
     declared: Vec<(usize, usize)>,
     fetched: HashMap<usize, u64>,
+    copy: std::sync::Weak<Shadow>,
 }
 
 static KNOWN: Mutex<BTreeMap<u64, Known>> = Mutex::new(BTreeMap::new());
 
+/// What is known of `copy`, made if need be; copies gone are let go of every
+/// few seconds (ids are never used again, and copies come and go as the
+/// title streams).
+fn known_of<'a>(known: &'a mut BTreeMap<u64, Known>, copy: &std::sync::Arc<Shadow>) -> &'a mut Known {
+    static PRUNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    if now >= PRUNED.load(Ordering::Relaxed) + 4000 {
+        PRUNED.store(now, Ordering::Relaxed);
+        prune(known);
+    }
+    let known = known.entry(copy.id()).or_default();
+    if known.copy.strong_count() == 0 {
+        known.copy = std::sync::Arc::downgrade(copy);
+    }
+    known
+}
+
+/// Lets go of what is known of copies gone.
+fn prune(known: &mut BTreeMap<u64, Known>) {
+    known.retain(|_, k| k.copy.strong_count() > 0);
+}
+
 /// Offsets `[from, to)` of a copy were declared as written.
-pub(super) fn declared(copy: u64, from: usize, to: usize) {
+pub(super) fn declared(copy: &std::sync::Arc<Shadow>, from: usize, to: usize) {
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    let known = known.entry(copy).or_default();
+    let known = known_of(&mut known, copy);
     if !known.declared.iter().any(|r| r.0 <= from && to <= r.1) {
         join_ranges(&mut known.declared, [(from, to)]);
     }
 }
 
 /// A piece from offset `at` on of a copy was fetched.
-pub(super) fn fetched(copy: u64, at: usize) {
+pub(super) fn fetched(copy: &std::sync::Arc<Shadow>, at: usize) {
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    known.entry(copy).or_default().fetched.insert(at / PIECE, crate::frame::current());
+    known_of(&mut known, copy).fetched.insert(at / PIECE, crate::frame::current());
 }
 
 fn known(copy: u64, at: usize) -> String {
@@ -665,6 +689,16 @@ mod tests {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).remove(&u64::MAX).expect("noted");
         let [t] = &noted[..] else { panic!("one piece") };
         assert_eq!((t.at, &t.was[..], &t.new[..]), (8, &was[3..11], &new[3..11]));
+    }
+
+    /// What is known of copies gone is let go of; of copies alive it stays.
+    #[test]
+    fn what_is_known_of_copies_gone_goes() {
+        let mut known = BTreeMap::new();
+        known.insert(1, Known { declared: vec![(0, 64)], ..Known::default() });
+        known.insert(2, Known::default());
+        prune(&mut known);
+        assert!(known.is_empty());
     }
 
     /// The tests below want processes of their own with the relay on: each

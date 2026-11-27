@@ -5309,7 +5309,7 @@ impl Host {
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
-                        upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
+                        upcheck::declared(&r.shadow, r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
                         if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
@@ -5326,7 +5326,7 @@ impl Host {
                                 }
                             }
                             if upcheck::on() {
-                                upcheck::fetched(r.shadow.id(), lo);
+                                upcheck::fetched(&r.shadow, lo);
                             }
                             seen.insert((copy, lo, hi));
                             pieces.push((r.shadow.clone(), lo, hi, total));
