@@ -2162,8 +2162,10 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
-            } else if console_lanes && group > wave && thread_ticket() {
-                // the flat id rounded down is not a host wave's base on every host
+            } else if console_lanes && group > wave && thread_ticket() && s.lds_dwords < 32768 / 4 {
+                // the flat id rounded down is not a host wave's base on every host (not in a
+                // program whose LDS already fills D3D12's 32 KiB: its counter would not fit, and
+                // the program keeps the rounding, as before the counter)
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }

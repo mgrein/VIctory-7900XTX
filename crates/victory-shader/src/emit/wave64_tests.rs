@@ -1822,3 +1822,41 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// A program whose LDS already fills D3D12's 32 KiB keeps the rounded thread base: the group
+/// counter's dword would take the group past the limit, and the validator refuses it (two
+/// meshlet triangle programs of the title at 32,772 bytes).
+#[test]
+fn a_group_whose_lds_is_full_takes_no_thread_counter() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+        0xD834_0000,
+        0x0000_0500, // ds_write_b32 v0, v5
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11 | 64 << 15, // and 32 KiB of LDS
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lower_with = |ticket: bool| {
+        lower::TEST_THREAD_TICKET.set(Some(ticket));
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        lower::TEST_THREAD_TICKET.set(None);
+        shader.expect("lower")
+    };
+    let shader = lower_with(true);
+    assert_eq!(shader.dxil, lower_with(false).dxil, "no counter past 32 KiB of LDS");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+}
