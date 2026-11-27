@@ -5289,6 +5289,12 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 /// be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
+/// [`BUFFERS_CHANGED`] now: moves when a title buffer or window comes or
+/// goes (`crate::draw`, `VICTORY_TABLE_GENERATION`).
+pub(crate) fn buffers_changed() -> u64 {
+    BUFFERS_CHANGED.load(Ordering::SeqCst)
+}
+
 /// The table of windows changed, or is about to: what threads remember of
 /// it ([`FOUND`]) is of before. Bumped where a window is put in, and before
 /// one is taken out.

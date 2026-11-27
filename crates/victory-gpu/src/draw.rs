@@ -3618,15 +3618,33 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            let verify = table_verify();
+            let mut words = Vec::new();
             let key = {
                 let mut h = RecordHash::default();
+                if verify {
+                    words.reserve_exact(n as usize);
+                }
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    let record = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    h.add(record);
+                    if verify {
+                        words.push(record);
+                    }
                 }
                 (table, n, h.0)
             };
+            // A table found by its hash whose words are not the same ones
+            // ([`table_verify`]), or made before a title buffer came or went
+            // ([`table_generation`]), is made again.
+            let generation = if table_generation() { crate::shadow::buffers_changed() } else { 0 };
+            if self.fresh_tables.get(&key).is_some_and(|known| {
+                (verify && *known.records != *words) || known.generation != generation
+            }) {
+                self.fresh_tables.remove(&key);
+            }
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -3699,7 +3717,18 @@ impl State {
                 continue;
             };
             let maker = std::ptr::from_ref(plan) as usize;
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), maker, shared: n > own });
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    first,
+                    epoch: 0,
+                    ready: Vec::new(),
+                    maker,
+                    shared: n > own,
+                    records: words.into_boxed_slice(),
+                    generation,
+                },
+            );
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4650,6 +4679,33 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    /// The record words it was made from ([`table_verify`]; else empty).
+    records: Box<[[u32; 3]]>,
+    /// [`crate::shadow::buffers_changed`] when it was made
+    /// ([`table_generation`]; else 0).
+    generation: u64,
+}
+
+/// Whether a table found again by the hash of its records' words is also
+/// compared word for word (`VICTORY_TABLE_VERIFY=0`: the hash alone, as
+/// before): two tables of one address and length whose words hash alike
+/// would share the first one's views. Costs a compare per hit and the words
+/// kept until the list's slots are given back. (After Belobug 127830e,
+/// romainhedouin b41f3f3 and uiliannn's VItoriaBr 213fa545.)
+fn table_verify() -> bool {
+    crate::toggled!("VICTORY_TABLE_VERIFY")
+}
+
+/// `VICTORY_TABLE_GENERATION=1` (off by default): a table made afresh is
+/// made again after any title buffer or window came or went
+/// ([`crate::shadow::buffers_changed`]), for a buffer released and another
+/// made at the same address within one list, which the same record words
+/// would otherwise keep showing through the first one's view. Coarse: the
+/// count moves often, and each move makes the list's tables again. (After
+/// DexNom 5f4c3df4.)
+fn table_generation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_GENERATION").is_some_and(|v| v == "1"))
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
