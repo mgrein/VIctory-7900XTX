@@ -1594,6 +1594,134 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`zero_mask_on`] and [`entry_copy_on`], for its thread only.
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_ZERO_MASK=0`: a lane mask that is identically empty, read as data in a block
+/// not every lane of a console wave runs, is balloted and exchanged (so refused) as before.
+/// Otherwise both its dwords are 0 with no ballot: no lane contributes a bit to it.
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_ENTRY_COPY=0`: a scalar copy of an entry-block lane mask, read as data in a
+/// block not every lane runs, is refused as before ([`Lower::entry_mask_copied_by`]).
+fn entry_copy_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ENTRY_COPY").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_RESINFO_MIP_BOUNDS=0`: an image size query at a level past the
+/// view's last returns what the host's dimensions query gives (undefined in
+/// D3D12; some drivers clamp the level) as before. Otherwise all three sizes
+/// are 0 there, as on the console, and the level count stays (views of
+/// textures; a UAV's query keeps its one level's sizes).
+fn resinfo_mip_bounds_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_MIP_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_RESINFO_SHAPE=0`: an image size query reads 1 for each size DXIL
+/// leaves out, as before. Otherwise it answers as the console does: the
+/// depth of a 1D or 2D image that is not an array is 0, a 1D array reports
+/// its layers in both the second and the third size, and a cube 6 faces.
+fn resinfo_shape_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_SHAPE").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_RESINFO_MSAA=0`: a program that asks the size of a multisampled
+/// image (MIMG dimensions 6 and 7) is refused, as before. Otherwise the
+/// query reads the view as a 2D multisampled texture (or array of them):
+/// its sizes and one level. Other accesses to such views stay refused.
+fn resinfo_msaa_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_MSAA").is_none_or(|v| v != "0"))
+}
+
+/// The four results of an image size query (`image_get_resinfo`) of a view of
+/// DXIL resource kind `kind` from the host's `dimensions` (width, height,
+/// depth or layers, levels): with `console_shape` the sizes DXIL leaves out
+/// read as on the console ([`resinfo_shape_on`]), else 1. With
+/// `mip_to_check`, all three sizes are 0 for a level at or past the count.
+/// A multisampled view (kinds 3 and 8) has one level.
+pub(super) fn resinfo_sizes(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    kind: u32,
+    dimensions: [V; 4],
+    mip_to_check: Option<V>,
+    console_shape: bool,
+) -> [V; 4] {
+    let [width, height, depth, levels] = dimensions;
+    let zero = m.i32(0);
+    let one = m.i32(1);
+    let missing = if console_shape { zero } else { one };
+    let mut sizes = match kind {
+        1 => [width, one, missing],
+        2 | 3 => [width, height, missing],
+        5 if console_shape => [width, height, m.i32(6)],
+        6 if console_shape => [width, height, height],
+        5 | 6 => [width, height, one],
+        _ => [width, height, depth],
+    };
+    if let Some(mip) = mip_to_check {
+        let exists = m.cmp(block, pred::IULT, mip, levels);
+        for size in &mut sizes {
+            *size = m.select(block, exists, *size, zero);
+        }
+    }
+    // (DXIL's fourth result of a multisampled view is its sample count.)
+    let levels = if matches!(kind, 3 | 8) { one } else { levels };
+    [sizes[0], sizes[1], sizes[2], levels]
+}
+
+/// `VICTORY_RESINFO_D16=0`: a d16 image size query writes one register per
+/// size asked for, as before, past the registers the instruction has.
+/// Otherwise the sizes are packed as the console packs them, two 16-bit
+/// halves per register, low half first.
+fn resinfo_d16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_D16").is_none_or(|v| v != "0"))
+}
+
+/// `components` (integers) packed two per dword, low half first: a d16 image
+/// size query's registers ([`resinfo_d16_on`]). An odd last one leaves its
+/// upper half 0.
+pub(super) fn packed_resinfo(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    components: &[V],
+) -> Vec<V> {
+    let mask = m.i32(0xFFFF);
+    let shift = m.i32(16);
+    components
+        .chunks(2)
+        .map(|pair| {
+            let low = m.bin(block, Bin::And, pair[0], mask);
+            match pair.get(1) {
+                Some(&high) => {
+                    let high = m.bin(block, Bin::Shl, high, shift);
+                    m.bin(block, Bin::Or, low, high)
+                }
+                None => low,
+            }
+        })
+        .collect()
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -4184,14 +4312,17 @@ impl<'a> Lower<'a> {
         // The builder's threads read what others of the dispatch wrote (a
         // refit climbs from children to parents): globally coherent. With
         // `VICTORY_BVH_COHERENT=glc` only the accesses that say so
-        // ([`super::builder_coherent_glc`]).
-        let coherent = if crate::spill::is_spilled(self.x.native)
-            && (coherent || !super::builder_coherent_glc() || self.invalidates_caches())
-        {
-            0x4000
+        // ([`super::builder_coherent_glc`]). Another compute program's
+        // accesses that say so, with `VICTORY_COMPUTE_WINDOW_COHERENCE=1`
+        // ([`super::compute_window_coherence`]).
+        let coherent = if crate::spill::is_spilled(self.x.native) {
+            coherent || !super::builder_coherent_glc() || self.invalidates_caches()
         } else {
-            0
+            self.x.native.stage == HwStage::Cs
+                && super::compute_window_coherence()
+                && (coherent || self.invalidates_caches())
         };
+        let coherent = if coherent { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
@@ -4619,15 +4750,60 @@ impl<'a> Lower<'a> {
         Some(r)
     }
 
+    /// The entry-block lane mask that the scalar copy writing `lo` in IR
+    /// block `block` copies (`s_mov_b64`, or `s_and_b64`/`s_or_b64` of a mask
+    /// with itself): a scalar copy keeps both dwords even where some lanes
+    /// skip it, and the entry block runs every lane, so both host waves can
+    /// ballot the source there.
+    fn entry_mask_copied_by(&self, block: usize, lo: Value) -> Option<Value> {
+        let inst = self.x.p.blocks.get(block)?.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let operand = match (inst.name(), src.as_slice()) {
+            ("s_mov_b64", [a]) => a,
+            ("s_and_b64" | "s_or_b64", [a, b]) if a == b => a,
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *operand else {
+            return None;
+        };
+        let source = inst.read(Reg::S(code))?;
+        let high = inst.read(Reg::S(code.checked_add(1)?))?;
+        (self.x.p.blocks[0].preds.is_empty()
+            && self.all_lanes(0)
+            && self.def_block.get(&source) == Some(&0)
+            && self.x.st.highs.get(&high) == Some(&source)
+            && self.x.st.active.contains(&source))
+        .then_some(source)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         // A mask operation on numbers (`sop`): its number is known.
-        let (lo, high) = match self.x.st.highs.get(&v) {
+        let (mut lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        // A copy of a mask the entry block writes, made where not every lane
+        // runs: the copy's 64 bits are its source's whichever lanes skip it,
+        // and both host waves ballot the source in the entry block.
+        if !self.local
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && entry_copy_on()
+            && let Some(&block) = self.def_block.get(&lo)
+            && !self.all_lanes(block)
+            && let Some(source) = self.entry_mask_copied_by(block, lo)
+        {
+            lo = source;
+        }
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask: either dword
+        // is 0 even where the other half of a console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
@@ -12318,6 +12494,9 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            // Sized only ([`resinfo_msaa_on`]).
+            6 if name == "image_get_resinfo" && resinfo_msaa_on() => (3, 2),
+            7 if name == "image_get_resinfo" && resinfo_msaa_on() => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -12567,34 +12746,43 @@ impl<'a> Lower<'a> {
         };
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            // in the first address: DXIL's dimensions ([`resinfo_sizes`]; UAVs:
+            // one level).
+            let multisampled = matches!(kind, 3 | 8);
+            if multisampled && uav {
+                return Err("a multisampled UAV");
+            }
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
-                self.s.m.undef(self.s.t.i32)
-            } else {
-                addr_val(self, 0)?
-            };
+            // A UAV is a view of one level: its query keeps that level's
+            // sizes whatever the first address says. So is a multisampled
+            // view, whose DXIL query takes no level.
+            let requested = if uav || multisampled { None } else { Some(addr_val(self, 0)?) };
+            let mip = requested.unwrap_or_else(|| self.s.m.undef(self.s.t.i32));
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-            let one = self.s.m.i32(1);
-            let present = match kind {
-                1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
-                _ => [true, true, true, true],
-            };
+            let dimensions: [V; 4] = std::array::from_fn(|ch| {
+                if uav && ch == 3 { self.s.m.i32(1) } else { self.s.m.extract(c, d, ch as u32) }
+            });
+            let sizes = resinfo_sizes(
+                &mut self.s.m,
+                c,
+                kind,
+                dimensions,
+                requested.filter(|_| resinfo_mip_bounds_on()),
+                resinfo_shape_on(),
+            );
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
-            for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
-                    one
-                } else {
-                    self.s.m.extract(c, d, ch)
-                };
+            let mut channels: Vec<V> =
+                (0..4usize).filter(|ch| dmask >> ch & 1 != 0).map(|ch| sizes[ch]).collect();
+            if *d16 && resinfo_d16_on() {
+                channels = packed_resinfo(&mut self.s.m, c, &channels);
+            }
+            for (k, x) in channels.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -14621,6 +14809,54 @@ mod tests {
             .map(|p| p.0)
             .filter(|p| p & 0xFF == 11 && p & 0x1000 != 0)
             .collect()
+    }
+
+    /// The properties of the heap handles of title memory by address that a
+    /// compute program without a spilled table makes for a plain global
+    /// load, a global load with `glc` and a global store, with
+    /// `VICTORY_COMPUTE_WINDOW_COHERENCE=1` or without; with `invalidate`,
+    /// the program invalidates the console's caches first.
+    fn window_memory_handles(on: bool, invalidate: bool) -> Vec<u32> {
+        use super::super::{TEST_WINDOW_COHERENCE, shader::HEAP_HANDLES};
+        let mut words = vec![
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0xDC30_8000,    // global_load_dword v3, v[0:1], off
+            0x037D_0000,
+            0xDC31_8000, // global_load_dword v4, v[0:1], off glc
+            0x047D_0000,
+            0x4A06_0903, // v_add_nc_u32 v3, v3, v4
+            0xDC70_8000, // global_store_dword v[0:1], v3, off
+            0x007D_0300,
+            S_ENDPGM,
+        ];
+        if invalidate {
+            words.splice(0..0, [0xE1C4_0000, 0]); // buffer_gl0_inv
+        }
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        TEST_WINDOW_COHERENCE.set(Some(on));
+        HEAP_HANDLES.with(|made| made.borrow_mut().clear());
+        let lowered = lower_with(&words, layout, vec![]);
+        TEST_WINDOW_COHERENCE.set(None);
+        lowered.expect("lowers");
+        HEAP_HANDLES
+            .with(|made| made.take())
+            .into_iter()
+            .map(|p| p.0)
+            .filter(|p| p & 0xFF == 11 && p & 0x1000 != 0)
+            .collect()
+    }
+
+    /// A compute program's accesses by address: plain views as before, or
+    /// with `VICTORY_COMPUTE_WINDOW_COHERENCE=1` globally coherent views for
+    /// the load with `glc` and the store (every access in a program that
+    /// invalidates the console's caches itself). From
+    /// stellarr-studio/kelvaroq patch 0049.
+    #[test]
+    fn compute_window_coherence_marks_only_accesses_other_groups_see() {
+        assert_eq!(window_memory_handles(false, false), [0x1000 | 11; 3]);
+        assert_eq!(window_memory_handles(false, true), [0x1000 | 11; 3]);
+        assert_eq!(window_memory_handles(true, false), [0x1000 | 11, 0x5000 | 11, 0x5000 | 11]);
+        assert_eq!(window_memory_handles(true, true), [0x5000 | 11; 3]);
     }
 
     /// The builder's loads by address through globally coherent views: all

@@ -388,6 +388,30 @@ thread_local! {
     /// The tests' way to translate as with `VICTORY_BVH_COHERENT=glc`
     /// ([`builder_coherent_glc`]).
     pub(crate) static TEST_COHERENT_GLC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The tests' way to translate as with
+    /// `VICTORY_COMPUTE_WINDOW_COHERENCE=1` ([`compute_window_coherence`]).
+    pub(crate) static TEST_WINDOW_COHERENCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_COMPUTE_WINDOW_COHERENCE=1`: in a compute program other than the
+/// structure builder's (which has [`builder_coherent_glc`]), the accesses to
+/// title memory by address that the console marks as seen by other groups
+/// go through globally coherent views: atomics, stores, loads with `glc` or
+/// `dlc`, and every access of a program that invalidates the console's
+/// caches itself. A dispatch whose groups hand data to one another through
+/// title memory then sees it on the host as on the console; NVIDIA
+/// otherwise may serve such a load from a stale line of the SM's L1.
+///
+/// Off by default: no program is known to need it, and coherent views cost
+/// those accesses the L1. Part of the translation: the shader cache keys on
+/// it when set.
+pub fn compute_window_coherence() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WINDOW_COHERENCE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_WINDOW_COHERENCE").is_some_and(|v| v == "1"))
 }
 
 /// Which accesses of the ray-tracing structure builder to title memory by

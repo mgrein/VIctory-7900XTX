@@ -174,6 +174,16 @@ fn build() -> [u8; 32] {
                 bytes.push(0);
             }
         }
+        // Translator switches added later: each keyed only when set, so the
+        // translations cached with all of them unset keep their key.
+        for name in SET_ONLY {
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_encoded_bytes());
+                bytes.push(0);
+            }
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -183,6 +193,17 @@ fn build() -> [u8; 32] {
     }
     *hash.finalize().as_bytes()
 }
+
+/// Translator switches in the key only when set ([`build`]).
+const SET_ONLY: &[&str] = &[
+    "VICTORY_WAVE_ZERO_MASK",
+    "VICTORY_WAVE_ENTRY_COPY",
+    "VICTORY_RESINFO_MIP_BOUNDS",
+    "VICTORY_RESINFO_SHAPE",
+    "VICTORY_RESINFO_MSAA",
+    "VICTORY_RESINFO_D16",
+    "VICTORY_COMPUTE_WINDOW_COHERENCE",
+];
 
 /// What tells one set of translations from another ([`build`]).
 pub(crate) fn translation() -> [u8; 32] {

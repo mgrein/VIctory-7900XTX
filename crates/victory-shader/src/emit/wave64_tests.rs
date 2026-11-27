@@ -1745,3 +1745,55 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
+
+/// Threads below s0 read both dwords of a scalar mask written in their branch and store
+/// 1 + (lo ^ hi): an identically empty mask (`s_xor_b64 exec, exec`) reads 0 with no
+/// exchange, a copy of EXEC (`s_or_b64 exec, exec`, EXEC written in the entry block) reads
+/// the entry block's ballot, and a mask of the branch's own lanes (`s_and_b64 exec, 1`) is
+/// still refused. From stellarr-studio/kelvaroq patches 0033 and 0047.
+#[test]
+fn empty_and_copied_wave_masks_can_be_read_in_a_lane_branch() {
+    let lower_mask = |op, on| {
+        let native = native(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0007, // s_cbranch_execz to the restore of EXEC
+            op,
+            0x7E0A_020E, // v_mov_b32 v5, s14
+            0x7E0C_020F, // v_mov_b32 v6, s15
+            0x3A0A_0D05, // v_xor_b32 v5, v5, v6
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 5 << 8, // buffer_store_dword v5, off, s[8:11], 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let previous = lower::TEST_ZERO_MASK.replace(Some(on));
+        let result = lowered(&native, &p, &HashSet::new());
+        lower::TEST_ZERO_MASK.set(previous);
+        result
+    };
+    const XOR_EXEC: u32 = 0x898E_7E7E; // s_xor_b64 s[14:15], exec, exec
+    const OR_EXEC: u32 = 0x888E_7E7E; // s_or_b64 s[14:15], exec, exec
+    for op in [XOR_EXEC, OR_EXEC] {
+        let off = lower_mask(op, false);
+        assert!(matches!(off, Err(ShaderError::Unsupported { .. })), "{op:#x}: {:?}", off.err());
+    }
+    let dynamic = lower_mask(0x878E_817E, true); // s_and_b64 s[14:15], exec, 1
+    assert!(matches!(dynamic, Err(ShaderError::Unsupported { .. })), "{:?}", dynamic.err());
+    let empty = lower_mask(XOR_EXEC, true).expect("empty mask");
+    let copied = lower_mask(OR_EXEC, true).expect("copy of EXEC");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, copied_mask) in [(&empty, false), (&copied, true)] {
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        for below in [1, 32, 40, 64] {
+            let bits = if copied_mask { u64::MAX >> (64 - below) } else { 0 };
+            let expected = ((bits as u32) ^ (bits >> 32) as u32).wrapping_add(1);
+            if let Some(actual) = on_the_card(shader, [below, 0]) {
+                assert_eq!(actual, expected, "{below} active lanes");
+            }
+        }
+    }
+}
