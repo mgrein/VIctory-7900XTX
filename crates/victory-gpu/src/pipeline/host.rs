@@ -36,8 +36,8 @@ pub(crate) struct GraphicsState {
     /// The depth bias as the title's stream has it, and whether the stream's
     /// depth format is one of the console's 16-bit ones: `rasterizer` holds
     /// the host's bias ([`host_depth_bias`]). Only while a stream is read.
-    title_bias: i32,
-    depth16: bool,
+    pub(super) title_bias: i32,
+    pub(super) depth16: bool,
 }
 
 /// Whether the depth bias of a pipeline that draws to the console's 16-bit

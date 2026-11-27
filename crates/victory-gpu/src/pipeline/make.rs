@@ -26,7 +26,7 @@
 //! frame's budget ([`fills_in_once`]).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -182,13 +182,40 @@ impl Pending {
         self.made.get_or_init(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = guarded(&self.shaders, || HostPipeline::new(&self.shaders, self.graphics.as_deref()));
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// Host pipelines whose making panicked, since the start.
+static PANICKED: AtomicU64 = AtomicU64::new(0);
+
+/// What `make` makes, or no host pipeline if it panics. A panic in the
+/// translator or in what builds the host's description ended the worker it
+/// happened on: the pipeline stayed "being made" to the run's end, every
+/// frame that drew with it waited out its budget for it, and the workers
+/// were one fewer. Caught, the pipeline is one the host refused, said so
+/// with its shaders, and the worker goes on. (As
+/// Belobug/VIctory-Belobug-AMD PR #219 and fxceless/victory-fork 46da5eec,
+/// PR #1353.)
+fn guarded(shaders: &[Arc<Shader>], make: impl FnOnce() -> Option<HostPipeline>) -> Option<HostPipeline> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(make)) {
+        Ok(made) => made,
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            let panicked = PANICKED.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::error!(?shaders, why, panicked, "making a host pipeline panicked: it has none in this run");
+            None
+        }
     }
 }
 
@@ -586,6 +613,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    replace_stuck();
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
@@ -658,6 +686,134 @@ fn worker_count(asked: Option<usize>, processors: usize, total: Option<u64>) -> 
     }
 }
 
+/// The workers' stacks: `VICTORY_PIPELINE_STACK_MB` MiB (64 by default, 2
+/// to 1024). A worker translates the shaders of the pipeline it makes, and
+/// the translator walks the biggest programs' blocks by recursion: on the 2
+/// MiB a thread gets otherwise, one deep enough ends the process (a stack
+/// that runs out cannot be caught). Only address space is set aside; memory
+/// is taken as the stack is used. (After the cool_fox fork's PR #10, 256
+/// MiB there.)
+fn stack_bytes() -> usize {
+    let mb = std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64);
+    mb.clamp(2, 1024) << 20
+}
+
+/// A worker: since when it has been in the pipeline it is making now
+/// (`crate::host::now_ms`, 0: in none), and whether another was started in
+/// its place ([`replace_stuck`]).
+struct Worker {
+    since: AtomicU64,
+    replaced: AtomicBool,
+    screens_only: AtomicBool,
+}
+
+/// Every worker started, those started in another's place too.
+static WORKERS: [Worker; 128] =
+    [const { Worker { since: AtomicU64::new(0), replaced: AtomicBool::new(false), screens_only: AtomicBool::new(false) } }; 128];
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// After how long in one pipeline a worker counts as stuck:
+/// `VICTORY_PIPELINE_STUCK_S` seconds (120 by default; 0: never).
+fn stuck_after_ms() -> u64 {
+    static AFTER: OnceLock<u64> = OnceLock::new();
+    *AFTER.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_STUCK_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(120) * 1000
+    })
+}
+
+/// The workers that have been in one pipeline for `after` ms at `now` and
+/// have nobody in their place yet: each is marked as replaced.
+fn stuck(workers: &[Worker], now: u64, after: u64) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (i, w) in workers.iter().enumerate() {
+        let since = w.since.load(Ordering::Relaxed);
+        if after > 0 && since != 0 && now.saturating_sub(since) >= after && !w.replaced.swap(true, Ordering::Relaxed) {
+            found.push(i);
+        }
+    }
+    found
+}
+
+/// Starts a worker in the place of each one stuck in a pipeline
+/// ([`stuck_after_ms`]): a compile the driver never comes back from (or
+/// comes back from minutes later) took its worker with it, and with four
+/// workers every such one is a quarter of what a cold cache gets made. The
+/// stuck worker is left alone (a thread inside the driver cannot be ended);
+/// should it come back, its pipeline is kept and it ends. Looked at once a
+/// second, when a pipeline is queued. (After DexNom PRs #37 and #45.)
+fn replace_stuck() {
+    static LOOKED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms() + 1;
+    let looked = LOOKED.load(Ordering::Relaxed);
+    if now < looked + 1000 || LOOKED.compare_exchange(looked, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let started = STARTED.load(Ordering::Relaxed).min(WORKERS.len());
+    for i in stuck(&WORKERS[..started], now, stuck_after_ms()) {
+        let screens_only = WORKERS[i].screens_only.load(Ordering::Relaxed);
+        let ms = now.saturating_sub(WORKERS[i].since.load(Ordering::Relaxed));
+        let replaced = spawn(screens_only);
+        tracing::warn!(worker = i, ms, screens_only, replaced, "a pipeline worker is stuck in one pipeline: another is started in its place");
+    }
+}
+
+/// Starts one worker; whether there is one more now.
+fn spawn(screens_only: bool) -> bool {
+    let i = STARTED.fetch_add(1, Ordering::Relaxed);
+    if i >= WORKERS.len() {
+        return false;
+    }
+    WORKERS[i].screens_only.store(screens_only, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .stack_size(stack_bytes())
+        .spawn(move || work(i, screens_only));
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
+}
+
+/// What worker `i` does: makes the queue's pipelines, until another was
+/// started in its place.
+fn work(i: usize, screens_only: bool) {
+    // Below the title's own threads (loading, recording),
+    // and the streaming one, which is below normal itself
+    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
+    }
+    loop {
+        // Short of memory: two workers only (the screen's
+        // own are not counted).
+        while !screens_only && i >= SHORT_WORKERS && short_of_commit() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let p = next(screens_only);
+        WORKERS[i].since.store(crate::host::now_ms() + 1, Ordering::Relaxed);
+        p.make();
+        WORKERS[i].since.store(0, Ordering::Relaxed);
+        if p.was_slow.load(Ordering::Relaxed) {
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.slow_now -= 1;
+            AVAILABLE.notify_all();
+        }
+        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+            drained();
+        } else {
+            super::library::save(false);
+        }
+        if WORKERS[i].replaced.load(Ordering::Relaxed) {
+            tracing::info!(worker = i, "a pipeline worker that was stuck came back: it ends, another has its place");
+            return;
+        }
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -673,45 +829,7 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        // Short of memory: two workers only (the screen's
-                        // own are not counted).
-                        while !screens_only && i >= SHORT_WORKERS && short_of_commit() {
-                            std::thread::sleep(Duration::from_millis(250));
-                        }
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
-            }
+            running |= spawn(i >= workers);
         }
         running
     })
@@ -825,8 +943,6 @@ mod tests {
         assert!(queue.pop(false, 1).is_none());
     }
 
-    /// Passes over the screen go before all others, and workers of their own
-    /// take nothing else.
     /// A pipeline of one shader whose container is `text` (with the stage
     /// in it: the shader table keeps one shader per content).
     fn of_container(stage: &'static str, text: &[u8]) -> Vec<Arc<Shader>> {
@@ -946,6 +1062,32 @@ mod tests {
         }
     }
 
+    /// A panic while a pipeline is made leaves it refused, not being made
+    /// for ever, and whoever waits for it is told.
+    #[test]
+    fn a_panic_refuses_the_pipeline() {
+        assert!(guarded(&[], || panic!("a translator's panic (expected by this test)")).is_none());
+        assert!(guarded(&[], || None).is_none());
+        assert!(PANICKED.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn a_worker_long_in_one_pipeline_is_replaced_once() {
+        let worker = |since| Worker {
+            since: AtomicU64::new(since),
+            replaced: AtomicBool::new(false),
+            screens_only: AtomicBool::new(false),
+        };
+        // Idle, 5 s in a pipeline, 130 s in one.
+        let workers = [worker(0), worker(195_000), worker(70_000)];
+        assert_eq!(stuck(&workers, 200_000, 120_000), [2]);
+        assert!(stuck(&workers, 200_000, 120_000).is_empty(), "once");
+        assert_eq!(stuck(&workers, 320_000, 120_000), [1]);
+        // Never, with the switch at 0.
+        assert!(stuck(&[worker(1)], u64::MAX, 0).is_empty());
+        assert!((2 << 20..=1024 << 20).contains(&stack_bytes()));
+    }
+
     #[test]
     fn a_pipeline_is_waited_for_one_budget_in_all() {
         let ms = Duration::from_millis;
@@ -992,6 +1134,8 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop_with(false, 1, true).unwrap(), &early));
     }
 
+    /// Passes over the screen go before all others, and workers of their own
+    /// take nothing else.
     #[test]
     fn passes_over_the_screen_go_first() {
         let of = |screen| {
