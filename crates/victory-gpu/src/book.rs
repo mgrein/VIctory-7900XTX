@@ -244,7 +244,11 @@ fn watch(object: &ID3D12Object, id: u64) {
     unsafe {
         let notice = IUnknown::from_raw(notice.cast());
         if object.SetPrivateDataInterface(&KEY, &notice).is_err() {
+            // Nothing will tell when the object goes: its entry leaves the
+            // book now rather than staying alive in it for good.
             std::mem::forget(notice);
+            let now = crate::host::now_ms();
+            with(|b| b.remove(id, raw, now));
         }
     }
 }
@@ -531,12 +535,37 @@ pub(crate) fn check() {
 /// buffers, naming what is gone, naming what was never there.
 static FOUND: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// The (slot, address) pairs the slot check has seen, with how often, for
+/// this round of the view heap and the one before. A pair not seen for a
+/// whole round is forgotten: slots are reused for new views all the time, so
+/// keeping every pair ever seen would grow for as long as the check runs.
+#[derive(Default)]
+struct Said {
+    now: HashMap<(u32, u64), u64>,
+    before: HashMap<(u32, u64), u64>,
+}
+
+impl Said {
+    /// Counts one more sighting of `key`; how many there have been.
+    fn mark(&mut self, key: (u32, u64)) -> u64 {
+        let earlier = self.before.remove(&key).unwrap_or(0);
+        let times = self.now.entry(key).or_insert(earlier);
+        *times += 1;
+        *times
+    }
+
+    /// A round of the view heap ended.
+    fn round(&mut self) {
+        self.before = std::mem::take(&mut self.now);
+    }
+}
+
 fn walk() {
     use Ordering::Relaxed;
     const CHUNK: u32 = 4096;
     let mut at = 0u32;
     // Slots said already, by slot and address.
-    let mut said: HashMap<(u32, u64), u64> = HashMap::new();
+    let mut said = Said::default();
     let mut suspects: Vec<(u32, [u8; 32], u64)> = Vec::new();
     let mut round = std::time::Instant::now();
     let mut never_said = 0;
@@ -580,10 +609,9 @@ fn walk() {
                     Fate::Never => (5, "nothing the book ever had".to_owned()),
                 };
                 FOUND[what].fetch_add(1, Relaxed);
-                let times = said.entry((slot, base)).or_insert(0);
-                *times += 1;
+                let times = said.mark((slot, base));
                 let quota = if what == 4 { &mut gone_said } else { &mut never_said };
-                if *times > 1 || *quota >= if what == 4 { 400 } else { 60 } {
+                if times > 1 || *quota >= if what == 4 { 400 } else { 60 } {
                     continue;
                 }
                 *quota += 1;
@@ -598,6 +626,7 @@ fn walk() {
         at = first + (bytes.len() / 32) as u32;
         if at >= end {
             at = 0;
+            said.round();
             let f = [0, 1, 2, 3, 4, 5].map(|i| FOUND[i].swap(0, Relaxed));
             let (live, gone, unknown) = with(|b| (b.live.len(), b.gone.len(), b.unknown.clone()));
             tracing::info!(
@@ -772,6 +801,25 @@ mod tests {
             }
         }
         FORCED.store(false, Ordering::Relaxed);
+    }
+
+    /// A stale slot is counted across rounds while it stays, and forgotten
+    /// once a whole round passes without it.
+    #[test]
+    fn slots_said_are_forgotten_after_a_round_without_them() {
+        let mut said = Said::default();
+        assert_eq!(said.mark((1, 0x100)), 1);
+        assert_eq!(said.mark((1, 0x100)), 2);
+        said.round();
+        assert_eq!(said.mark((1, 0x100)), 3);
+        said.round();
+        said.round();
+        assert_eq!(said.mark((1, 0x100)), 1);
+        for i in 0..1000 {
+            said.mark((i, 0x200 + u64::from(i)));
+            said.round();
+        }
+        assert!(said.now.len() + said.before.len() <= 2);
     }
 
     #[test]

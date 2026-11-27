@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Foundation::RECT;
@@ -287,6 +287,87 @@ impl ListState {
     pub(super) fn closed(&self) -> Option<(Option<Arc<Vec<u8>>>, Arc<Vec<Change>>)> {
         lock(&self.inner).closed.clone()
     }
+
+    /// The list died: what it recorded goes.
+    fn forget(&self) {
+        let mut inner = lock(&self.inner);
+        inner.whole = false;
+        inner.bytes = Vec::new();
+        inner.changes = Vec::new();
+        inner.closed = None;
+    }
+}
+
+/// A dead list's shims and state, freed some presents later: a method of
+/// the list may still have been running through them as it died.
+struct Retired {
+    at: u64,
+    _shims: Vec<hook::Shims>,
+    _states: Vec<Arc<ListState>>,
+}
+
+/// Presents a dead list's shims are kept for.
+const RETIRED_PRESENTS: u64 = 8;
+
+/// Records of objects that are not resources, kept apart from their objects'
+/// lifetimes while a frame is captured (its lists may name them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Record {
+    Pipeline,
+    Root,
+    MemHeap,
+    Signature,
+    Query,
+}
+
+/// Which root signatures' records pipelines' and command signatures'
+/// records name. A root signature may die before what was made with it (D3D12
+/// does not ask that it lives), and a capture still writes it down for them:
+/// its record goes only when it is dead and named by none.
+#[derive(Default)]
+struct Roots {
+    users: HashMap<u32, u32>,
+    dead: std::collections::HashSet<u32>,
+}
+
+impl Roots {
+    /// A record naming `root` was kept.
+    fn named(&mut self, root: u32) {
+        if root != NONE {
+            *self.users.entry(root).or_default() += 1;
+        }
+    }
+
+    /// A record naming `root` went: true if the root's record goes now.
+    fn unnamed(&mut self, root: u32) -> bool {
+        let Some(n) = self.users.get_mut(&root) else {
+            return false;
+        };
+        *n -= 1;
+        if *n > 0 {
+            return false;
+        }
+        self.users.remove(&root);
+        self.dead.remove(&root)
+    }
+
+    /// The root signature died: true if its record goes now.
+    fn died(&mut self, root: u32) -> bool {
+        if self.users.contains_key(&root) {
+            self.dead.insert(root);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+/// The root signatures a pipeline's parts name.
+fn roots_of(parts: &[Part]) -> impl Iterator<Item = u32> + '_ {
+    parts.iter().filter_map(|p| match p {
+        Part::Root { root } => Some(*root),
+        _ => None,
+    })
 }
 
 struct QueueState {
@@ -359,6 +440,15 @@ pub(super) struct Recorder {
     problems: Mutex<BTreeMap<String, u64>>,
     /// Submissions and presents, one at a time.
     pub(super) submits: Mutex<snap::Phase>,
+    /// Records of objects that died while a frame was captured: forgotten
+    /// when the capture ends (see `Recorder::stop_watching`).
+    later: Mutex<Vec<(Record, u32)>>,
+    /// Which root signatures' records other records name.
+    root_users: Mutex<Roots>,
+    /// Dead lists' shims and states, oldest first.
+    retired: Mutex<std::collections::VecDeque<Retired>>,
+    /// Presents seen.
+    presents: AtomicU64,
 }
 
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
@@ -445,6 +535,10 @@ impl Recorder {
             held: Mutex::default(),
             problems: Mutex::default(),
             submits: Mutex::new(snap::Phase::default()),
+            later: Mutex::default(),
+            root_users: Mutex::default(),
+            retired: Mutex::default(),
+            presents: AtomicU64::new(0),
         })
     }
 
@@ -628,14 +722,128 @@ impl Recorder {
                 lock(&self.states).remove(id);
                 lock(&self.names).remove(&id);
             }
-            Gone::List { ptr } => {
-                write(&self.lists).remove(&ptr);
+            Gone::List { ref ptrs } => {
+                let states: Vec<Arc<ListState>> = {
+                    let mut lists = write(&self.lists);
+                    ptrs.iter().filter_map(|p| lists.remove(p)).collect()
+                };
+                for state in &states {
+                    state.forget();
+                }
+                // SAFETY: the list is dying: its methods are not called
+                // anew. What was its own is kept for some presents.
+                let shims = ptrs
+                    .iter()
+                    .map(|&p| unsafe { hook::retire(p as Ptr) })
+                    .collect();
+                lock(&self.retired).push_back(Retired {
+                    at: self.presents.load(Ordering::SeqCst),
+                    _shims: shims,
+                    _states: states,
+                });
             }
             Gone::Heap { id, ptr } => {
                 self.ids.remove(ptr, id);
                 write(&self.descriptors).remove(id);
             }
+            Gone::Other { what, id, ptr } => {
+                self.ids.remove(ptr, id);
+                let now = {
+                    let mut later = lock(&self.later);
+                    let watching = self.watching.load(Ordering::SeqCst);
+                    if watching {
+                        later.push((what, id));
+                    }
+                    !watching
+                };
+                if now {
+                    self.forget(what, id);
+                }
+            }
         }
+    }
+
+    /// Drops the record of a dead object.
+    fn forget(&self, what: Record, id: u32) {
+        match what {
+            Record::Pipeline => {
+                let parts = lock(&self.pipelines).remove(&id);
+                if let Some(parts) = parts {
+                    self.unname_roots(roots_of(&parts));
+                }
+            }
+            Record::Root => {
+                if lock(&self.root_users).died(id) {
+                    self.forget_root(id);
+                }
+                return;
+            }
+            Record::MemHeap => drop(lock(&self.heaps).remove(&id)),
+            Record::Signature => {
+                let signature = lock(&self.signatures).remove(&id);
+                if let Some(s) = signature {
+                    self.unname_roots([s.root]);
+                }
+            }
+            Record::Query => drop(lock(&self.queries).remove(&id)),
+        }
+        lock(&self.names).remove(&id);
+    }
+
+    /// Records naming these root signatures went: dead ones named by no
+    /// other record go too.
+    fn unname_roots(&self, roots: impl IntoIterator<Item = u32>) {
+        let gone: Vec<u32> = {
+            let mut users = lock(&self.root_users);
+            roots.into_iter().filter(|&r| users.unnamed(r)).collect()
+        };
+        for root in gone {
+            self.forget_root(root);
+        }
+    }
+
+    fn forget_root(&self, id: u32) {
+        lock(&self.roots).remove(&id);
+        lock(&self.names).remove(&id);
+    }
+
+    /// A capture ended: objects are no longer watched, and the records of
+    /// those that died during it go.
+    pub(super) fn stop_watching(&self) {
+        self.watching.store(false, Ordering::SeqCst);
+        let dead = std::mem::take(&mut *lock(&self.later));
+        for (what, id) in dead {
+            self.forget(what, id);
+        }
+    }
+
+    /// A present: dead lists' shims old enough are freed.
+    fn presented(&self) {
+        let now = self.presents.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut old = Vec::new();
+        {
+            let mut retired = lock(&self.retired);
+            while retired
+                .front()
+                .is_some_and(|r| r.at + RETIRED_PRESENTS <= now)
+            {
+                old.extend(retired.pop_front());
+            }
+        }
+        drop(old);
+    }
+
+    /// Has us told when an object that is not a resource, list or
+    /// descriptor heap dies; `id` is its record's.
+    fn follow(&self, p: Ptr, what: Record, id: u32) {
+        self.tell_gone(
+            &*borrow::<IUnknown>(p),
+            Gone::Other {
+                what,
+                id,
+                ptr: p as usize,
+            },
+        );
     }
 
     /// Has us told when an object dies.
@@ -730,9 +938,24 @@ impl Recorder {
     }
 
     fn pipeline(&self, p: Ptr, parts: Vec<Part>) {
-        let id = self.id();
-        lock(&self.pipelines).insert(id, Arc::new(parts));
+        // A library may answer with a pipeline it gave before.
+        let known = self
+            .ids
+            .get(p as usize)
+            .filter(|id| lock(&self.pipelines).contains_key(id));
+        let id = known.unwrap_or_else(|| self.id());
+        {
+            let mut users = lock(&self.root_users);
+            roots_of(&parts).for_each(|root| users.named(root));
+        }
+        let before = lock(&self.pipelines).insert(id, Arc::new(parts));
+        if let Some(before) = before {
+            self.unname_roots(roots_of(&before));
+        }
         self.ids.set(p as usize, id);
+        if known.is_none() {
+            self.follow(p, Record::Pipeline, id);
+        }
     }
 
     /// `name` is an object's, for reports.
@@ -759,9 +982,24 @@ impl pso::Keep for Keeper<'_> {
 
 /// Which object died.
 enum Gone {
-    Resource { id: u32, ptr: usize, va: u64 },
-    List { ptr: usize },
-    Heap { id: u32, ptr: usize },
+    Resource {
+        id: u32,
+        ptr: usize,
+        va: u64,
+    },
+    /// A list, by the addresses of all its interfaces we hooked.
+    List {
+        ptrs: Vec<usize>,
+    },
+    Heap {
+        id: u32,
+        ptr: usize,
+    },
+    Other {
+        what: Record,
+        id: u32,
+        ptr: usize,
+    },
 }
 
 /// A COM object an object of D3D12's holds and lets go of when it dies.
@@ -904,6 +1142,7 @@ pub fn name(object: &impl Interface, text: &str) {
 pub fn present(texture: &ID3D12Resource, state: D3D12_RESOURCE_STATES) {
     if let Some(r) = recorder() {
         snap::present(r, texture, state.0 as u32);
+        r.presented();
     }
 }
 
@@ -1318,15 +1557,19 @@ unsafe extern "system" fn create_list(
                     r.armed.load(Ordering::SeqCst) && kind == D3D12_COMMAND_LIST_TYPE_DIRECT;
                 begin(&mut inner, r, pso);
             }
-            for q in all {
-                // The state's address is kept for good, as the table is.
-                hook::install(q, Arc::into_raw(state.clone()).cast(), list_table);
+            for &q in &all {
+                // `lists` keeps the state alive while the list lives, and
+                // `Recorder::gone` as long as its shims after.
                 write(&r.lists).insert(q as usize, state.clone());
-                r.tell_gone(
-                    &*borrow::<ID3D12CommandList>(q),
-                    Gone::List { ptr: q as usize },
-                );
+                hook::install(q, Arc::as_ptr(&state).cast(), list_table);
             }
+            // One notice for the list: its interfaces are one object.
+            r.tell_gone(
+                &*borrow::<ID3D12CommandList>(p),
+                Gone::List {
+                    ptrs: all.iter().map(|&q| q as usize).collect(),
+                },
+            );
         }
         hr
     }
@@ -1489,6 +1732,9 @@ unsafe extern "system" fn create_root(
             let id = known.unwrap_or_else(|| r.id());
             lock(&r.roots).insert(id, Arc::new(bytes));
             r.ids.set(p as usize, id);
+            if known.is_none() {
+                r.follow(p, Record::Root, id);
+            }
         }
         hr
     }
@@ -1532,6 +1778,7 @@ unsafe extern "system" fn create_signature(
             } else {
                 r.object(root, "a root signature")
             };
+            lock(&r.root_users).named(root);
             lock(&r.signatures).insert(
                 id,
                 wire::Signature {
@@ -1542,6 +1789,7 @@ unsafe extern "system" fn create_signature(
                 },
             );
             r.ids.set(p as usize, id);
+            r.follow(p, Record::Signature, id);
         }
         hr
     }
@@ -1567,6 +1815,7 @@ unsafe extern "system" fn create_queries(
                 },
             );
             r.ids.set(p as usize, id);
+            r.follow(p, Record::Query, id);
         }
         hr
     }
@@ -1621,6 +1870,7 @@ unsafe extern "system" fn create_heap(
             let id = r.id();
             lock(&r.heaps).insert(id, heap_of(id, &*desc));
             r.ids.set(p as usize, id);
+            r.follow(p, Record::MemHeap, id);
         }
         hr
     }
@@ -1693,6 +1943,7 @@ unsafe extern "system" fn create_placed(
                 r.problem("a heap opened from existing memory: a replay makes one like it");
                 lock(&r.heaps).insert(id, heap_of(id, &d));
                 r.ids.set(heap as usize, id);
+                r.follow(heap, Record::MemHeap, id);
                 id
             });
             r.add(p, Place::Placed { heap, offset }, state.0, clear_of(clear));
@@ -2776,5 +3027,111 @@ mod tests {
         h.set(2, &s);
         assert_eq!(h.all(), [Slot::EMPTY, s]);
         assert_eq!(h.get(9), Slot::EMPTY);
+    }
+    #[test]
+    fn dead_objects_records_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Recorder::new(Settings {
+            folder: dir.path().to_owned(),
+            at: At::Trigger,
+            frames: 1,
+            always: false,
+        })
+        .unwrap();
+        lock(&r.pipelines).insert(5, Arc::new(Vec::new()));
+        lock(&r.roots).insert(6, Arc::new(vec![1, 2]));
+        lock(&r.queries).insert(
+            7,
+            wire::QueryHeap {
+                id: 7,
+                kind: 0,
+                count: 1,
+            },
+        );
+        lock(&r.names).insert(5, "a pipeline".into());
+        r.ids.set(0x50, 5);
+        r.ids.set(0x60, 6);
+        r.ids.set(0x70, 7);
+        let other = |what, id, ptr| Gone::Other { what, id, ptr };
+        r.gone(&other(Record::Pipeline, 5, 0x50));
+        assert!(lock(&r.pipelines).is_empty());
+        assert!(lock(&r.names).is_empty());
+        assert_eq!(r.ids.get(0x50), None);
+        // While a frame is captured, its lists may name dead objects: their
+        // records go when it ends.
+        r.watching.store(true, Ordering::SeqCst);
+        r.gone(&other(Record::Root, 6, 0x60));
+        r.gone(&other(Record::Query, 7, 0x70));
+        assert!(lock(&r.roots).contains_key(&6));
+        assert!(lock(&r.queries).contains_key(&7));
+        assert_eq!(r.ids.get(0x60), None, "the address may be used anew");
+        r.stop_watching();
+        assert!(lock(&r.roots).is_empty());
+        assert!(lock(&r.queries).is_empty());
+        assert!(lock(&r.later).is_empty());
+
+        // A dead root signature's record stays while a pipeline's or a
+        // command signature's record names it.
+        lock(&r.roots).insert(10, Arc::new(vec![3]));
+        lock(&r.pipelines).insert(11, Arc::new(vec![Part::Root { root: 10 }]));
+        lock(&r.signatures).insert(
+            12,
+            wire::Signature {
+                id: 12,
+                stride: 4,
+                args: Vec::new(),
+                root: 10,
+            },
+        );
+        {
+            let mut users = lock(&r.root_users);
+            users.named(10);
+            users.named(10);
+            users.named(NONE);
+        }
+        r.gone(&other(Record::Root, 10, 0xa0));
+        assert!(lock(&r.roots).contains_key(&10));
+        r.gone(&other(Record::Pipeline, 11, 0xb0));
+        assert!(lock(&r.roots).contains_key(&10));
+        r.gone(&other(Record::Signature, 12, 0xc0));
+        assert!(lock(&r.roots).is_empty());
+        assert!(lock(&r.signatures).is_empty());
+        {
+            let users = lock(&r.root_users);
+            assert!(users.users.is_empty() && users.dead.is_empty());
+        }
+        // A live one named by a record that goes stays.
+        lock(&r.roots).insert(13, Arc::new(vec![3]));
+        lock(&r.pipelines).insert(14, Arc::new(vec![Part::Root { root: 13 }]));
+        lock(&r.root_users).named(13);
+        r.gone(&other(Record::Pipeline, 14, 0xd0));
+        assert!(lock(&r.roots).contains_key(&13));
+        r.gone(&other(Record::Root, 13, 0xe0));
+        assert!(lock(&r.roots).is_empty());
+
+        // A dead list's recording goes at once, its state some presents on.
+        let state = Arc::new(ListState {
+            kind: 0,
+            inner: Mutex::default(),
+        });
+        lock(&state.inner).closed = Some((Some(Arc::new(vec![0; 64])), Arc::new(Vec::new())));
+        write(&r.lists).insert(0x80, state.clone());
+        write(&r.lists).insert(0x88, state.clone());
+        let weak = Arc::downgrade(&state);
+        drop(state);
+        r.gone(&Gone::List {
+            ptrs: vec![0x80, 0x88],
+        });
+        assert!(read(&r.lists).is_empty());
+        let state = weak.upgrade().unwrap();
+        assert!(state.closed().is_none());
+        drop(state);
+        for _ in 1..RETIRED_PRESENTS {
+            r.presented();
+        }
+        assert!(weak.upgrade().is_some());
+        r.presented();
+        assert!(weak.upgrade().is_none());
+        assert!(lock(&r.retired).is_empty());
     }
 }
