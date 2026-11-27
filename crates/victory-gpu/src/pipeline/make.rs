@@ -43,6 +43,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// What first uses have waited for it so far, over all frames and
+    /// threads, in microseconds ([`total_capped`]).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -211,11 +215,40 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether one pipeline is waited for at most one budget in all, over every
+/// frame it is asked for in. The frame's budget begins anew in every frame:
+/// a pipeline whose compile takes three seconds took the whole half second
+/// of each frame that drew with it until it was there, six frames of half a
+/// second while the world streams in, and its draws were dropped in all of
+/// them anyway. With the cap the first frame waits, and the later ones drop
+/// its draws at once until a worker has it. (After
+/// Belobug/VIctory-Belobug-AMD PR #229 by ESAT586, DexNom's and
+/// fxceless/victory-fork PR #1234 and #1312.)
+/// On by default; `VICTORY_PIPELINE_WAIT_TOTAL=0`: a budget in every frame,
+/// as before.
+fn total_capped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_TOTAL").is_none_or(|v| v != "0"))
+}
+
+/// What a first use may wait now: what is left of the frame's `budget`
+/// (`spent` of it is used or taken), and with `capped` no more than what is
+/// left of one budget for this pipeline, `waited` for already.
+fn allowance(budget: Duration, spent: Duration, waited: Duration, capped: bool) -> Duration {
+    let left = budget.saturating_sub(spent);
+    if capped { left.min(budget.saturating_sub(waited)) } else { left }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
+        return;
+    }
+    let capped = total_capped();
+    let waited_before = Duration::from_micros(p.waited_us.load(Ordering::Relaxed));
+    if capped && waited_before >= budget {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -228,7 +261,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = allowance(budget, spent.1, waited_before, capped);
         if shared {
             spent.1 += left;
         }
@@ -250,6 +283,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -636,6 +670,40 @@ mod tests {
 
     /// Passes over the screen go before all others, and workers of their own
     /// take nothing else.
+    #[test]
+    fn a_pipeline_is_waited_for_one_budget_in_all() {
+        let ms = Duration::from_millis;
+        // Within a frame: what the frame has left.
+        assert_eq!(allowance(ms(500), ms(0), ms(0), true), ms(500));
+        assert_eq!(allowance(ms(500), ms(200), ms(0), true), ms(300));
+        assert_eq!(allowance(ms(500), ms(600), ms(0), true), ms(0));
+        // In a later frame: what the pipeline has left of its one budget.
+        assert_eq!(allowance(ms(500), ms(0), ms(450), true), ms(50));
+        assert_eq!(allowance(ms(500), ms(100), ms(500), true), ms(0));
+        // Without the cap, a budget in every frame.
+        assert_eq!(allowance(ms(500), ms(100), ms(5000), false), ms(400));
+    }
+
+    /// A pipeline no worker finishes takes its budget of one frame and none
+    /// of the next.
+    #[test]
+    fn later_frames_do_not_wait_for_a_pipeline_that_took_its_budget() {
+        let budget = wait_budget();
+        if budget.is_zero() || budget > Duration::from_secs(2) || !total_capped() {
+            return; // switched off or long by the environment
+        }
+        let p = Pending::new(Vec::new(), None);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        // Frames no other test counts in.
+        let frame = 0x7e57_0000_0000u64;
+        wait(&p, frame);
+        assert!(p.made.get().is_none());
+        assert_eq!(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)), budget);
+        let again = Instant::now();
+        wait(&p, frame + 1);
+        assert!(again.elapsed() < budget / 4, "waited {:?} in a later frame", again.elapsed());
+    }
+
     #[test]
     fn early_pipelines_wait_while_short_of_memory() {
         let early = Arc::new(Pending::new(Vec::new(), None));
