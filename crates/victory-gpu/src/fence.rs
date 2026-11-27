@@ -71,6 +71,68 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
+/// Whether a value we store where the title may be waiting on its address
+/// (a fence's value, read at the fence's GPU address; what a list writes
+/// when it has run) wakes the threads in `WaitOnAddress` there
+/// (`VICTORY_ADDRESS_WAKE=0`: not, as before). Such a wait ended only at its
+/// timeout: nothing on a PC wakes it when our store changes the value. A
+/// wake nobody waits for is a look at an empty table in user mode
+/// (cool_fox e05d4633, codec_d).
+pub(crate) fn address_wake() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ADDRESS_WAKE").is_none_or(|v| v != "0"))
+}
+
+/// Wakes the threads waiting on the address `at` ([`address_wake`]).
+pub(crate) fn wake_address(at: *const c_void) {
+    #[cfg(windows)]
+    if address_wake() && !at.is_null() {
+        // SAFETY: the call only looks the address up among the waited-for
+        // ones; it does not read through it.
+        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(at) };
+    }
+    #[cfg(not(windows))]
+    let _ = at;
+}
+
+/// For how many milliseconds at most a wait for a fence with no event (the
+/// title's "block until reached") waits for another thread to reach the
+/// value before it fails as before (`VICTORY_FENCE_BLOCK_MS`, unset or 0:
+/// it fails at once). The wait sleeps on the value's address in steps of
+/// 10 ms at most and lets queues run what they hold between them
+/// (cool_fox e05d4633, codec_d).
+fn block_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_FENCE_BLOCK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Waits up to [`block_ms`] for `fence` to reach `value`: whether it did.
+#[cfg(windows)]
+fn block_until(fence: &Fence, value: u64) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(block_ms());
+    loop {
+        let now = fence.value.load(Ordering::Acquire);
+        if now >= value {
+            return true;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now()).as_millis() as u32;
+        if left == 0 {
+            return false;
+        }
+        // SAFETY: the fence's value and a copy of it, eight bytes each;
+        // woken by [`set`] or at the timeout.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                fence.value.as_ptr().cast(),
+                (&raw const now).cast(),
+                8,
+                left.min(10),
+            );
+        }
+        crate::queue::release_held(false);
+    }
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         FENCE,
@@ -112,7 +174,16 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             drop(waiters);
             crate::queue::before_sync();
             crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
+            if fence.value.load(Ordering::Acquire) >= value || (block_ms() > 0 && block_until(fence, value)) {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
+        #[cfg(windows)]
+        if block_ms() > 0 {
+            drop(waiters);
+            if block_until(fence, value) {
                 return S_OK;
             }
             tracing::warn!(value, "blocking fence wait not implemented");
@@ -140,6 +211,9 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    // A title thread asleep on the value's address sees it now.
+    wake_address(fence.value.as_ptr().cast());
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");
@@ -177,6 +251,36 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A thread asleep on the value's address (as a title that reads the
+    /// fence at its GPU address waits) is woken by the set, well before its
+    /// own timeout.
+    #[cfg(windows)]
+    #[test]
+    fn a_set_wakes_a_thread_waiting_on_the_value_s_address() {
+        use windows_sys::Win32::System::Threading::WaitOnAddress;
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let at = fence(f).value.as_ptr() as usize;
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let was = 1u64;
+            loop {
+                // SAFETY: the fence outlives the thread (joined below).
+                let now = unsafe { (at as *const u64).read_volatile() };
+                if now != was {
+                    return (now, started.elapsed());
+                }
+                // SAFETY: eight readable bytes at both addresses.
+                unsafe { WaitOnAddress(at as *const c_void, (&raw const was).cast(), 8, 20_000) };
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        set(f, 7);
+        let (seen, took) = waiter.join().unwrap();
+        assert_eq!(seen, 7);
+        assert!(took < std::time::Duration::from_secs(10), "woken only at the timeout: {took:?}");
+    }
 
     #[cfg(windows)]
     #[test]

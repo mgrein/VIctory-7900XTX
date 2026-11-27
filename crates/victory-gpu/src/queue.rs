@@ -858,6 +858,8 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // A title thread asleep on this address sees the value now.
+        crate::fence::wake_address(at.cast());
     }
 }
 
