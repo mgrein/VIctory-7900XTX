@@ -248,10 +248,18 @@ pub fn keys(dir: &Path) -> Vec<String> {
 
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
+///
+/// The host is opened first, as a run does: what the card can do (its
+/// widest wave, the view heap's limit) is part of the translator's settings.
+/// Asked before, they were "not known", so the fingerprint named
+/// translations no run on this card uses. (After
+/// Belobug/VIctory-Belobug-AMD PRs #267, #294 and #305 and VItoriaBr PR #90,
+/// `prepare_shader_warmup`.)
 pub fn fingerprint() -> String {
+    let host = crate::host::host();
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
+    if let Some(host) = host {
         h.update(&host.driver().to_le_bytes());
     }
     h.finalize().to_hex()[..16].to_owned()
@@ -268,6 +276,12 @@ pub fn use_translations(dir: PathBuf) {
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+    // Before the first translation, as a run and `victory shaders` do: the
+    // card's widest wave and its view heap's limit decide the form of some
+    // programs and are part of the translations' key. A pipeline that
+    // refuses before it reaches the host (stages we do not translate) had
+    // its shaders translated for a card "not known" otherwise.
+    let _ = crate::host::host();
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
