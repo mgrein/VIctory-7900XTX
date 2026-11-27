@@ -8904,6 +8904,81 @@ struct Batch {
     front: bool,
     /// The most entries `index` held ([`MapHint`]).
     most: usize,
+    /// With [`refresh_spans_kept`]: per copy (by address) whose refreshes
+    /// lie apart, the disjoint spans in it, sorted; its entry in
+    /// `refreshes` holds their union's bounds.
+    spans: ByCopy<Vec<(usize, usize)>>,
+}
+
+/// Whether a submission's refreshes of one copy are kept as up to
+/// [`SPANS_MOST`] disjoint spans (`VICTORY_REFRESH_SPANS=1`; off by
+/// default) instead of one from the lowest to the highest: two far ranges
+/// of the heap's buffer asked for and walked everything between them.
+/// Each refresh still brings the bytes it names up to date; only what lies
+/// between the ranges, which no step of the submission asked for, is left
+/// out. Refreshes in front of the steps (`refresh_front`, the copies
+/// shaders write) are not changed by it. (After DexNom PR #20, Batushn.)
+fn refresh_spans_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_SPANS"))
+}
+
+/// The most disjoint spans kept per copy ([`refresh_spans_kept`]).
+const SPANS_MOST: usize = 64;
+
+/// Ranges closer than this are kept as one span ([`add_span`]).
+const SPANS_GAP: usize = 64 << 10;
+
+/// Puts `[from, to)` into `spans` (sorted, disjoint, never nearer than
+/// [`SPANS_GAP`] to each other): joined with those it overlaps or nears,
+/// and with more than [`SPANS_MOST`] the two nearest joined.
+fn add_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let (mut from, mut to) = (from, to);
+    // The first span that ends at or after `from - gap`.
+    let first = spans.partition_point(|&(_, e)| e.saturating_add(SPANS_GAP) < from);
+    let mut last = first;
+    while last < spans.len() && spans[last].0 <= to.saturating_add(SPANS_GAP) {
+        from = from.min(spans[last].0);
+        to = to.max(spans[last].1);
+        last += 1;
+    }
+    spans.splice(first..last, [(from, to)]);
+    if spans.len() > SPANS_MOST {
+        let i = (1..spans.len()).min_by_key(|&i| spans[i].0 - spans[i - 1].1).unwrap_or(1);
+        spans[i - 1].1 = spans[i].1;
+        spans.remove(i);
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{SPANS_GAP, SPANS_MOST, add_span};
+
+    /// Far ranges stay apart, near and overlapping ones join, and past the
+    /// most the nearest two join; the spans stay sorted and disjoint and
+    /// cover every range put in.
+    #[test]
+    fn far_refreshes_of_a_copy_stay_apart() {
+        let mut s = Vec::new();
+        add_span(&mut s, 0, 16);
+        add_span(&mut s, 100 << 20, (100 << 20) + 16);
+        assert_eq!(s, [(0, 16), (100 << 20, (100 << 20) + 16)], "nothing between is asked for");
+        add_span(&mut s, 8, 32);
+        add_span(&mut s, 32 + SPANS_GAP - 1, 40 + SPANS_GAP);
+        assert_eq!(s[0], (0, 40 + SPANS_GAP), "near ones join");
+        add_span(&mut s, 10, 100 << 20);
+        assert_eq!(s, [(0, (100 << 20) + 16)], "one over both joins them");
+        let mut s = Vec::new();
+        for i in (0..=SPANS_MOST).rev() {
+            add_span(&mut s, i << 24, (i << 24) + 1);
+        }
+        add_span(&mut s, (3 << 24) + 2, (3 << 24) + 3);
+        assert_eq!(s.len(), SPANS_MOST);
+        assert!(s.windows(2).all(|w| w[0].1 < w[1].0));
+        for i in 0..=SPANS_MOST {
+            assert!(s.iter().any(|&(a, e)| a <= i << 24 && (i << 24) + 1 <= e), "{i} is still covered");
+        }
+    }
 }
 
 /// [`MapHint`] of [`Batch`]'s `index`.
@@ -9326,6 +9401,12 @@ impl Batch {
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
+                if refresh_spans_kept()
+                    && (self.spans.contains_key(&key) || end.saturating_add(SPANS_GAP) < r.1 || r.2.saturating_add(SPANS_GAP) < address)
+                {
+                    let spans = self.spans.entry(key).or_insert_with(|| vec![(r.1, r.2)]);
+                    add_span(spans, address, end);
+                }
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
@@ -9347,6 +9428,7 @@ impl Batch {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let spans = self.spans.remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
@@ -9354,7 +9436,7 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         if !(crate::watch::light() && known_nothing(&shadow, from, to)) {
-            Self::update(&shadow, from, to);
+            Self::update_spans(&shadow, from, to, spans.as_deref());
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9362,6 +9444,19 @@ impl Batch {
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
             SPLIT[10].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Batch::update`] of each of `spans` if given (the refreshes of
+    /// the copy that lie apart, [`refresh_spans_kept`]), else of `[from, to)`.
+    fn update_spans(shadow: &crate::shadow::Shadow, from: usize, to: usize, spans: Option<&[(usize, usize)]>) {
+        match spans {
+            Some(spans) => {
+                for &(a, e) in spans {
+                    Self::update(shadow, a, e);
+                }
+            }
+            None => Self::update(shadow, from, to),
         }
     }
 
@@ -9698,6 +9793,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
+        let spans = std::mem::take(&mut self.spans);
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
@@ -9705,7 +9801,10 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| match spans.get(&(std::sync::Arc::as_ptr(&r.0) as usize)) {
+                    Some(apart) => apart.clone(),
+                    None => vec![(r.1, r.2)],
+                })
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -9733,13 +9832,16 @@ impl Batch {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    Self::update_spans(shadow, *from, *to, spans.get(&(std::sync::Arc::as_ptr(shadow) as usize)).map(Vec::as_slice));
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
                     .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|(shadow, from, to)| {
+                        let apart = spans.get(&(std::sync::Arc::as_ptr(&shadow) as usize)).cloned();
+                        Box::new(move || Self::update_spans(&shadow, from, to, apart.as_deref())) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
@@ -9749,7 +9851,7 @@ impl Batch {
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+                Self::update_spans(&shadow, from, to, spans.get(&(std::sync::Arc::as_ptr(&shadow) as usize)).map(Vec::as_slice));
             }
         }
         if ahead {
