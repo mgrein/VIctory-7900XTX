@@ -2691,7 +2691,10 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // A sum; the unsigned flag only for integers (a float
+                // prefix with it set is not what the HLSL compiler emits,
+                // as `waveActiveOp` below; VItoriaBr PR #120).
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
