@@ -3,7 +3,10 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 #               (on NVIDIA through the card's own ray tracing, DXR 1.1 ray queries; -SoftwareRT: the emulated walk)
-# -Build        target\diag (the default, the build all measurements are of) or target\release (faster to play)
+# -Build        auto (the default): target\release when it is built, else target\diag;
+#               release: the plain build, faster to play (no copy counters, per-call timing or memory-map walks),
+#               logging warnings and errors only (VICTORY_LOG=warn, unless -More sets it);
+#               diag: the build all measurements are of, for measuring runs (its log lines at info, as before)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Nvidia       the NVIDIA profile even where no NVIDIA card is found (it is taken by itself on one; README.md, "NVIDIA")
 # -CardAwake    on NVIDIA, keep the card awake between submissions all the same (VICTORY_CARD_AWAKE=1, as on AMD)
@@ -15,7 +18,7 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$SoftwareRT,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('auto', 'diag', 'release')][string]$Build = 'auto',
     [hashtable]$More = @{},
     [switch]$Nvidia,
     [switch]$CardAwake,
@@ -84,6 +87,14 @@ if ($PSBoundParameters.ContainsKey('Fps')) {
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
+if ($Build -eq 'auto') {
+    # (After cool_fox's Play-VIctory.cmd, which plays the release build at VICTORY_LOG=warn.)
+    $Build = if (Test-Path (Join-Path $PSScriptRoot '..\target\release\victory.exe')) { 'release' } else { 'diag' }
+    Write-Host "Playing the $Build build (-Build diag for a measuring run, -Build release for the faster one)."
+}
+# The release build logs warnings and errors only: info lines cost on the title's threads and say
+# little without the diagnostics' counters. -More @{VICTORY_LOG='info'} brings them back.
+if ($Build -eq 'release' -and -not $More.ContainsKey('VICTORY_LOG')) { $settings.VICTORY_LOG = 'warn' }
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }

@@ -74,8 +74,10 @@ the card's own ray tracing units; run `victory shaders` once with
 `VICTORY_NATIVE_RT=1` set before that (it changes every shader's cache key).
 
 The faster build to play with is the plain release one, without the
-diagnostics feature: `cargo build --locked --release -p victory`, then
-`scripts\play.ps1 -Build release -Exe ...`. Both builds use thin LTO, one
+diagnostics feature: `cargo build --locked --release -p victory`. Once it is
+built, `scripts\play.ps1` plays it by itself, logging warnings and errors only
+(`VICTORY_LOG=warn`); `-Build diag` keeps the diagnostics build for a measuring
+run. Both builds use thin LTO, one
 codegen unit and `target-cpu=x86-64-v3` (`Cargo.toml`, `.cargo/config.toml`),
 so a build takes longer than it did.
 
