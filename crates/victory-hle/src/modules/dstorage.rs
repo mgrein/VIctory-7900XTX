@@ -628,18 +628,105 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
+        let low = low_priority();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        if low {
+                            lower_this_thread();
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, below_normal = low, "dstorage: workers");
     });
     Some(scheduler)
+}
+
+/// How many workers read, inflate and unpack requests at once. They share the
+/// processor with the title's own threads, the list translators and the
+/// submitting thread, and SMT twins add little to a pool that already keeps
+/// every core busy: so the PC's physical cores by default (fxceless PR #1044
+/// measured copies back at 2.4-3.5 ms/MB with 8 workers against 5.7 with 16 on
+/// an 8-core/16-thread machine). `VICTORY_DSTORAGE_WORKERS=<1..64>` sets the
+/// count outright; `VICTORY_DSTORAGE_WORKERS=logical` takes every logical
+/// processor, as before.
+fn worker_count() -> usize {
+    let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let set = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+    worker_count_for(set.as_deref(), logical, physical_cores())
+}
+
+fn worker_count_for(set: Option<&str>, logical: usize, physical: Option<usize>) -> usize {
+    match set.map(str::trim) {
+        Some("logical") => return logical,
+        Some(v) => {
+            if let Some(n) = v.parse::<usize>().ok().filter(|n| (1..=64).contains(n)) {
+                return n;
+            }
+            tracing::warn!(value = v, "dstorage: VICTORY_DSTORAGE_WORKERS is not 1-64 or `logical`; ignored");
+        }
+        None => {}
+    }
+    physical.unwrap_or(logical / 2).clamp(2, 32).min(logical.max(2))
+}
+
+/// The PC's physical cores, if Windows says (one `RelationProcessorCore`
+/// record per core, whatever its SMT twins).
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len = 0u32;
+    // SAFETY: a null buffer asks for the size only.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    // u64s, so that the records' fields are aligned.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: the buffer holds at least `len` bytes.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let bytes = buf.as_ptr().cast::<u8>();
+    let (mut at, mut cores) = (0usize, 0usize);
+    while at + 8 <= len as usize {
+        // SAFETY: inside the `len` bytes written; `Size` is at offset 4.
+        let size = unsafe { std::ptr::read_unaligned(bytes.add(at + 4).cast::<u32>()) } as usize;
+        if size < 8 || at + size > len as usize {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+/// Whether the workers run below normal priority, so that a burst of streaming
+/// gives way to the title's hot threads (`VICTORY_DSTORAGE_LOW_PRIORITY=1`;
+/// off by default: streaming bursts may come later, so try it against late
+/// textures before turning it on).
+fn low_priority() -> bool {
+    std::env::var_os("VICTORY_DSTORAGE_LOW_PRIORITY").is_some_and(|v| v == "1")
+}
+
+fn lower_this_thread() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: the pseudo handle of the calling thread.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
 impl Scheduler {
@@ -1887,6 +1974,17 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn workers_follow_physical_cores_unless_set() {
+        assert_eq!(super::worker_count_for(None, 12, Some(6)), 6);
+        assert_eq!(super::worker_count_for(None, 12, None), 6);
+        assert_eq!(super::worker_count_for(None, 2, Some(1)), 2);
+        assert_eq!(super::worker_count_for(Some("logical"), 12, Some(6)), 12);
+        assert_eq!(super::worker_count_for(Some(" 3 "), 12, Some(6)), 3);
+        assert_eq!(super::worker_count_for(Some("0"), 12, Some(6)), 6);
+        assert!(super::physical_cores().is_some_and(|n| n >= 1));
     }
 
     #[test]
