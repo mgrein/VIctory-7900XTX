@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -1535,12 +1534,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = scratch::take(request.intermediate_size as usize);
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         // The compressed bytes are not needed while BCPack decodes.
         drop(source);
         packed.truncate(n);
-        Cow::Owned(packed)
+        Source::Owned(packed)
     } else {
         source
     };
@@ -1825,18 +1824,119 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
+/// A compressed request's bytes: the title's memory, or ours.
+enum Source {
+    Borrowed(&'static [u8]),
+    Owned(scratch::Buf),
+}
+
+impl std::ops::Deref for Source {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Source::Borrowed(bytes) => bytes,
+            Source::Owned(buf) => buf,
+        }
+    }
+}
+
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> Result<Source, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Source::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = scratch::take(size);
     read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    Ok(Source::Owned(bytes))
+}
+
+/// Each worker keeps its last two compressed-source and intermediate
+/// buffers of up to 8 MiB for its next requests, instead of a new
+/// allocation (and the page faults of fresh pages) per request; larger ones
+/// are freed as before. The idea from VItoriaBr PR #124 (ItzMeGamer).
+mod scratch {
+    use std::cell::RefCell;
+
+    /// Largest buffer kept, and how many.
+    const KEPT_BYTES: usize = 8 << 20;
+    const KEPT: usize = 2;
+
+    thread_local! {
+        static FREE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `len` zero bytes, in a kept buffer when one is there.
+    pub(super) fn take(len: usize) -> Buf {
+        if len > KEPT_BYTES {
+            // Fresh zeroed pages, as before.
+            return Buf(vec![0; len]);
+        }
+        let mut bytes = FREE.with_borrow_mut(Vec::pop).unwrap_or_default();
+        bytes.clear();
+        bytes.resize(len, 0);
+        Buf(bytes)
+    }
+
+    pub(super) struct Buf(Vec<u8>);
+
+    impl Buf {
+        pub(super) fn truncate(&mut self, len: usize) {
+            self.0.truncate(len);
+        }
+    }
+
+    impl std::ops::Deref for Buf {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Buf {
+        fn deref_mut(&mut self) -> &mut [u8] {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Buf {
+        fn drop(&mut self) {
+            let bytes = std::mem::take(&mut self.0);
+            if bytes.capacity() != 0 && bytes.capacity() <= KEPT_BYTES {
+                // `try_with`: a buffer dropped while the thread ends is freed.
+                let _ = FREE.try_with(|free| {
+                    let mut free = free.borrow_mut();
+                    if free.len() < KEPT {
+                        free.push(bytes);
+                    }
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn small_buffers_are_reused_zeroed_and_large_ones_freed() {
+            let mut a = super::take(1000);
+            a[..3].copy_from_slice(&[1, 2, 3]);
+            let at = a.as_ptr();
+            drop(a);
+            let b = super::take(500);
+            assert_eq!(b.as_ptr(), at);
+            assert!(b.iter().all(|&x| x == 0) && b.len() == 500);
+            drop(b);
+            let big = super::take(super::KEPT_BYTES + 1);
+            drop(big);
+            super::FREE.with_borrow(|free| {
+                assert!(free.len() <= super::KEPT);
+                assert!(free.iter().all(|v| v.capacity() <= super::KEPT_BYTES));
+            });
+        }
+    }
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
