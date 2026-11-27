@@ -448,8 +448,9 @@ enum Job {
     /// they run in.
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
     /// A submission whose lists are being translated ([`crate::list::thin`]):
-    /// the parts of it are known when they are.
-    Lists(usize, Recordings),
+    /// the parts of it are known when they are. The queue's address and
+    /// kind: the title may release the queue before it is unfolded.
+    Lists(usize, u32, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
     /// begin in the order, and the signals given behind them.
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
@@ -481,7 +482,7 @@ impl Work for Job {
         match self {
             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
-            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
+            Job::Lists(_, _, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
     }
@@ -491,11 +492,11 @@ impl Work for Job {
     }
 
     fn unfold(self) -> Vec<Self> {
-        let Job::Lists(queue, recordings) = self else {
+        let Job::Lists(queue, kind, recordings) = self else {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        let jobs = jobs_of(queue, kind, &lists);
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -858,11 +859,11 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        LANE.push(queue, [Job::Lists(queue, super::queue(this).kind, recordings)]);
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(queue, super::queue(this).kind, lists);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -882,9 +883,11 @@ fn room(queued: u64) {
     }
 }
 
-/// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
-    let queue = this as usize;
+/// What a submission of `lists` to the queue at `queue` (of `kind`) is in
+/// the line.
+fn jobs_of(queue: usize, kind: u32, lists: &[This]) -> Vec<Job> {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = kind;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
     let first = lists.iter().position(|&l| crate::list::cut_list(l)).unwrap_or(lists.len());
@@ -899,7 +902,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
             .collect();
         format!(
             "SUBMIT queue kind {} lists {named:?} to the line (the first {first} in one piece)",
-            super::queue(this).kind
+            kind
         )
     });
     let mut jobs: Vec<Job> = Vec::new();
