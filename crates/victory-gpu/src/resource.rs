@@ -3276,7 +3276,35 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     let [plane] = &t.planes[..] else {
         return None;
     };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    let mut layout = plane.layout.clone();
+    let at = r.data() as usize;
+    // The water height plane (256x256 R32_FLOAT, `SW_64KB_R_X`) is the one
+    // XOR layout with an address equation: it holds only for a texture on
+    // a 64 KiB boundary, and the equation is the console's.
+    const R32_FLOAT: u32 = 41;
+    if r.desc.format == R32_FLOAT && at.is_multiple_of(65536) {
+        use victory_formats::texture::RenderPipeConfig;
+        layout.configure_render_xor(match crate::console::current() {
+            crate::console::Console::SeriesS => RenderPipeConfig::Pipes8Packers4,
+            crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
+        });
+    }
+    // A layout that cannot be addressed could not be tiled back once the
+    // card had copied it: no copy is recorded and waited for.
+    if !layout.addressable() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                width = r.desc.width,
+                height = r.desc.height,
+                format = r.desc.format,
+                swizzle = layout.desc.swizzle.0,
+                "a texture of a kind copied back has a layout that cannot be tiled: not copied back"
+            )
+        });
+        return None;
+    }
+    Some((layout, at, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3644,6 +3672,31 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    /// A texture of a kind copied back gets a target only where its layout
+    /// can be tiled: a plain swizzle, or the water plane's `SW_64KB_R_X` on
+    /// a 64 KiB boundary; not that one off the boundary, nor another XOR
+    /// mode. (After cool_fox d9f3ea6f, DoubleGhosty.)
+    #[test]
+    #[cfg(windows)]
+    fn copied_back_textures_need_a_layout_that_can_be_tiled() {
+        for (swizzle, bias, supported) in
+            [(0x105, 0, true), (0x11b, 0, true), (0x11b, 256, false), (0x119, 0, false)]
+        {
+            let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
+            let bytes = footprint(&desc).unwrap().size as usize;
+            let memory = vec![0u8; bytes + 65536 + bias];
+            let at = (memory.as_ptr() as usize).next_multiple_of(65536) + bias;
+            let mut r = std::ptr::null();
+            assert_eq!(
+                create_at_address(std::ptr::null(), at as u64, &desc, 0, std::ptr::null(), &PAGEABLE_IIDS[0], &mut r),
+                S_OK
+            );
+            let target = title_texture(r).map(|(_, base, extent)| (base, extent));
+            assert_eq!(target, supported.then_some((at, bytes)), "layout {swizzle:#x} at +{bias}");
+            assert_eq!(resource_release(r), 0);
         }
     }
 
