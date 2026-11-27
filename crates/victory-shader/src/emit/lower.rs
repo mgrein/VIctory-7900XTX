@@ -4355,6 +4355,103 @@ impl<'a> Lower<'a> {
         Some((h, byte))
     }
 
+    /// Up to four consecutive dwords of title memory from the 40-bit address `lo`, `hi`, each
+    /// `transfer(handle, byte, dwords)` call reading or writing a run of them in one copy. The
+    /// directory maps each 64 KiB page on its own, so a run that crosses a page's end looks up
+    /// the next page for its rest (one constant-masked access on each page); a run inside one
+    /// page is one access. Results come back per dword, joined. `guard`, `store` and `coherent`
+    /// are [`Lower::memory`]'s (fxceless PR #846, gomeaw).
+    #[allow(clippy::too_many_arguments)]
+    fn memory_transfer(
+        &mut self,
+        lo: V,
+        hi: V,
+        guard: Option<V>,
+        store: bool,
+        coherent: bool,
+        count: u8,
+        mut transfer: impl FnMut(&mut Self, V, V, std::ops::Range<u8>) -> Vec<V>,
+    ) -> Vec<V> {
+        let (handle, byte) = self.memory(lo, hi, guard, store, coherent);
+        if count == 1 {
+            return transfer(self, handle, byte, 0..count);
+        }
+        let head = self.cur;
+        let page_mask = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(head, Bin::And, lo, page_mask);
+        let limit = self.s.m.i32(0x10000 - 4 * u32::from(count));
+        let fits = self.s.m.cmp(head, pred::IULE, within, limit);
+        let (whole, split, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(fits, whole, split));
+        self.cur = whole;
+        let values = transfer(self, handle, byte, 0..count);
+        let whole_end = self.cur;
+        self.s.m.terminate(whole_end, Term::Br(join));
+        let mut incoming: Vec<Vec<(V, usize)>> = values.into_iter().map(|v| vec![(v, whole_end)]).collect();
+        self.cur = split;
+        // The last dword lies in the next page: look up that page's start
+        // (with the carry when the low word wraps).
+        let (end_lo, end_hi) = self.address_plus(lo, hi, 4 * i32::from(count - 1));
+        let page_base = self.s.m.i32(!0xFFFF);
+        let next_lo = self.s.m.bin(self.cur, Bin::And, end_lo, page_base);
+        let (next_handle, next_byte) = self.memory(next_lo, end_hi, guard, store, coherent);
+        // A component mask is constant: one case per dword the next page
+        // starts at.
+        for first in (1..count).rev() {
+            let rest = if first > 1 {
+                let (case, rest) = (self.s.m.new_block(), self.s.m.new_block());
+                let boundary = self.s.m.i32(0x10000 - 4 * u32::from(first));
+                let here = self.s.m.cmp(self.cur, pred::IULE, within, boundary);
+                self.s.m.terminate(self.cur, Term::CondBr(here, case, rest));
+                self.cur = case;
+                Some(rest)
+            } else {
+                None
+            };
+            let mut values = transfer(self, handle, byte, 0..first);
+            values.extend(transfer(self, next_handle, next_byte, first..count));
+            let end = self.cur;
+            for (edges, value) in incoming.iter_mut().zip(values) {
+                edges.push((value, end));
+            }
+            self.s.m.terminate(end, Term::Br(join));
+            if let Some(rest) = rest {
+                self.cur = rest;
+            }
+        }
+        self.cur = join;
+        let i32t = self.s.t.i32;
+        incoming
+            .into_iter()
+            .map(|edges| {
+                let phi = self.s.m.phi(join, i32t);
+                self.s.m.set_phi(phi, edges);
+                phi
+            })
+            .collect()
+    }
+
+    /// `count` dwords of a raw view from `byte`, as integers.
+    fn memory_load_words(&mut self, handle: V, byte: V, count: u8) -> Vec<V> {
+        let c = self.cur;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align) = (self.s.m.i8((1u8 << count) - 1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[handle, byte, iu, mask, align],
+        );
+        (0..count)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, u32::from(k));
+                self.as_int(x)
+            })
+            .collect()
+    }
+
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
     /// memory by address (`resource::MEMORY`): the address is the VGPR
     /// pair, each lane its own.
@@ -4401,20 +4498,10 @@ impl<'a> Lower<'a> {
                 return Err("a global load result");
             };
             let coherent = Self::needs_coherence(inst, false);
-            let (h, byte) = self.memory(lo, hi, guard, false, coherent);
-            let c = self.cur;
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
+            let words = self.memory_transfer(lo, hi, guard, false, coherent, n, |l, h, byte, range| {
+                l.memory_load_words(h, byte, range.end - range.start)
+            });
+            for (k, x) in (0..n).zip(words) {
                 self.write(inst, Reg::V(reg + k), x, guard);
             }
             return Ok(());
@@ -4423,16 +4510,17 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard, true, true);
-            let mut args = vec![h, byte, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(align);
-            let at = self.begin_guarded(guard);
-            self.s
-                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
-            self.end_guarded(at, &[]);
+            self.memory_transfer(lo, hi, guard, true, true, n, |l, h, byte, range| {
+                let mut args = vec![h, byte, iu];
+                args.extend(&vals[usize::from(range.start)..usize::from(range.end)]);
+                args.resize(3 + 4, iu);
+                args.push(l.s.m.i8((1u8 << (range.end - range.start)) - 1));
+                args.push(align);
+                let at = l.begin_guarded(guard);
+                l.s.op(l.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+                l.end_guarded(at, &[]);
+                Vec::new()
+            });
             return Ok(());
         }
         let Some(op) = name.strip_prefix("global_atomic_") else {
@@ -4571,7 +4659,7 @@ impl<'a> Lower<'a> {
         };
         let (mut lo, mut hi) = (word(self, 0)?, word(self, 1)?);
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             // An offset register counts up from the address.
             let so = self.operand(inst, &soffset)?;
@@ -4581,24 +4669,14 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Add, hi, carry);
             lo = sum;
         }
-        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None, false, Self::needs_coherence(inst, false));
-            let c = self.cur;
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
+            let coherent = Self::needs_coherence(inst, false);
+            let words = self.memory_transfer(lo, hi, None, false, coherent, n, |l, h, byte, range| {
+                l.memory_load_words(h, byte, range.end - range.start)
+            });
+            for (k, x) in (0..n).zip(words) {
                 self.write(inst, Reg::S(code + first + k), x, None);
             }
         }
