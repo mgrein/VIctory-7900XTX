@@ -16,6 +16,14 @@ use crate::host::host;
 pub(crate) mod copies;
 pub(crate) mod scratch_views;
 
+/// Logs `what` the first time it happens.
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
 /// `CreateShaderResourceView` of `resource` (none: a null view) at `at`, a
 /// slot the card does not see: copied from the one this thread kept if it
 /// keeps views ([`copies`]), else made there.
@@ -4047,14 +4055,6 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     })
 }
 
-/// Logs `what` the first time it happens.
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
-}
-
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -4652,9 +4652,10 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
+/// family takes the texture's format, except an RGBA8 shader view in sRGB
+/// or linear where the host casts typed formats ([`keeps_gamma_view`]).
+/// shortcut: other such views (BGRA8 sRGB of UNORM, say) read without
+/// their conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4705,10 +4706,50 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && !keeps_gamma_view(own, view, unordered)
     {
         *format = d.Format;
     }
     true
+}
+
+/// Whether a shader view in format `view` of a typed texture in format
+/// `own` keeps its own format: an RGBA8 view that picks sRGB or linear, on
+/// a host that views typed textures in other typed formats of their family
+/// (`CastingFullyTypedFormatSupported`, `D3D12_OPTIONS3`, asked once).
+/// Taking the texture's format dropped the conversion: an sRGB view of a
+/// UNORM texture read its texels as linear, a linear view of an sRGB one
+/// read them converted. Unordered access views have no sRGB on the host.
+/// `VICTORY_GAMMA_CAST=0`: the texture's format, as before.
+fn keeps_gamma_view(own: u32, view: u32, unordered: bool) -> bool {
+    const UNORM: u32 = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+    const SRGB: u32 = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
+    !unordered && matches!((own, view), (UNORM, SRGB) | (SRGB, UNORM)) && typed_casting()
+}
+
+/// Whether the host views typed textures in other typed formats of their
+/// family ([`keeps_gamma_view`]), and `VICTORY_GAMMA_CAST` is not 0.
+fn typed_casting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_GAMMA_CAST").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        let on = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.CastingFullyTypedFormatSupported.as_bool();
+        tracing::info!(on, "RGBA8 shader views keep their sRGB or linear format");
+        on
+    })
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5803,6 +5844,156 @@ mod tests {
         // SAFETY: live heap query.
         assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
         assert_eq!(full.count, 2047);
+    }
+
+    /// An RGBA8 texture read through an sRGB or linear shader view made as
+    /// the title's are ([`fits`]) gets that view's conversion, whichever of
+    /// the two the texture is, where the host casts typed formats; without
+    /// the cast, the texture's own. One texel of 0x80 sampled on the GPU.
+    #[test]
+    fn rgba8_views_keep_their_srgb_conversion() {
+        const UNORM: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+        const SRGB: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        const LINEAR_VALUE: f32 = 128.0 / 255.0;
+        const SRGB_VALUE: f32 = 0.215_860_5;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let casting = typed_casting();
+        assert!(!keeps_gamma_view(UNORM.0 as u32, SRGB.0 as u32, true), "no sRGB unordered access");
+        for (texture_format, view_format) in [(UNORM, UNORM), (UNORM, SRGB), (SRGB, UNORM), (SRGB, SRGB)] {
+            let read_as = if casting { view_format } else { texture_format };
+            let expected = if read_as == SRGB { SRGB_VALUE } else { LINEAR_VALUE };
+            let red = sample_one_texel(&host.device, texture_format, view_format).expect("the sample ran");
+            assert!(
+                (red - expected).abs() < 0.002,
+                "texture {} viewed as {}: red {red}, expected {expected} (casting {casting})",
+                texture_format.0,
+                view_format.0
+            );
+        }
+    }
+
+    /// The red channel a compute shader reads through a shader view in
+    /// `view_format` ([`fits`]) of a 1x1 texture in `texture_format` whose
+    /// every byte is 0x80.
+    fn sample_one_texel(device: &ID3D12Device, texture_format: DXGI_FORMAT, view_format: DXGI_FORMAT) -> windows::core::Result<f32> {
+        const SHADER: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"\n\
+            Texture2D<float4> texel : register(t0);\n\
+            RWByteAddressBuffer result : register(u0);\n\
+            [RootSignature(RS)]\n\
+            [numthreads(1, 1, 1)]\n\
+            void main() { result.Store(0, asuint(texel.Load(int3(0, 0, 0)).r)); }\n";
+        const ROW_PITCH: u64 = 256;
+        let mut rig = crate::inplace::Rig::new(device)?;
+        let made = |kind: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| {
+            let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+            let mut resource: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a resource of our own.
+            unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut resource) }?;
+            resource.ok_or_else(windows::core::Error::empty)
+        };
+        let buffer = |size: u64, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let texture = made(
+            D3D12_HEAP_TYPE_DEFAULT,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: texture_format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        let result = made(D3D12_HEAP_TYPE_DEFAULT, &buffer(4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON)?;
+        let upload = made(D3D12_HEAP_TYPE_UPLOAD, &buffer(ROW_PITCH, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the mapping holds the buffer's bytes until unmapped.
+        unsafe {
+            upload.Map(0, None, Some(&mut mapped))?;
+            mapped.cast::<u8>().write_bytes(0x80, 4);
+            upload.Unmap(0, None);
+        }
+        let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: view_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        };
+        assert!(fits(&texture, Some(&mut view.Format), false), "the host allows the view");
+        // SAFETY: a plain shader-visible heap of one view, of a live texture.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+            device.CreateShaderResourceView(&texture, Some(&view), heap.GetCPUDescriptorHandleForHeapStart());
+            heap
+        };
+        let code = crate::host::compile(SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+        // SAFETY: the compiled bytes carry the root signature too.
+        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+            let pipeline = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            })?;
+            (root, pipeline)
+        };
+        // SAFETY: an open list of ours; every resource named is alive.
+        rig.run(|list| unsafe {
+            let destination = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: texture_format,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: ROW_PITCH as u32,
+                        },
+                    },
+                },
+            };
+            list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+            list.ResourceBarrier(&[crate::host::transition(
+                &texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pipeline);
+            list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.SetComputeRootUnorderedAccessView(1, result.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+        })?;
+        let bytes = rig.fetch(&result, 0, 4)?;
+        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// A view of a host copy that begins at a later level shows the same
