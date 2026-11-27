@@ -1193,6 +1193,7 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => {
+            crate::drvwatch::start();
             if crate::dxr::requested() {
                 let _ = host.raytracing_tier_1_1();
             }
