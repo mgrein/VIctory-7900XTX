@@ -499,6 +499,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // Another thread replaced the instruction after the checks above read it (the emulation
+    // knows only the original): the thread goes on into the replacement.
+    // SAFETY: as above; where the faulting thread is, in the code it runs.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION
+        && unsafe { crate::console_insn::is_replacement((*(*info).ContextRecord).Rip as usize) }
+    {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.

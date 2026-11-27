@@ -11,7 +11,7 @@
 //! GPL-2.0-only, which cannot be combined with this GPL-3.0-or-later program; fxceless PR #1057
 //! took them out, and so does this.)
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// What is at a faulting address, as far as replacing goes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,6 +177,8 @@ fn clzero_stub15(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
 /// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
+/// Where [`STUBS`] is (0: not made yet), read without its lock by [`is_replacement`].
+static STUBS_AT: AtomicUsize = AtomicUsize::new(0);
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
 pub(crate) fn near(at: usize) -> Option<usize> {
@@ -199,6 +201,9 @@ unsafe fn patch_to_stub(at: usize, was: [u8; 5], body: impl FnOnce(usize) -> Opt
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
+        if let Some((place, _)) = *stubs {
+            STUBS_AT.store(place, Relaxed);
+        }
     }
     let Some((place, used)) = stubs.as_mut() else {
         return false;
@@ -213,8 +218,13 @@ unsafe fn patch_to_stub(at: usize, was: [u8; 5], body: impl FnOnce(usize) -> Opt
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
-        *used += body.len().next_multiple_of(16);
-        patch(at, &was, &jump)
+        let done = patch(at, &was, &jump);
+        // A stub nothing jumps to (another thread replaced the code first, with its own stub)
+        // gives its room back; the lock is held, so no other stub was placed after it.
+        if done {
+            *used += body.len().next_multiple_of(16);
+        }
+        done
     }
 }
 
@@ -283,6 +293,36 @@ unsafe fn patch(at: usize, was: &[u8], patch: &[u8]) -> bool {
     }
 }
 
+/// Whether the code at `rip` is one of the replacements made here: `0f 1f 00` (for `monitorx`),
+/// `pause; nop` (for `mwaitx`), a run of the no-ops a `clwb` becomes, or a jump into the stubs.
+/// A thread that faulted on the instruction before another thread replaced it finds this there
+/// in its handler, and goes on into the replacement instead of being left to an emulation that
+/// knows only the console's instructions (the illegal instruction would kill the title).
+/// Replacements are never undone, so once this is true it stays true.
+///
+/// # Safety
+/// `rip` is where the faulting thread is, in code that stays mapped.
+pub(crate) unsafe fn is_replacement(rip: usize) -> bool {
+    let room = 0x1000 - (rip & 0xfff);
+    let mut code = [0u8; 5];
+    let n = room.min(code.len());
+    // SAFETY: inside the page of the faulting instruction.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, code.as_mut_ptr(), n) };
+    replacement(&code[..n], rip, STUBS_AT.load(Relaxed))
+}
+
+/// [`is_replacement`] for `code` (the bytes at `at`, up to 5) and stubs at `stubs` (0: none).
+fn replacement(code: &[u8], at: usize, stubs: usize) -> bool {
+    match *code {
+        [0x0f, 0x1f, 0x00, ..] | [0xf3, 0x90, 0x90, ..] | [0x90, 0x90, 0x90, 0x90, ..] => true,
+        [0xe9, a, b, c, d] if stubs != 0 => {
+            let to = (at as i64 + 5 + i64::from(i32::from_le_bytes([a, b, c, d]))) as usize;
+            (stubs..stubs + STUBS_LEN).contains(&to)
+        }
+        _ => false,
+    }
+}
+
 /// Places replaced so far, of each kind (wait, `clzero` loop, 15-byte `clzero` loop, `clwb`).
 static REPLACED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -331,7 +371,8 @@ pub(crate) unsafe fn replace_at_fault(rip: usize) -> bool {
                 (2, patch_to_stub(rip, was, |stub| clzero_stub15(rip, stub, cmp)))
             }
             Site::Clwb(len) if patches_clwb() => (3, patch(rip, &code[..len], &[0x90; 16][..len])),
-            _ => return false,
+            // (Something else: perhaps another thread's replacement, made since this fault.)
+            _ => return is_replacement(rip),
         }
     };
     if done {
@@ -349,7 +390,9 @@ pub(crate) unsafe fn replace_at_fault(rip: usize) -> bool {
             );
         }
     }
-    done
+    // Not replaced by this thread: by another one meanwhile (with another stub, say)?
+    // SAFETY: as above.
+    done || unsafe { is_replacement(rip) }
 }
 
 /// Diagnostics: how often each place in the title's code raises one of these exceptions, the
@@ -462,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn replacements_are_known_again() {
+        assert!(replacement(&[0x0f, 0x1f, 0x00, 0xc3], 0x1000, 0));
+        assert!(replacement(&[0xf3, 0x90, 0x90], 0x1000, 0));
+        assert!(replacement(&[0x90, 0x90, 0x90, 0x90, 0xc3], 0x1000, 0));
+        assert!(!replacement(&[0x90, 0x90, 0x90, 0xc3], 0x1000, 0), "shorter than any clwb");
+        assert!(!replacement(&[0x0f, 0x01, 0xfb], 0x1000, 0));
+        assert!(!replacement(&[0x90], 0x1000, 0), "cut by the page's end");
+        // jmp from 0x10_0000 to 0x20_0000, the stubs there or elsewhere.
+        let j = jump(0x10_0000, 0x20_0000).unwrap();
+        assert!(replacement(&j, 0x10_0000, 0x20_0000));
+        assert!(replacement(&j, 0x10_0000, 0x20_0000 - STUBS_LEN + 1));
+        assert!(!replacement(&j, 0x10_0000, 0x20_0001));
+        assert!(!replacement(&j, 0x10_0000, 0x20_0000 - STUBS_LEN));
+        assert!(!replacement(&j, 0x10_0000, 0), "no stubs yet");
+    }
+
+    #[test]
     fn wait_instructions_are_replaced_inside_sixteen_aligned_bytes() {
         let word = u128::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 0x0f, 0x01, 0xfb, 11, 12, 13, 14, 15, 16]);
         let new = with_patch(word, 0x1007, &[0xf3, 0x90, 0x90]).unwrap();
@@ -496,6 +556,9 @@ mod tests {
                 // They run now.
                 let run: extern "system" fn() = std::mem::transmute(page.add(6));
                 run();
+                for rip in [at + 6, at + 9, at + 12] {
+                    assert!(replace_at_fault(rip), "a thread that faulted before the replacement");
+                }
                 // A second thread that faulted at the same place meanwhile.
                 assert!(patch(at + 6, &[0x0f, 0x01, 0xfa], &[0x0f, 0x1f, 0x00]));
             }
@@ -538,6 +601,12 @@ mod tests {
                 assert_eq!(replace_at_fault(page + 16), patches_clzero());
                 if patches_clzero() {
                     assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
+                    // A thread that read the loop before the jump was written: its own stub is
+                    // not used (and gives its room back), and it goes on into the jump there.
+                    let was = [0x0f, 0x01, 0xfc, 0x48, 0x83];
+                    assert!(!patch_to_stub(page + 16, was, |stub| clzero_stub(page + 16, stub, cmp)));
+                    assert!(is_replacement(page + 16));
+                    assert!(replace_at_fault(page + 16), "a second fault there finds the jump");
                     let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
                     // From inside a line to inside the third: whole lines, one past the end.
                     assert_eq!(run(first + 8, first + 130), first + 8 + 128);
@@ -582,6 +651,7 @@ mod tests {
             assert_eq!(replace_at_fault(page + 16), patches_clzero15());
             if patches_clzero15() {
                 assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
+                assert!(replace_at_fault(page + 16), "a second fault there finds the jump");
                 let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
                 // Lines from the start until `a` (64 past the line zeroed) reaches the end.
                 assert_eq!(run(first, first + 130), first + 192);
