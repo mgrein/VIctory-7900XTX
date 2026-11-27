@@ -27,7 +27,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -149,8 +149,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = File::object(Files::new(file, Io::chosen()));
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -276,7 +275,58 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    files: Files,
+    files: Arc<Files>,
+}
+
+/// The file objects alive, by address, so that a request can take hold of
+/// its file when it is enqueued without reading through the title's pointer.
+static OPEN_FILES: Mutex<BTreeMap<usize, Weak<Files>>> = Mutex::new(BTreeMap::new());
+
+/// What a request whose source is not a file object of ours fails with.
+const E_FILE_HANDLE: HRESULT = 0x8924_0017_u32 as i32;
+
+/// `VICTORY_DSTORAGE_FILE_SOURCE=0`: a running read reaches its file
+/// through the title's object, as before (released meanwhile: a read of
+/// freed memory); unset or 1: each read holds its file from enqueue until it
+/// has run, and a source that is no file object of ours fails the request.
+fn retain_files() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_FILE_SOURCE").is_none_or(|v| v != "0"))
+}
+
+impl File {
+    fn object(files: Files) -> *mut c_void {
+        let files = Arc::new(files);
+        let weak = Arc::downgrade(&files);
+        let object = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+        OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner()).insert(object as usize, weak);
+        object
+    }
+
+    /// The file a request reads, held for it: `Ok(None)` for a memory
+    /// source, or when reads do not hold their files.
+    fn held(request: &Request) -> Result<Option<Arc<Files>>, HRESULT> {
+        if !retain_files() || request.options & MEMORY_SOURCE != 0 {
+            return Ok(None);
+        }
+        OPEN_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(request.source as usize))
+            .and_then(Weak::upgrade)
+            .map(Some)
+            .ok_or(E_FILE_HANDLE)
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        let object = std::ptr::from_ref(self) as usize - std::mem::offset_of!(Instance<File>, state);
+        let mut open = OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        if open.get(&object).is_some_and(|w| w.as_ptr() == Arc::as_ptr(&self.files)) {
+            open.remove(&object);
+        }
+    }
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -1050,8 +1100,9 @@ struct Read {
 }
 
 /// What a read keeps from its enqueue until it has run.
-#[derive(Default)]
 struct Held {
+    /// Its file ([`File::held`]), or why it has none.
+    file: Result<Option<Arc<Files>>, HRESULT>,
     /// The page list is on the enqueuing thread's stack ([`on_stack`]).
     stack_list: bool,
     /// That list, copied when the request was submitted, or why it could
@@ -1059,9 +1110,15 @@ struct Held {
     pages: Option<Result<Box<[usize]>, HRESULT>>,
 }
 
+impl Default for Held {
+    fn default() -> Held {
+        Held { file: Ok(None), stack_list: false, pages: None }
+    }
+}
+
 impl Held {
     fn at_enqueue(request: &Request) -> Held {
-        Held { stack_list: on_stack(request), pages: None }
+        Held { file: File::held(request), stack_list: on_stack(request), pages: None }
     }
 
     /// The request is submitted: a list on the stack is copied now, while
@@ -1465,6 +1522,7 @@ fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    let file = held.file.as_ref().map_err(|&hr| fail(hr, "its source is not a file of ours"))?.as_deref();
     let saved = match &held.pages {
         Some(Ok(pages)) => Some(&pages[..]),
         Some(Err(hr)) => return Err(fail(*hr, "its page list could not be read when it was submitted")),
@@ -1477,11 +1535,11 @@ fn execute(request: &Request, held: &Held) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, saved, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, saved, size, |out| read_into(request, out, file).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, file).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1595,7 +1653,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request, file: Option<&Files>) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1603,7 +1661,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         return Ok(Cow::Borrowed(bytes));
     }
     let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    read_into(request, &mut bytes, file)?;
     Ok(Cow::Owned(bytes))
 }
 
@@ -1613,17 +1671,18 @@ static READING: AtomicU64 = AtomicU64::new(0);
 /// How often a read the host refuses is tried again (about 0.25 s in all).
 const READ_RETRIES: u32 = 8;
 
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` (the source size) from the request's file (`file`, held
+/// for it, or else its object) or memory.
+fn read_into(request: &Request, out: &mut [u8], file: Option<&Files>) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .files;
+    let files = file.unwrap_or_else(|| {
+        // SAFETY: a file object we created; the title keeps it open.
+        &unsafe { &*request.source.cast::<Instance<File>>() }.state.files
+    });
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
@@ -2539,6 +2598,21 @@ mod tests {
         let byte = 5u8;
         let r = request(PAGE_DESTINATION | MEMORY_SOURCE, list, 1, std::ptr::from_ref(&byte).cast(), 0, 1);
         assert_eq!(execute(&r, &Held::default()), Err(E_INVALIDARG));
+    }
+
+    #[test]
+    fn a_held_file_outlives_its_object_and_other_sources_fail() {
+        let (_dir, file) = file_with(&[11, 28]);
+        let mut byte = 0u8;
+        let r = request(0, std::ptr::from_mut(&mut byte).cast(), 1, file, 1, 1);
+        let held = Held::at_enqueue(&r);
+        assert_eq!(release(file.cast::<Instance<File>>()), 0);
+        assert_eq!(execute(&r, &held), Ok(()));
+        assert_eq!(byte, 28);
+        // The object is gone, and so is its entry.
+        assert!(matches!(Held::at_enqueue(&r).file, Err(E_FILE_HANDLE)));
+        let foreign = Request { source: std::ptr::dangling::<u8>().cast(), ..r };
+        assert_eq!(execute(&foreign, &Held::at_enqueue(&foreign)), Err(E_FILE_HANDLE));
     }
 
     #[test]
