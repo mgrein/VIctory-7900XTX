@@ -872,12 +872,39 @@ pub(super) fn submit(this: This, lists: &[This]) {
     room(before + runs);
 }
 
+/// [`runs_most`] while the PC is short of memory: 16 with the commit
+/// headroom under the governor's line (`VICTORY_RAM_TRIM_MB`,
+/// `crate::host::ram_pressure_level` 1) and 8 under half of it (2), if that
+/// is fewer; every submission in the line holds its host lists, their
+/// allocators and the copies kept for it. `VICTORY_SUBMIT_DEPTH_PRESSED=0`:
+/// the same depth whatever the memory, as before (VIctory-DXR 443fd629,
+/// effective_runs_most).
+fn effective_runs_most(most: usize, level: u8, on: bool) -> usize {
+    match (on, level) {
+        (false, _) | (_, 0) => most,
+        (_, 1) => most.min(16),
+        _ => most.min(8),
+    }
+}
+
+/// [`effective_runs_most`] now.
+fn runs_most_now() -> usize {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_DEPTH_PRESSED").is_none_or(|v| v != "0"));
+    let most = runs_most();
+    if !on || most <= 8 {
+        return most;
+    }
+    effective_runs_most(most, crate::host::ram_pressure_level(), on)
+}
+
 /// Waits for room in the line, with `queued` submissions in it.
 fn room(queued: u64) {
-    if queued > runs_most() as u64 {
+    let most = runs_most_now();
+    if queued > most as u64 {
         let began = Instant::now();
         let _waiting = crate::timeline::span("a submission waits for room in the line");
-        LANE.wait_runs(runs_most());
+        LANE.wait_runs(most);
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -975,6 +1002,22 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+}
+
+#[cfg(test)]
+mod depth_tests {
+    /// The depth asked while memory is there; 16 and 8 at most while it is
+    /// short, never more than was asked; as asked with the switch off.
+    #[test]
+    fn the_line_is_shorter_while_the_pc_is_short_of_memory() {
+        use super::effective_runs_most;
+        assert_eq!(effective_runs_most(64, 0, true), 64);
+        assert_eq!(effective_runs_most(64, 1, true), 16);
+        assert_eq!(effective_runs_most(64, 2, true), 8);
+        assert_eq!(effective_runs_most(12, 1, true), 12);
+        assert_eq!(effective_runs_most(4, 2, true), 4);
+        assert_eq!(effective_runs_most(64, 2, false), 64);
+    }
 }
 
 #[cfg(test)]

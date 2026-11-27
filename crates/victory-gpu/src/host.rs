@@ -228,6 +228,17 @@ pub(crate) fn ram_pressure() -> bool {
     limit > 0 && commit_headroom().is_some_and(|h| h < limit)
 }
 
+/// How short of memory the PC is: 0 not ([`ram_pressure`] is false), 1 with
+/// the commit headroom under [`ram_trim_bytes`], 2 under half of it.
+pub(crate) fn ram_pressure_level() -> u8 {
+    let limit = ram_trim_bytes();
+    match commit_headroom() {
+        Some(h) if limit > 0 && h < limit / 2 => 2,
+        Some(h) if limit > 0 && h < limit => 1,
+        _ => 0,
+    }
+}
+
 /// At the sweep, with `pressed` ([`ram_pressure`]) and the idle host lists
 /// it let go: under pressure the pooled snapshot buffers
 /// (`crate::shadow::drain_pool`) and the spare scratch chunks
