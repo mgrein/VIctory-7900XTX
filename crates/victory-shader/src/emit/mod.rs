@@ -236,6 +236,24 @@ fn parse_group_sync(value: Option<&str>) -> u8 {
     }
 }
 
+/// `VICTORY_COHERENT=1`: a program that orders memory across the groups of
+/// a dispatch, as the console marks it (cache-control bits GLC, DLC or SLC
+/// on a memory or scalar access, a memory atomic, or a cache invalidation:
+/// `lower::wants_coherent`), has every UAV globally coherent, and a
+/// compute one fences device memory around its memory atomics and at its
+/// cache invalidations. The console keeps such accesses coherent between
+/// groups; a plain host view may serve a stale copy from the SM's L1.
+/// Costs GPU time in those programs. Opt-in (after fxceless PR #914). Part
+/// of the translation: the shader cache keys on it when set.
+pub fn coherent_views() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COHERENT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT").is_some_and(|v| v == "1"))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
@@ -450,6 +468,8 @@ thread_local! {
     /// The tests' way to translate as with `VICTORY_BVH_COHERENT=glc`
     /// ([`builder_coherent_glc`]).
     pub(crate) static TEST_COHERENT_GLC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The tests' way to translate as with `VICTORY_COHERENT=1` or without.
+    pub(crate) static TEST_COHERENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Which accesses of the ray-tracing structure builder to title memory by

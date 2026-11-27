@@ -331,6 +331,9 @@ pub(crate) struct Shader {
     rtas_root_srvs: Vec<u8>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Every UAV globally coherent (`VICTORY_COHERENT=1`,
+    /// `lower::wants_coherent`).
+    pub coherent: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -393,6 +396,7 @@ impl Shader {
             root_srvs: Vec::new(),
             rtas_root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            coherent: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -597,7 +601,18 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// Resource properties, word 0, with bit 14 (globally coherent) on a
+    /// UAV (bit 12) when every UAV is coherent ([`Shader::coherent`]).
+    fn coherent_props(&self, props0: u32) -> u32 {
+        if self.coherent && props0 & 0x1000 != 0 {
+            props0 | 0x4000
+        } else {
+            props0
+        }
+    }
+
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        let props0 = self.coherent_props(props0);
         if props0 & 0xff == 16 {
             self.flags |= flags::RAYTRACING_TIER_1_1;
         }
@@ -820,7 +835,7 @@ impl Shader {
         };
         self.nonuniform_handles += u32::from(nonuniform);
         #[cfg(test)]
-        HEAP_HANDLES.with(|made| made.borrow_mut().push(props));
+        HEAP_HANDLES.with(|made| made.borrow_mut().push((self.coherent_props(props.0), props.1)));
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -1030,6 +1045,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -1043,7 +1060,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

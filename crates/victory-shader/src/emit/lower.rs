@@ -137,6 +137,29 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
     }
 }
 
+/// Whether a program orders memory across the groups of a dispatch, as the
+/// console marks it: cache-control bits (GLC, DLC, SLC) on a memory or
+/// scalar access, a memory atomic, or a cache invalidation. Plain buffer
+/// accesses and LDS atomics (group memory) do not count. With
+/// `VICTORY_COHERENT=1` such a program's UAVs are globally coherent
+/// (after fxceless PR #914, SpaghettiMaster545).
+pub(crate) fn wants_coherent(p: &crate::ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        let name = inst.name();
+        let bits = match &inst.fields {
+            Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Flat { cache, .. }
+            | Fields::Smem { cache, .. } => cache.glc || cache.dlc || cache.slc,
+            _ => false,
+        };
+        let atomic = name.contains("atomic")
+            && matches!(inst.fields, Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. });
+        let invalidate = matches!(name, "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv");
+        bits || atomic || invalidate
+    })
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -1994,6 +2017,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.coherent = super::coherent_views() && wants_coherent(p);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         if super::early_depth_on() && early_depth(&x.native.io, &x.outputs) {
@@ -6972,9 +6996,18 @@ impl<'a> Lower<'a> {
         // seen by the thread that comes after it. The console's program
         // waits for its writes there, and those waits are not in the code
         // here (after beloooo's 72e748ea, VIctory-Belobug-AMD).
-        let ordered = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
-            && crate::spill::is_spilled(self.x.native)
-            && super::builder_fences();
+        // With `VICTORY_COHERENT=1`, likewise in every compute program that
+        // orders memory across groups ([`Lower::device_fences`]).
+        let atomic = name.starts_with("buffer_atomic") || name.starts_with("global_atomic");
+        let ordered = atomic
+            && (crate::spill::is_spilled(self.x.native) && super::builder_fences() || self.device_fences());
+        if matches!(name, "s_dcache_inv" | "s_gl1_inv" | "buffer_gl0_inv" | "buffer_gl1_inv")
+            && self.device_fences()
+        {
+            // What the console's cache invalidation orders (reads after it
+            // see what other groups wrote before): a device fence here.
+            self.memory_fence();
+        }
         if ordered {
             self.memory_fence();
         }
@@ -7036,6 +7069,15 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether this program fences device memory where the console orders
+    /// its accesses against other groups' (`VICTORY_COHERENT=1`): a
+    /// compute program, not a mesh one, with coherent views
+    /// ([`wants_coherent`]). The host orders a thread's accesses to
+    /// different addresses for other groups only at a fence.
+    fn device_fences(&self) -> bool {
+        self.s.coherent && self.s.threads.is_some() && self.s.mesh.is_none()
     }
 
     /// Writes to buffers made before are seen, by every group, before those made after.
@@ -14930,6 +14972,49 @@ mod tests {
         assert_eq!(builder_memory_handles(false, false), [0x5000 | 11; 3]);
         assert_eq!(builder_memory_handles(true, false), [0x1000 | 11, 0x5000 | 11, 0x5000 | 11]);
         assert_eq!(builder_memory_handles(true, true), [0x5000 | 11; 3]);
+    }
+
+    /// Which programs order memory across groups (`VICTORY_COHERENT=1`
+    /// gives them globally coherent views): cache-control bits on a memory
+    /// or scalar access, a memory atomic or a cache invalidation; not plain
+    /// buffer accesses, nor LDS atomics (group memory). After fxceless PR
+    /// #914.
+    #[test]
+    fn coherent_views_follow_cache_bits_atomics_and_invalidations() {
+        let wants = |body: &[u32]| {
+            let mut words = body.to_vec();
+            words.push(S_ENDPGM);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            super::wants_coherent(&ir::build(&code, false, 8).unwrap())
+        };
+        // buffer_load_dword v1, v0, s[4:7], 0 offen / buffer_store_dword
+        // v1, v0, s[4:7], 0 offen
+        assert!(!wants(&[0xE030_1000, 0x8001_0100, 0xE070_1000, 0x8001_0100]));
+        // ds_add_u32 v0, v1: an atomic on group memory, not on a view.
+        assert!(!wants(&[0xD800_0000, 0x0000_0100]));
+        // The same load with glc (bit 14), dlc (bit 15) or slc (dword 1 bit 22).
+        assert!(wants(&[0xE030_5000, 0x8001_0100]));
+        assert!(wants(&[0xE030_9000, 0x8001_0100]));
+        assert!(wants(&[0xE030_1000, 0x8041_0100]));
+        // buffer_atomic_add v1, v0, s[4:7], 0 offen
+        assert!(wants(&[0xE0C8_1000, 0x8001_0100]));
+        // buffer_gl0_inv
+        assert!(wants(&[0xE1C4_0000, 0x0000_0000]));
+        // s_load_dword s8, s[4:5], 0x0 with glc, and without
+        assert!(wants(&[0xF401_0202, 0xFA00_0000]));
+        assert!(!wants(&[0xF400_0202, 0xFA00_0000]));
+    }
+
+    /// With `VICTORY_COHERENT=1` a program that orders memory across groups
+    /// (here a load with `glc`) has every view coherent, the plain load's
+    /// too, even where `VICTORY_BVH_COHERENT=glc` would keep it plain.
+    #[test]
+    fn with_coherent_views_every_view_of_such_a_program_is_coherent() {
+        use super::super::TEST_COHERENT;
+        TEST_COHERENT.set(Some(true));
+        let handles = builder_memory_handles(true, false);
+        TEST_COHERENT.set(None);
+        assert_eq!(handles, [0x5000 | 11; 3]);
     }
 
     /// Lowers a one-thread compute program that copies four root constants
