@@ -616,9 +616,99 @@ impl Asking {
         Asking(first, last)
     }
 
-    /// Everything: an asking for a whole submission.
+    /// Everything: an asking for a whole submission, as it was before
+    /// [`AskingMany`] ([`hold_everything`]).
     fn hold_all() -> Asking {
         Asking::hold(0, usize::MAX)
+    }
+}
+
+/// Whether a submission's asking holds everything in [`ASKING`] while it
+/// asks, as before (`VICTORY_ASK_HOLD_ALL=1`; off by default, read here).
+///
+/// By default it holds only the page ranges it asks the kernel about
+/// ([`AskingMany`]): an asking of other pages on another thread (the heaps'
+/// thread asks about the descriptor heaps, the refreshes of the lists'
+/// threads about what the submission did not name) no longer waits for the
+/// submission's whole asking, some milliseconds a frame. What is kept: no
+/// two threads ask the kernel about the same page before the first one's
+/// answer is in the journal, since every range a kernel call covers is held
+/// from before the call until its pages are noted.
+fn hold_everything() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_HOLD_ALL").is_some_and(|v| v == "1"))
+}
+
+/// Sorts page ranges and joins those that overlap or touch.
+fn coalesce(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() < 2 {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for i in 1..ranges.len() {
+        let (a, b) = ranges[i];
+        if a <= ranges[kept].1 {
+            ranges[kept].1 = ranges[kept].1.max(b);
+        } else {
+            kept += 1;
+            ranges[kept] = (a, b);
+        }
+    }
+    ranges.truncate(kept + 1);
+}
+
+/// Several page ranges held in [`ASKING`] at once until dropped, taken
+/// together (all or none: who waits holds nothing meanwhile, so two of them
+/// never wait for each other). Ranges it does not hold are free for other
+/// askings. (After VIctory-DXR 965e0927, Maren Halvorsen.)
+struct AskingMany(Vec<(usize, usize)>);
+
+impl AskingMany {
+    fn hold(mut ranges: Vec<(usize, usize)>) -> AskingMany {
+        ranges.retain(|r| r.0 < r.1);
+        coalesce(&mut ranges);
+        if ranges.is_empty() {
+            return AskingMany(ranges);
+        }
+        let overlaps = |held: &[(usize, usize)]| {
+            held.iter().any(|&(a, b)| {
+                // The first of ours that ends past `a`: the only one that
+                // can begin before `b` if any does (ours are in order and
+                // apart).
+                let i = ranges.partition_point(|r| r.1 <= a);
+                i < ranges.len() && ranges[i].0 < b
+            })
+        };
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if overlaps(&held) {
+            held = waited(0, || {
+                let mut held = held;
+                while overlaps(&held) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&ranges);
+        drop(held);
+        AskingMany(ranges)
+    }
+}
+
+impl Drop for AskingMany {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &range in &self.0 {
+            if let Some(i) = held.iter().position(|&r| r == range) {
+                held.swap_remove(i);
+            }
+        }
+        drop(held);
+        ASKING.1.notify_all();
     }
 }
 
@@ -808,7 +898,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    let _all = (!held).then(Asking::hold_all);
+    let _all = (!held && hold_everything()).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let gap = ahead_gap();
     let ends = known_ends();
@@ -831,6 +921,18 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     }
     // (Let go before asking: a refused run notes where it ends.)
     drop(ends);
+    // Held until the answers are noted below: every page a run's kernel
+    // calls cover (whole, by reservation or by halves) lies between its
+    // first piece's start and its furthest end. A run of one piece is not
+    // asked ([`ask_run`]).
+    let _runs = (!held && !hold_everything()).then(|| {
+        AskingMany::hold(
+            runs.iter()
+                .filter(|r| r.len() >= 2)
+                .map(|r| (pieces[r.start].0, pieces[r.clone()].iter().map(|p| p.1).max().unwrap_or(0)))
+                .collect(),
+        )
+    });
     for (a, w) in spread_each(runs.len(), |r| {
         let (mut a, mut w) = (Vec::new(), Vec::new());
         ask_run(&pieces[runs[r].clone()], &mut a, &mut w);
@@ -1075,6 +1177,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
+    if !hold_everything() {
+        // Each part holds the ranges it asks about, and no more
+        // ([`AskingMany`]). An asking of another thread that comes between
+        // the two parts is what the second part's own number is for.
+        ask_ahead_held(ranges, false);
+        spent.next("asking: the rest");
+        ask_rest(ranges, false);
+        spent.end();
+        return;
+    }
     // Both parts under one hold of everything: a second hold waited for the
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
@@ -1088,10 +1200,16 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
-    let _all = (!held).then(Asking::hold_all);
-    let mut ahead = {
+    let everything = hold_everything();
+    let _all = (!held && everything).then(Asking::hold_all);
+    // (Not holding everything, the first part's ranges stay standing
+    // meanwhile: the refreshes of other threads go on answering from the
+    // journal instead of asking the kernel about them again.)
+    let mut ahead = if held || everything {
         let mut j = journal_mut();
         j.ahead.take()
+    } else {
+        journal().ahead.ranges.clone()
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
@@ -1115,6 +1233,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
     }
     let mut ahead = held_ahead.take();
+    // Held until the answers are noted below.
+    let _alone = (!held && !everything).then(|| AskingMany::hold(alone_ranges.clone()));
     let answers = spread_each(alone_ranges.len(), |r| {
         let (first, last) = alone_ranges[r];
         #[cfg(feature = "diagnostics")]
@@ -3596,32 +3716,48 @@ impl Drop for KernelWrite {
 /// 1, the guarded blocks under it are opened and count as written (host
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
-/// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
-/// copies lay under such writes and kept the bytes from before; runs 197
-/// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// 4, both also for reads to plain addresses when they have finished;
+/// 8, the placed textures under a read to a plain address that has
+/// finished are passed to the texture pass (what bit 2 then does with
+/// them), the guards left alone.
+/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (the default until this
+/// one). `0`: nothing, counted only (the default until run 199). `1`: bits
+/// 1 and 2. `slots`: bit 2 alone. `all`: everything.
+/// (Bit 1: in every run 10,000 to 50,000 guarded blocks of host copies lay
+/// under such writes and kept the bytes from before; runs 197 and 198
+/// opened them, 9,766 and 10,796 blocks, with nothing worse for it. Bit 2
+/// makes texture slots due and is the one that flooded the queue in an
+/// earlier form; it now makes due only the slots whose texture was uploaded
+/// before the write (`HostHeap::slots_written_under`), each once per write,
+/// from the host copy it has. Bits 2 and 8 by default after fxceless
+/// e4245f3c, where a texture uploaded before its bytes landed stayed as it
+/// was uploaded, black faces in a cutscene among them; VItoriaBr's preset
+/// counted 7,000 such textures taken again. What it costs is uploads: the
+/// frame line's "writes behind the guards" says how many slots.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("1") => 3,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
-    })
+    *MODE.get_or_init(|| page_writes_of(std::env::var("VICTORY_PAGE_WRITES").ok().as_deref()))
+}
+
+/// [`page_writes`] for what `VICTORY_PAGE_WRITES` holds.
+fn page_writes_of(asked: Option<&str>) -> u8 {
+    match asked.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 3,
+        Some("slots") => 2,
+        Some("guards") => 1,
+        Some("all") => 15,
+        _ => 1 | 2 | 8,
+    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
 /// copies that would otherwise keep the bytes from before); reads to
-/// plain addresses that finished.
-pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// plain addresses that finished; of those, the ones passed to the texture
+/// pass (bit 8 or 4 of [`page_writes`]).
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The bytes of a write the guards do not see are there: title memory
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
@@ -3649,7 +3785,14 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
+        WRITTEN[4].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // (Bit 8 alone: the placed textures under it, not the guards,
+            // which [`writing`] opened before the read began.)
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
@@ -3734,11 +3877,133 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// By address ranges (after DexNom 5f4c3df4): a read pins the addresses it
+/// reads, a change says every address it may take away for its moment (the
+/// whole of each view it unmaps, and what it maps), and the two wait for
+/// each other only where they overlap. Before, any change kept every read
+/// out: a texture's staging waited 846 ms for one in a sample, and with
+/// `VICTORY_TEXTURE_NO_WAIT=1` read every texture through the kernel
+/// instead for as long as any change went on. Who names no range holds
+/// everything, as before. `VICTORY_RANGE_LOCK=0`: everybody holds
+/// everything ([`range_lock`]).
+static MAPPING: MapLock = MapLock::new();
+
+/// Whether reads in place and changes of mapping hold only their own
+/// address ranges (`VICTORY_RANGE_LOCK=0`: all of memory, each of them, as
+/// before; read here).
+fn range_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGE_LOCK").is_none_or(|v| v != "0"))
+}
+
+/// All of memory, as a range to hold.
+const ALL_MEMORY: (usize, usize) = (0, usize::MAX);
+
+/// The ranges under a change of mapping and those being read in place
+/// ([`MAPPING`]).
+struct MapLock {
+    held: Mutex<MapHeld>,
+    moved: Condvar,
+    /// One change at a time.
+    changer: Mutex<()>,
+}
+
+struct MapHeld {
+    /// What the change under way, or the one waiting for its readers, may
+    /// take away: `(start, end)` in order and apart.
+    changing: Vec<(usize, usize)>,
+    /// What is being read in place, one for each [`MapRead`].
+    reading: Vec<(usize, usize)>,
+}
+
+impl MapHeld {
+    fn changes(&self, range: (usize, usize)) -> bool {
+        // The first that ends past its start: the only one that can begin
+        // before its end.
+        let i = self.changing.partition_point(|c| c.1 <= range.0);
+        self.changing.get(i).is_some_and(|c| c.0 < range.1)
+    }
+}
+
+/// A change of mapping under way in a [`MapLock`], until dropped.
+struct MapChange {
+    lock: &'static MapLock,
+    #[allow(dead_code)]
+    alone: std::sync::MutexGuard<'static, ()>,
+}
+
+/// A read in place of a range of a [`MapLock`], until dropped.
+struct MapRead {
+    lock: &'static MapLock,
+    range: (usize, usize),
+}
+
+impl MapLock {
+    const fn new() -> MapLock {
+        MapLock {
+            held: Mutex::new(MapHeld { changing: Vec::new(), reading: Vec::new() }),
+            moved: Condvar::new(),
+            changer: Mutex::new(()),
+        }
+    }
+
+    /// Begins a change of `ranges`: no read of any of them is under way
+    /// when it returns, and none begins until it is dropped. Said before it
+    /// waits for the reads under way, so that reads which keep coming do
+    /// not keep it out.
+    fn change(&'static self, ranges: &[(usize, usize)]) -> MapChange {
+        let alone = self.changer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = ranges.iter().copied().filter(|r| r.0 < r.1).collect();
+        coalesce(&mut ranges);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.changing = ranges;
+        while held.reading.iter().any(|&r| held.changes(r)) {
+            held = self.moved.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(held);
+        MapChange { lock: self, alone }
+    }
+
+    /// Pins `range` for a read in place, when no change of any of it is
+    /// under way or waiting; with `wait` false, `None` instead of waiting.
+    fn read(&'static self, range: (usize, usize), wait: bool) -> Option<MapRead> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.changes(range) {
+            if !wait {
+                return None;
+            }
+            held = self.moved.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.reading.push(range);
+        Some(MapRead { lock: self, range })
+    }
+}
+
+impl Drop for MapChange {
+    fn drop(&mut self) {
+        self.lock.held.lock().unwrap_or_else(|e| e.into_inner()).changing.clear();
+        self.lock.moved.notify_all();
+    }
+}
+
+impl Drop for MapRead {
+    fn drop(&mut self) {
+        let mut held = self.lock.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.reading.iter().position(|&r| r == self.range) {
+            held.reading.swap_remove(i);
+        }
+        let waited_for = held.changes(self.range);
+        drop(held);
+        if waited_for {
+            self.lock.moved.notify_all();
+        }
+    }
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] MapChange);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3867,6 +4132,16 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_ranges(&[ALL_MEMORY])
+}
+
+/// [`title_memory_remapping`] by a runtime that knows what it changes:
+/// `ranges` (start, end) hold every address that may be unmapped, or mapped
+/// and not yet committed, at any moment of the change. That is the whole of
+/// every view the change unmaps, also where it maps the rest of one again,
+/// and everything it maps. Reads in place of other addresses go on
+/// ([`title_memory_reading_range`]).
+pub fn title_memory_remapping_ranges(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3877,32 +4152,47 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let changing = MAPPING.change(if range_lock() { ranges } else { &[ALL_MEMORY] });
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] MapRead);
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(ALL_MEMORY.0, ALL_MEMORY.1)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    title_memory_reading_range_now(ALL_MEMORY.0, ALL_MEMORY.1)
+}
+
+/// [`title_memory_reading`] for a caller that reads `[start, end)` and
+/// nothing else of title memory in place: the runtime changes no mapping
+/// of those addresses until what it returns is dropped; changes elsewhere
+/// neither wait for it nor are waited for.
+pub fn title_memory_reading_range(start: usize, end: usize) -> Reading {
+    let range = if range_lock() { (start, end) } else { ALL_MEMORY };
+    match MAPPING.read(range, true) {
+        Some(read) => Reading(read),
+        None => unreachable!("a read that waits is given"),
     }
+}
+
+/// [`title_memory_reading_range`] if it can be had at once
+/// ([`title_memory_reading_now`]).
+pub fn title_memory_reading_range_now(start: usize, end: usize) -> Option<Reading> {
+    let range = if range_lock() { (start, end) } else { ALL_MEMORY };
+    MAPPING.read(range, false).map(Reading)
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -4209,6 +4499,19 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn what_is_done_with_writes_behind_the_guards() {
+        // Unset: the guards opened, the textures uploaded before made due,
+        // those under plain reads too.
+        assert_eq!(page_writes_of(None), 1 | 2 | 8);
+        assert_eq!(page_writes_of(Some("")), 1 | 2 | 8);
+        assert_eq!(page_writes_of(Some(" guards ")), 1);
+        assert_eq!(page_writes_of(Some("0")), 0);
+        assert_eq!(page_writes_of(Some("1")), 3);
+        assert_eq!(page_writes_of(Some("slots")), 2);
+        assert_eq!(page_writes_of(Some("all")), 15);
+    }
 
     #[test]
     fn ranges_asked_ahead_hold_what_lies_in_one_of_them() {
@@ -4701,6 +5004,57 @@ mod tests {
     /// thread can guard it in between. Told, it is the title's to write: a
     /// block left read-only and forgotten would be an access violation in
     /// title code.
+    #[test]
+    fn ranges_held_together_are_joined() {
+        let mut ranges = vec![(20, 25), (10, 15), (14, 18), (18, 20), (30, 35)];
+        coalesce(&mut ranges);
+        assert_eq!(ranges, [(10, 25), (30, 35)]);
+        let mut none: Vec<(usize, usize)> = Vec::new();
+        coalesce(&mut none);
+        assert!(none.is_empty());
+    }
+
+    /// (After VIctory-DXR 965e0927's `asking_many_does_not_block_disjoint_ranges`.)
+    #[test]
+    fn many_ranges_held_leave_the_others_free() {
+        // Page numbers no memory has: only the holds are tried.
+        const AT: usize = usize::MAX / PAGE - 4096;
+        let hold = || AskingMany::hold(vec![(AT + 100, AT + 120), (AT + 200, AT + 220), (AT + 110, AT + 130), (AT + 7, AT + 7)]);
+        let held = hold();
+        assert_eq!(held.0, [(AT + 100, AT + 130), (AT + 200, AT + 220)]);
+        // Between the two, and beside them: at once.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _between = Asking::hold(AT + 130, AT + 200);
+            let _beside = AskingMany::hold(vec![(AT + 300, AT + 310), (AT + 50, AT + 100)]);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("ranges not held are free");
+        t.join().unwrap();
+        drop(held);
+        // One that overlaps waits until it is let go, whichever way it asks,
+        // and holds nothing while it waits.
+        for many in [false, true] {
+            let held = hold();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t = std::thread::spawn(move || {
+                if many {
+                    let _h = AskingMany::hold(vec![(AT + 400, AT + 410), (AT + 219, AT + 230)]);
+                    tx.send(()).unwrap();
+                } else {
+                    let _h = Asking::hold(AT + 129, AT + 131);
+                    tx.send(()).unwrap();
+                }
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "an overlapping range was held twice");
+            drop(Asking::hold(AT + 400, AT + 410));
+            drop(held);
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("let go, the waiting one holds");
+            t.join().unwrap();
+        }
+        assert!(!ASKING.0.lock().unwrap().iter().any(|r| r.0 >= AT));
+    }
+
     #[test]
     fn a_block_guarded_before_we_were_told_of_its_view_can_be_written() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -5530,6 +5884,67 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// (A lock of the test's own: other tests change the mapping of
+    /// everything meanwhile.)
+    #[test]
+    fn a_change_of_mapping_keeps_out_only_reads_of_what_it_changes() {
+        use super::MapLock;
+        static LOCK: MapLock = MapLock::new();
+        const K: usize = 0x1_0000;
+        // A change of two ranges, given out of order and touching.
+        let changing = LOCK.change(&[(8 * K, 9 * K), (K, 2 * K), (2 * K, 3 * K), (5 * K, 5 * K)]);
+        // Reads elsewhere are had at once, also between and beside them.
+        let started = std::time::Instant::now();
+        let beside = [(0, K), (3 * K, 8 * K), (9 * K, 20 * K), (5 * K, 5 * K + 1)].map(|r| LOCK.read(r, false).expect("not under the change"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(beside);
+        // Reads of what it changes are not, nor a read of everything.
+        for r in [(K, K + 1), (3 * K - 1, 3 * K), (0, 9 * K), (8 * K + 5, 30 * K), (0, usize::MAX)] {
+            assert!(LOCK.read(r, false).is_none(), "{r:x?} read under its change");
+        }
+        // One that waits gets through when the change is done.
+        let (began, wait) = mpsc::channel();
+        let read = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let read = read.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _reading = LOCK.read((2 * K, 2 * K + 1), true);
+                read.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!read.load(Ordering::SeqCst), "a read in place began under a change of its range");
+        drop(changing);
+        reader.join().unwrap();
+        // A read held: a change elsewhere begins at once, one of its range
+        // waits for it, and while that one waits no new read of the range
+        // begins (reads that keep coming would keep the change out).
+        let reading = LOCK.read((4 * K, 5 * K), true).unwrap();
+        drop(LOCK.change(&[(0, 4 * K), (5 * K, 6 * K)]));
+        let changed = Arc::new(AtomicBool::new(false));
+        let (began, wait) = mpsc::channel();
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _changing = LOCK.change(&[(4 * K + 100, 4 * K + 200)]);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!changed.load(Ordering::SeqCst), "the mapping changed under a read in place");
+        assert!(LOCK.read((4 * K + 150, 4 * K + 160), false).is_none());
+        assert!(LOCK.read((6 * K, 7 * K), false).is_some());
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        let held = LOCK.held.lock().unwrap();
+        assert!(held.changing.is_empty() && held.reading.is_empty());
     }
 }
 

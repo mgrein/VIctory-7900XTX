@@ -1507,7 +1507,9 @@ impl Staging {
         let mut mapped = Some(if no_wait() {
             // Not waited for while the staging buffer holds a detiling: it
             // is kept and the texture read at its next refresh (`no_wait`).
-            match crate::watch::title_memory_reading_now() {
+            // (Its own addresses only: a change of mapping elsewhere is
+            // none of this read's business, `title_memory_reading_range`.)
+            match crate::watch::title_memory_reading_range_now(self.memory as usize, self.memory as usize + size) {
                 Some(mapped) => mapped,
                 None if last.defer_remap() => {
                     UNLOCKED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1515,11 +1517,11 @@ impl Staging {
                 }
                 None => {
                     UNLOCKED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    waited(2, crate::watch::title_memory_reading)
+                    waited(2, || crate::watch::title_memory_reading_range(self.memory as usize, self.memory as usize + size))
                 }
             }
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(self.memory as usize, self.memory as usize + size))
         });
         last.deferred = false;
         // Read through the copy, the bytes are ours: the runtime may remap
