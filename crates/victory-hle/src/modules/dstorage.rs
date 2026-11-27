@@ -154,7 +154,9 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() != 0 {
+        walls_files().insert(file as usize, kept);
+    }
     put(out, file)
 }
 
@@ -456,10 +458,21 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
+/// `Release` of a file: its walls trace entry goes with the last reference,
+/// so the map does not grow per open and a reused address names the new file.
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    let address = this as usize;
+    let left = release(this);
+    if left == 0 {
+        walls_files().remove(&address);
+    }
+    left
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -659,9 +672,14 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+/// The files open, by the address of our file object, with their paths
+/// (for the walls trace: a request names its file by that address). Filled
+/// only while the trace is on; a file's entry goes when it is released.
+static WALLS_FILES: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+
+fn walls_files() -> MutexGuard<'static, HashMap<usize, String>> {
+    WALLS_FILES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -672,9 +690,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        walls_files().get(&(request.source as usize)).cloned().unwrap_or_else(|| "?".to_string())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -2550,5 +2566,18 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn releasing_a_file_forgets_its_walls_entry() {
+        let (_dir, file) = file_with(&pattern(64));
+        let address = file as usize;
+        if walls_trace() == 0 {
+            assert!(!walls_files().contains_key(&address), "kept with the trace off");
+        }
+        walls_files().insert(address, "data.bin".into());
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release(file), 0);
+        assert!(!walls_files().contains_key(&address));
     }
 }
