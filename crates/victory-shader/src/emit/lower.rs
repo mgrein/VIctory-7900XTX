@@ -6525,10 +6525,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let at = self.begin_guarded(Some(g));
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        // A subtraction, or an addition of a negated value (which host
+        // compilers turn into one): group-shared memory has no atomic
+        // subtraction in DXIL, and drivers refuse such a pipeline
+        // (E_OUTOFMEMORY from NVIDIA's on an RTX 5060 and from WARP), so it
+        // is a compare-exchange loop (DexNom PR #61, 44c1813, Castyan).
+        let subtract = match rmw {
+            Some(Rmw::Sub) => Some(v0),
+            Some(Rmw::Add) => self.s.m.negated(v0),
+            _ => None,
+        };
+        let r = match (rmw, subtract) {
+            (Some(_), Some(x)) => self.lds_subtract(p, x),
+            (Some(op), None) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
+            (None, _) => self
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
@@ -6538,6 +6549,25 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
+    }
+
+    /// Subtracts `x` from the LDS dword at `p` atomically, with a
+    /// compare-exchange loop; the old value returns (`ds_sub_u32`, see the
+    /// caller).
+    fn lds_subtract(&mut self, p: V, x: V) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        let new = self.s.m.bin(lp, Bin::Sub, old, x);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
     }
 
     /// `ds_max_f32` (`max`) or `ds_min_f32` on the LDS dword at `p` with

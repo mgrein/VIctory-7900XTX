@@ -2332,3 +2332,37 @@ fn lds_byte_writes_keep_the_other_bytes_of_their_dword() {
         assert_eq!(got, 0x1413_1211, "{backend}: got {got:#x}");
     });
 }
+
+/// `ds_sub_u32`, and `ds_add_u32` of a negated value (which host compilers
+/// turn into a subtraction): DXIL has no atomic subtraction on group-shared
+/// memory and drivers refused the pipeline, so both are a compare-exchange
+/// loop. 64 threads each take `v2` from (or, subtracting `0 - v2`, add it
+/// to) LDS[0], which starts as `v1`.
+#[test]
+fn lds_subtraction_is_atomic_across_waves() {
+    const DS_ADD_U32: u8 = 0x00;
+    const DS_SUB_U32: u8 = 0x01;
+    for (op, negate, want, name) in [
+        (DS_ADD_U32, true, 100 - 64 * 3, "ds_add_u32 of 0 - x"),
+        (DS_SUB_U32, false, 100 - 64 * 3, "ds_sub_u32 of x"),
+        (DS_SUB_U32, true, 100 + 64 * 3, "ds_sub_u32 of 0 - x"),
+        (DS_ADD_U32, false, 100 + 64 * 3, "ds_add_u32 of x"),
+    ] {
+        let mut body = vec![vop1(0x001, 5, 0x80)];
+        body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+        body.push(S_BARRIER);
+        let data = if negate {
+            body.push(vop2(0x26, 6, 0x80, 2)); // v_sub_nc_u32 v6, 0, v2
+            6
+        } else {
+            2
+        };
+        body.extend(ds(op, 0, 5, data));
+        body.push(S_BARRIER);
+        body.extend(ds(DS_READ_B32, 0, 5, 0));
+        let shader = build_cs(&body, 64, 512);
+        run_cases(&shader, &[[100, 3, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got as i32, want, "{backend}: {name} over 64 threads");
+        });
+    }
+}
