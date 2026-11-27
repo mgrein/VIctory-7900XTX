@@ -31,6 +31,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(these) = these {
         return make(&dir, &these);
     }
+    let _only = only_one(&dir)?;
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
@@ -111,6 +112,32 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.iter().sum::<f64>() / 1e3
     );
     Ok(())
+}
+
+/// The lock file one `victory warm` holds while it runs: a second one started
+/// meanwhile (in another console, or by a script) would make the same
+/// pipelines again, in as many more processes, and add the same lines to
+/// `warm-done.txt`. Windows lets the lock go when the process ends, however
+/// it ends. The workers (`--these`) do not take it.
+const LOCK_FILE: &str = "warm.lock";
+
+fn only_one(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("another victory warm is running on {} (it holds {LOCK_FILE})", dir.display())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("could not lock {}", path.display())),
+    }
 }
 
 fn run_batches(
@@ -261,6 +288,19 @@ mod tests {
             .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()?)
+    }
+
+    /// One warm at a time over a folder: the second is refused while the first
+    /// holds the lock, and goes once it is let go.
+    #[test]
+    fn a_second_warm_on_the_same_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("victory-warm-lock-{}", std::process::id()));
+        let first = only_one(&dir).unwrap();
+        let refused = only_one(&dir).unwrap_err().to_string();
+        assert!(refused.contains("another victory warm"), "{refused}");
+        drop(first);
+        drop(only_one(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -411,6 +411,37 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// The lane bounds (minimum, maximum; 0 for any) in the pipeline
+/// validation data of the translated shader `dxil`: valid DXIL can still
+/// ask for a wave wider than the device runs, which the device refuses.
+fn wave_lanes(dxil: &[u8]) -> Option<[u32; 2]> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    // PSVRuntimeInfo0: a 16-byte stage union, then the wave lane counts.
+    let info = psv.get(4..)?.get(..size)?;
+    Some([
+        u32::from_le_bytes(info.get(16..20)?.try_into().ok()?),
+        u32::from_le_bytes(info.get(20..24)?.try_into().ok()?),
+    ])
+}
+
+/// Logs the translated stage of a refused pipeline: the content hash of
+/// its DXIL (the shader cache keeps translations under a build-dependent
+/// key; this finds them in a saved cache without capturing the originals)
+/// and the wave lanes it asks for.
+fn log_refused_stage(shader: &Shader) {
+    if let Some(t) = shader.translated() {
+        let dxil = &t.host.dxil;
+        tracing::warn!(
+            ?shader,
+            host_dxil = %blake3::hash(dxil),
+            wave_lanes = ?wave_lanes(dxil),
+            "translated stage of a refused pipeline"
+        );
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -629,6 +660,9 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    for (shader, _) in &stages {
+                        log_refused_stage(shader);
+                    }
                     host.log_messages();
                     return None;
                 }
@@ -681,7 +715,10 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, %state, "host mesh pipeline refused");
+                    for (shader, _) in &stages {
+                        log_refused_stage(shader);
+                    }
                     host.log_messages();
                     return None;
                 }
@@ -787,7 +824,10 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, %state, "host pipeline refused");
+                for (shader, _) in &stages {
+                    log_refused_stage(shader);
+                }
                 host.log_messages();
                 return None;
             }
@@ -1115,6 +1155,81 @@ mod tests {
         D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// The wave lane counts are read from the PSV0 part's runtime info.
+    #[test]
+    fn wave_lanes_come_from_the_validation_data() {
+        // A container of one part (the digest left zero: not looked at here).
+        fn container(psv: &[u8]) -> Vec<u8> {
+            let mut out = b"DXBC".to_vec();
+            out.resize(20, 0);
+            for v in [1u32, 36 + 8 + psv.len() as u32, 1, 36] {
+                out.extend(v.to_le_bytes());
+            }
+            out.extend(b"PSV0");
+            out.extend((psv.len() as u32).to_le_bytes());
+            out.extend(psv);
+            out
+        }
+        let mut psv = 24u32.to_le_bytes().to_vec();
+        psv.extend_from_slice(&[0; 16]);
+        psv.extend_from_slice(&64u32.to_le_bytes());
+        psv.extend_from_slice(&64u32.to_le_bytes());
+        let dxil = container(&psv);
+        assert_eq!(wave_lanes(&dxil), Some([64, 64]));
+        // A runtime info shorter than the lane counts: none.
+        psv[..4].copy_from_slice(&16u32.to_le_bytes());
+        let dxil = container(&psv);
+        assert_eq!(wave_lanes(&dxil), None);
+        assert_eq!(wave_lanes(b"not a container"), None);
+    }
+
+    /// A fixed wave size is enforced when the pipeline is created: on a
+    /// device whose waves have 32 lanes, the same empty compute shader is
+    /// made with `WaveSize(32)` and refused with `WaveSize(64)`.
+    #[test]
+    fn compute_pipeline_enforces_the_devices_wave_width() {
+        let (Some(host), Some(dxc)) = (host(), dxc()) else { return };
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+        // SAFETY: each structure and size match the requested feature.
+        let available = unsafe {
+            host.device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut caps).cast(), size_of_val(&caps) as u32)
+                .is_ok()
+                && host
+                    .device
+                    .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+                    .is_ok()
+        };
+        if !available
+            || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+            || !caps.WaveOps.as_bool()
+            || caps.WaveLaneCountMax != 32
+        {
+            return;
+        }
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for width in [32, 64] {
+            let src = format!("[WaveSize({width})] [numthreads(64,1,1)] void main() {{}}");
+            let dxil = compile(&dxc, dir.path(), &src, "cs_6_6");
+            assert_eq!(wave_lanes(&dxil), Some([width, width]));
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: the description borrows the live root signature.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: code(&dxil),
+                ..Default::default()
+            };
+            // SAFETY: the root signature and shader live through creation.
+            let made = unsafe { host.device.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            if width == 32 {
+                made.unwrap();
+            } else {
+                assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+            }
         }
     }
 
