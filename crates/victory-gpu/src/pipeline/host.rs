@@ -33,6 +33,32 @@ pub(crate) struct GraphicsState {
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     pub(super) depth_format: DXGI_FORMAT,
     pub(super) samples: DXGI_SAMPLE_DESC,
+    /// The depth bias as the title's stream has it, and whether the stream's
+    /// depth format is one of the console's 16-bit ones: `rasterizer` holds
+    /// the host's bias ([`host_depth_bias`]). Only while a stream is read.
+    title_bias: i32,
+    depth16: bool,
+}
+
+/// Whether the depth bias of a pipeline that draws to the console's 16-bit
+/// depth with stencil is given in the host's steps ([`host_depth_bias`]).
+/// On by default; `VICTORY_DEPTH16_BIAS=0`: the title's number unchanged, as
+/// before.
+fn depth16_bias() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH16_BIAS").is_none_or(|v| v != "0"))
+}
+
+/// The host's depth bias for the title's `bias`. A bias counts in the
+/// smallest steps of the depth format drawn to ("bias = DepthBias * r",
+/// where r is 2^-n for a format of n bits of depth: the D3D12 depth bias
+/// rules), and the console's 16-bit depth with stencil is a 24-bit one on
+/// the host (`crate::resource::pc_format`): the same number moved the depth
+/// by 1/256 of what the title asked for, too little to keep a surface clear
+/// of the one it lies on (shadow and mask buffers). 256 host steps are one
+/// of the title's. (The idea of XCL PR #2858; nothing of it is copied.)
+fn host_depth_bias(bias: i32, depth16: bool) -> i32 {
+    if depth16 { bias.saturating_mul(256) } else { bias }
 }
 
 impl Default for GraphicsState {
@@ -87,6 +113,8 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            title_bias: 0,
+            depth16: false,
         }
     }
 }
@@ -174,7 +202,12 @@ impl GraphicsState {
             match kind {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
-                10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
+                10 => {
+                    self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned();
+                    // (The depth format may come before or after.)
+                    self.title_bias = self.rasterizer.DepthBias;
+                    self.rasterizer.DepthBias = host_depth_bias(self.title_bias, self.depth16);
+                }
                 11 => {
                     self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
                     self.depth_bounds = false;
@@ -237,6 +270,8 @@ impl GraphicsState {
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
+                    self.depth16 = (118..=120).contains(&f) && depth16_bias();
+                    self.rasterizer.DepthBias = host_depth_bias(self.title_bias, self.depth16);
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
                 _ => {}
@@ -1511,6 +1546,46 @@ mod tests {
             element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
         ];
         assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    /// A stream's subobject as `GraphicsState::read` takes it: the type,
+    /// then the data at +4.
+    fn subobject<T: Copy>(kind: u32, data: T) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4 + size_of::<T>()];
+        bytes[..4].copy_from_slice(&kind.to_le_bytes());
+        // SAFETY: room for one `T` after the type.
+        unsafe { bytes.as_mut_ptr().add(4).cast::<T>().write_unaligned(data) };
+        bytes
+    }
+
+    /// The bias of a pipeline that draws to the console's 16-bit depth is
+    /// in the host's 24-bit steps, whichever of the two the stream has first.
+    #[test]
+    fn depth_bias_counts_in_the_host_formats_steps() {
+        if !depth16_bias() {
+            return; // switched off by the environment
+        }
+        let rasterizer = D3D12_RASTERIZER_DESC { DepthBias: -3, SlopeScaledDepthBias: 1.5, ..Default::default() };
+        let bias_of = |format: u32, format_first: bool| {
+            let mut g = GraphicsState::default();
+            let parts = [subobject(10, rasterizer), subobject(16, format)];
+            let order = if format_first { [1, 0] } else { [0, 1] };
+            for i in order {
+                // SAFETY: whole subobjects of their types.
+                unsafe { g.read(u32::from_le_bytes(parts[i][..4].try_into().unwrap()), parts[i].as_ptr()) };
+            }
+            assert_eq!(g.rasterizer.SlopeScaledDepthBias, 1.5);
+            (g.rasterizer.DepthBias, g.depth_format)
+        };
+        for first in [false, true] {
+            assert_eq!(bias_of(118, first), (-768, DXGI_FORMAT_D24_UNORM_S8_UINT));
+            // The host's own formats keep the title's number.
+            assert_eq!(bias_of(45, first), (-3, DXGI_FORMAT_D24_UNORM_S8_UINT));
+            assert_eq!(bias_of(40, first), (-3, DXGI_FORMAT_D32_FLOAT));
+            assert_eq!(bias_of(55, first), (-3, DXGI_FORMAT_D16_UNORM));
+        }
+        assert_eq!(host_depth_bias(i32::MAX, true), i32::MAX);
+        assert_eq!(host_depth_bias(i32::MIN / 2, true), i32::MIN);
     }
 
     /// An explicit offset near 4 GiB overflowed the next appended offset
