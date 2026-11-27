@@ -166,6 +166,31 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .collect()
 }
 
+/// The waterfall's sample turned into `image_get_resinfo` (x and y, d16,
+/// the level in v0: the lane's index, the result in v12, which the program
+/// stores per lane): lane 0 (the first texture, 2x1, one level) reads both
+/// sizes packed in one register, the other lanes ask past the last level
+/// and read 0. From stellarr-studio/kelvaroq patch 0049.
+#[test]
+fn resinfo_packs_d16_sizes_and_zeros_missing_levels() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let set_off = |key| std::env::var_os(key).is_some_and(|v| v == "0");
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    let query = words.iter().position(|&w| w == 0xF09C_0F08).unwrap();
+    words[query] = 0xF038_0308;
+    words[query + 1] = 0x8003_0C00;
+    let shader = build(&words, false);
+    let pixels = [[0.; 4]; 2];
+    let views = [View::Texture(2, 1, &pixels), View::Texture(1, 2, &pixels), View::RawUav(32)];
+    for (device, sizes) in run(&shader, &views) {
+        let level_zero = if set_off("VICTORY_RESINFO_D16") { 2 } else { 0x0001_0002 };
+        assert_eq!(sizes[0], level_zero, "{device}");
+        if !set_off("VICTORY_RESINFO_MIP_BOUNDS") {
+            assert!(sizes[1..].iter().all(|&word| word == 0), "{device}: {sizes:x?}");
+        }
+    }
+}
+
 /// The waterfall's sample turned into `image_get_resinfo` of a
 /// multisampled view (MIMG dimensions 6 and 7): it translates and validates
 /// instead of refusing the program. Translated only: no multisampled texture

@@ -1688,6 +1688,40 @@ pub(super) fn resinfo_sizes(
     [sizes[0], sizes[1], sizes[2], levels]
 }
 
+/// `VICTORY_RESINFO_D16=0`: a d16 image size query writes one register per
+/// size asked for, as before, past the registers the instruction has.
+/// Otherwise the sizes are packed as the console packs them, two 16-bit
+/// halves per register, low half first.
+fn resinfo_d16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_D16").is_none_or(|v| v != "0"))
+}
+
+/// `components` (integers) packed two per dword, low half first: a d16 image
+/// size query's registers ([`resinfo_d16_on`]). An odd last one leaves its
+/// upper half 0.
+pub(super) fn packed_resinfo(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    components: &[V],
+) -> Vec<V> {
+    let mask = m.i32(0xFFFF);
+    let shift = m.i32(16);
+    components
+        .chunks(2)
+        .map(|pair| {
+            let low = m.bin(block, Bin::And, pair[0], mask);
+            match pair.get(1) {
+                Some(&high) => {
+                    let high = m.bin(block, Bin::Shl, high, shift);
+                    m.bin(block, Bin::Or, low, high)
+                }
+                None => low,
+            }
+        })
+        .collect()
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -12740,8 +12774,13 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
-            for (k, ch) in (0..4usize).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), sizes[ch], guard);
+            let mut channels: Vec<V> =
+                (0..4usize).filter(|ch| dmask >> ch & 1 != 0).map(|ch| sizes[ch]).collect();
+            if *d16 && resinfo_d16_on() {
+                channels = packed_resinfo(&mut self.s.m, c, &channels);
+            }
+            for (k, x) in channels.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }

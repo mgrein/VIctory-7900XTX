@@ -1449,6 +1449,22 @@ mod tests {
         }
     }
 
+    /// A d16 image size query's sizes, two to a register, low half first
+    /// ([`crate::emit::lower::packed_resinfo`]). From stellarr-studio/kelvaroq
+    /// patch 0049.
+    #[test]
+    fn d16_resinfo_packs_three_sizes_into_two_registers() {
+        let Kit { mut m, b, writes, .. } = kit();
+        let components = [0x12345, 0xabcd, 0x10002].map(|v| m.i32(v));
+        let words = crate::emit::lower::packed_resinfo(&mut m, b, &components);
+        assert_eq!(words.len(), 2);
+        m.call(b, writes, words);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+        let expected = vec![m.i32(0xabcd_2345), m.i32(2)];
+        assert_eq!(stores(&m, b), [expected]);
+    }
+
     #[test]
     fn float_arithmetic_is_not_folded() {
         let Kit {
