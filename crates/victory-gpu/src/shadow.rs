@@ -1242,6 +1242,26 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 }
 
 #[cfg(test)]
+mod copy_wide_tests {
+    /// A copy big enough for several threads, of a length that is not a
+    /// multiple of the parts: every byte arrives, and nothing past the end
+    /// is written; twice, the second on threads already there.
+    #[test]
+    fn a_big_copy_on_the_kept_threads_copies_every_byte() {
+        const LEN: usize = (80 << 20) + 12345;
+        let src: Vec<u8> = (0..LEN).map(|i| (i ^ (i >> 11) ^ (i >> 19)) as u8).collect();
+        let mut dst = vec![0u8; LEN + 64];
+        for _ in 0..2 {
+            dst.fill(0x5a);
+            // SAFETY: both hold `LEN` bytes and are apart.
+            unsafe { super::copy_wide(src.as_ptr(), dst.as_mut_ptr(), LEN) };
+            assert!(dst[..LEN] == src[..]);
+            assert!(dst[LEN..].iter().all(|&b| b == 0x5a));
+        }
+    }
+}
+
+#[cfg(test)]
 mod merge_piece_tests {
     use super::{merge_piece, merge_piece_bytes, merge_piece_words};
 
@@ -1759,6 +1779,60 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
+    // The parts are offered to the threads kept for [`wide`] and taken by
+    // this one too, which returns when every part is copied
+    // (`VICTORY_KEPT_HELPERS=0`: on threads made for this copy and joined,
+    // as before). Making and joining up to six threads for each big
+    // snapshot was 1.2 to 9.4 % of a submitting thread in Belobug's profiles
+    // (PRs #253 ySKELLETONX, #178, #139, #127). This thread waits only for
+    // parts a kept thread has taken, which is a copy under way: a kept
+    // thread busy with other work (which may want a lock this one holds)
+    // is not waited for, and this thread runs nobody else's work.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEPT.get_or_init(|| std::env::var_os("VICTORY_KEPT_HELPERS").is_none_or(|v| v != "0")) {
+        struct Offer {
+            next: std::sync::atomic::AtomicUsize,
+            done: Mutex<usize>,
+            all: std::sync::Condvar,
+        }
+        let offer = Arc::new(Offer { next: Default::default(), done: Mutex::new(0), all: std::sync::Condvar::new() });
+        // Takes parts until none is left. A helper that comes after the
+        // last part was taken touches nothing of the caller's.
+        let take = move |offer: &Offer| {
+            loop {
+                let i = offer.next.fetch_add(1, Ordering::AcqRel);
+                if i >= threads {
+                    return;
+                }
+                let at = (i * each).min(len);
+                let n = each.min(len - at);
+                // SAFETY: a part of the caller's ranges, which are valid
+                // until every part taken is counted done.
+                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                let mut done = offer.done.lock().unwrap_or_else(|e| e.into_inner());
+                *done += 1;
+                if *done == threads {
+                    offer.all.notify_all();
+                }
+            }
+        };
+        let workers = workers();
+        {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            for _ in 1..threads {
+                let offer = offer.clone();
+                workers.there.fetch_add(1, Ordering::AcqRel);
+                queue.push_back(Box::new(move || take(&offer)));
+            }
+        }
+        workers.more.notify_all();
+        take(&offer);
+        let mut done = offer.done.lock().unwrap_or_else(|e| e.into_inner());
+        while *done < threads {
+            done = offer.all.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        return;
+    }
     std::thread::scope(|s| {
         for i in 0..threads {
             let at = (i * each).min(len);
