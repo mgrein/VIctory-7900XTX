@@ -48,6 +48,13 @@ const MAX_UPGRADES_PER_SUB: usize = 8;
 const MAX_UPGRADE_BATCH_BYTES: u64 = 16 << 20;
 /// Maximum queued static upgrades awaiting GPU build (prevents unbounded RAM growth).
 const MAX_PENDING_UPGRADES: usize = 256;
+/// Maximum static BLAS compactions drained per submission.
+const MAX_COMPACTIONS_PER_SUB: usize = 16;
+/// Maximum queued static BLAS compactions awaiting GPU copy.
+const MAX_PENDING_COMPACTIONS: usize = 8192;
+/// Maximum 8-byte compacted-size postbuild queries recorded per submission (8192 × 8B = 64 KiB).
+const COMPACT_INFO_SLOTS: usize = 8192;
+const COMPACT_INFO_BYTES: u64 = (COMPACT_INFO_SLOTS * 8) as u64;
 /// Pooled per-submission auxiliary buffers larger than this are dropped on fence completion.
 const MAX_POOLED_AUX_BYTES: u64 = 4 << 20;
 /// Pooled per-submission scratch buffers larger than this are dropped on fence completion.
@@ -108,6 +115,37 @@ fn no_dup_opaque() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_NATIVE_RT_NO_DUP_OPAQUE").is_some_and(|v| v == "1")
     })
+}
+
+/// Whether static BLAS builds set `ALLOW_COMPACTION`, query postbuild compacted sizes,
+/// and asynchronously compact into smaller slab slices (`VICTORY_NATIVE_RT_COMPACT=0` disables).
+fn compact_static_blas() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_COMPACT").is_none_or(|v| v != "0")
+    })
+}
+
+fn static_blas_build_flags() -> D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS {
+    if compact_static_blas() {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+    } else {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+    }
+}
+
+/// Returns `true` when compacting a static BLAS from `uncompacted_size` to
+/// `compacted_size` (rounded up to 256B `AS_ALIGN`) saves meaningful slab VRAM.
+fn should_compact(uncompacted_size: u64, compacted_size: u64) -> bool {
+    if compacted_size == 0 {
+        return false;
+    }
+    let aligned = compacted_size.max(AS_ALIGN).next_multiple_of(AS_ALIGN);
+    let Some(saved) = uncompacted_size.checked_sub(aligned) else {
+        return false;
+    };
+    saved > 4096 && (saved.saturating_mul(10) >= uncompacted_size || saved >= 64 * 1024)
 }
 
 fn static_geom_flags(opaque: bool) -> D3D12_RAYTRACING_GEOMETRY_FLAGS {
@@ -629,6 +667,13 @@ struct StaticReadbackRecord {
     len: u64,
 }
 
+struct CompactQueryRecord {
+    guest_key: u64,
+    generation: u64,
+    uncompacted_size: u64,
+    slot: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpgradedGeom {
     vert_offset: u32,
@@ -661,6 +706,10 @@ pub(crate) struct DxrSubmission {
     /// Pooled upload + default vertex buffers for draining `pending_static_upgrades`.
     upgrade_upload: Option<(ID3D12Resource, usize, u64)>,
     upgrade_verts: Option<(ID3D12Resource, u64)>,
+    /// Pooled 64 KiB `DEFAULT` UAV and `READBACK` buffers for 8-byte compacted-size queries.
+    compact_info_uav: Option<(ID3D12Resource, u64)>,
+    compact_info_rb: Option<(ID3D12Resource, u64)>,
+    compact_queries: Vec<CompactQueryRecord>,
     kept: Vec<ID3D12Resource>,
     /// Keeps full `Shadow` objects (including any backing `ID3D12Heap` for placed
     /// in-place buffers) alive until this submission's GPU fence completes.
@@ -689,6 +738,9 @@ impl DxrSubmission {
             readbacks: Vec::new(),
             upgrade_upload: None,
             upgrade_verts: None,
+            compact_info_uav: None,
+            compact_info_rb: None,
+            compact_queries: Vec::new(),
             kept: Vec::new(),
             kept_shadows: Vec::new(),
             sub_seq: 0,
@@ -821,6 +873,24 @@ impl DxrSubmission {
         let gpu = unsafe { buf.GetGPUVirtualAddress() };
         Some((buf.clone(), gpu))
     }
+
+    fn ensure_compact_info(&mut self, host: &Host) -> Option<(ID3D12Resource, u64, ID3D12Resource)> {
+        if self.compact_info_uav.is_none() {
+            let buf = host.uav_buffer(COMPACT_INFO_BYTES)?;
+            name(&buf, || "victory dxr compact info uav".into());
+            self.compact_info_uav = Some((buf, COMPACT_INFO_BYTES));
+        }
+        if self.compact_info_rb.is_none() {
+            let buf = host.read_back_buffer(COMPACT_INFO_BYTES)?;
+            name(&buf, || "victory dxr compact info readback".into());
+            self.compact_info_rb = Some((buf, COMPACT_INFO_BYTES));
+        }
+        let (uav, _) = self.compact_info_uav.as_ref()?;
+        let (rb, _) = self.compact_info_rb.as_ref()?;
+        // SAFETY: live UAV buffer.
+        let uav_gpu = unsafe { uav.GetGPUVirtualAddress() };
+        Some((uav.clone(), uav_gpu, rb.clone()))
+    }
 }
 
 /// Tracks modified slots in `DxrState::blas_table` so `record_build_tlas` copies only
@@ -939,6 +1009,8 @@ struct DxrState {
     pending_empty_tlas: Vec<u64>,
     /// Decoded multi-geometry static BLAS upgrades waiting for GPU build on the next submission.
     pending_static_upgrades: VecDeque<PendingStaticUpgrade>,
+    /// Static BLASes `(guest_key, generation, compacted_size)` awaiting async compaction copy.
+    pending_compactions: VecDeque<(u64, u64, u64)>,
     /// Pooled command lists and reusable submission containers returned after GPU completion.
     free_lists: Vec<Prelude>,
     free_submissions: Vec<DxrSubmission>,
@@ -963,6 +1035,7 @@ impl DxrState {
             prebuild_cache: HashMap::new(),
             pending_empty_tlas: Vec::new(),
             pending_static_upgrades: VecDeque::new(),
+            pending_compactions: VecDeque::new(),
             free_lists: Vec::new(),
             free_submissions: Vec::new(),
         }
@@ -1073,8 +1146,8 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<DxrState>> {
     guard
 }
 
-/// Diagnostic counters: `[dynamic_blas, static_blas, upgraded_static, tlas, copies, skipped, tlas_srvs, upg_geoms, upg_non_opaque]`.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Diagnostic counters: `[dynamic_blas, static_blas, upgraded_static, tlas, copies, skipped, tlas_srvs, upg_geoms, upg_non_opaque, compacted]`.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const STAT_DYNAMIC_BLAS: usize = 0;
 const STAT_STATIC_BLAS: usize = 1;
 const STAT_UPGRADED_STATIC: usize = 2;
@@ -1084,14 +1157,15 @@ const STAT_SKIPPED: usize = 5;
 const STAT_TLAS_SRVS: usize = 6;
 const STAT_UPG_GEOMS: usize = 7;
 const STAT_UPG_NON_OPAQUE: usize = 8;
+const STAT_COMPACTED: usize = 9;
 
 /// Logs native DXR statistics periodically alongside the host frame-rate line.
 pub(crate) fn log_stats(frames: f64) {
     if !enabled() || frames <= 0.0 {
         return;
     }
-    let [dyn_blas, stat_blas, upgraded, tlas, copies, skipped, srvs, upg_geoms, upg_non_opaque] =
-        [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let [dyn_blas, stat_blas, upgraded, tlas, copies, skipped, srvs, upg_geoms, upg_non_opaque, compacted] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|i| STATS[i].swap(0, Ordering::Relaxed));
     let total_as = as_map().read().unwrap_or_else(|e| e.into_inner()).len();
     let (patched, missing, nulls, slab_total, slab_free) = {
         let guard = DXR_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1115,11 +1189,12 @@ pub(crate) fn log_stats(frames: f64) {
         (p, m, n, slab_total, slab_free)
     };
     tracing::info!(
-        "native DXR per frame: dyn_blas={:.1} static_blas={:.1} upgraded_static={:.1} tlas={:.1} copies={:.1} skipped={:.1} tlas_srvs={:.1} \
+        "native DXR per frame: dyn_blas={:.1} static_blas={:.1} upgraded_static={:.1} compacted={:.1} tlas={:.1} copies={:.1} skipped={:.1} tlas_srvs={:.1} \
          (instances patched={:.0} missing_blas={:.0} null_blas={:.0}; resident_as={total_as}; slab_mb={:.1} slab_free_mb={:.1}; upg_geoms={upg_geoms} non_opaque={upg_non_opaque})",
         dyn_blas as f64 / frames,
         stat_blas as f64 / frames,
         upgraded as f64 / frames,
+        compacted as f64 / frames,
         tlas as f64 / frames,
         copies as f64 / frames,
         skipped as f64 / frames,
@@ -1220,7 +1295,11 @@ fn has_pending_work() -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|s| !s.pending_empty_tlas.is_empty() || !s.pending_static_upgrades.is_empty())
+        .is_some_and(|s| {
+            !s.pending_empty_tlas.is_empty()
+                || !s.pending_static_upgrades.is_empty()
+                || !s.pending_compactions.is_empty()
+        })
 }
 
 // ============================================================================
@@ -2025,6 +2104,13 @@ pub(crate) fn record_submission(
             new_lists.push(Some(upg_list));
         }
 
+        if i == 0
+            && !state.pending_compactions.is_empty()
+            && let Some(cmp_list) = record_static_compactions(host, state, &mut sub)
+        {
+            new_lists.push(Some(cmp_list));
+        }
+
         let ops = run_ops.get(i).map(Vec::as_slice).unwrap_or(&[]);
         if ops.is_empty() || old_start >= old_end {
             new_lists.extend(lists[old_start..old_end].iter().cloned());
@@ -2044,6 +2130,7 @@ pub(crate) fn record_submission(
         sub.readbacks.clear();
         sub.readback_used = 0;
         sub.readback_cap = 0;
+        sub.compact_queries.clear();
         sub.kept.clear();
         sub.kept_shadows.clear();
         sub.sub_seq = 0;
@@ -2127,10 +2214,66 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
     let readback_used = sub.readback_used;
     sub.readback_used = 0;
     sub.readback_cap = 0;
+    let compact_queries = std::mem::take(&mut sub.compact_queries);
     let completed_sub_seq = sub.sub_seq;
     let completed_tlas_epoch = sub.tlas_epoch;
     sub.sub_seq = 0;
     sub.tlas_epoch = 0;
+
+    let mut new_compactions: Vec<(u64, u64, u64)> = Vec::new();
+    if !compact_queries.is_empty()
+        && let Some((rb_buf, rb_size)) = sub.compact_info_rb.as_ref()
+    {
+        let max_slots = compact_queries
+            .iter()
+            .map(|q| u64::from(q.slot) + 1)
+            .max()
+            .unwrap_or(0);
+        let map_end = (max_slots.saturating_mul(8).min(*rb_size)) as usize;
+        if map_end >= 8 {
+            let mut ptr = std::ptr::null_mut();
+            let read_range = D3D12_RANGE { Begin: 0, End: map_end };
+            // SAFETY: submission GPU fence has completed; readback buffer is idle.
+            let mapped = unsafe { rb_buf.Map(0, Some(&read_range), Some(&mut ptr)) };
+            if mapped.is_ok() && !ptr.is_null() {
+                // SAFETY: `ptr` is valid for `map_end` bytes until `Unmap`.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), map_end) };
+                let sizes: Vec<u64> = compact_queries
+                    .iter()
+                    .map(|q| {
+                        let off = (q.slot as usize).saturating_mul(8);
+                        if off + 8 <= bytes.len() {
+                            u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                let written_none = D3D12_RANGE { Begin: 0, End: 0 };
+                // SAFETY: matches successful `Map(0, ...)`.
+                unsafe { rb_buf.Unmap(0, Some(&written_none)) };
+
+                const ALLOW_COMPACTION: u32 =
+                    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
+                let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+                for (q, compacted_size) in compact_queries.into_iter().zip(sizes) {
+                    if !should_compact(q.uncompacted_size, compacted_size) {
+                        continue;
+                    }
+                    let live = map.get(&q.guest_key).is_some_and(|e| {
+                        e.kind == AsKind::Blas
+                            && e.built
+                            && e.generation == q.generation
+                            && (e.flags & ALLOW_COMPACTION) != 0
+                            && should_compact(e.slice.size, compacted_size)
+                    });
+                    if live {
+                        new_compactions.push((q.guest_key, q.generation, compacted_size));
+                    }
+                }
+            }
+        }
+    }
 
     if !readbacks.is_empty()
         && let Some((rb_buf, rb_size)) = sub.node_readback.as_ref()
@@ -2194,6 +2337,11 @@ pub(crate) fn finish_submission(mut sub: DxrSubmission) {
     state
         .slabs
         .drain_retired(state.completed_tlas_epoch, state.completed_sub_seq);
+    for item in new_compactions {
+        if state.pending_compactions.len() < MAX_PENDING_COMPACTIONS {
+            state.pending_compactions.push_back(item);
+        }
+    }
     for prelude in sub.lists.drain(..) {
         if state.free_lists.len() < MAX_FREE_LISTS {
             state.free_lists.push(prelude);
@@ -2246,7 +2394,7 @@ fn record_static_upgrades(
     let (upload_buf, upload_ptr) = sub.ensure_upgrade_upload(host, batch_bytes)?;
     let (verts_buf, verts_gpu) = sub.ensure_upgrade_verts(host, batch_bytes)?;
 
-    let build_flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    let build_flags = static_blas_build_flags();
     struct PreparedUpgrade {
         guest_key: u64,
         host_geoms: Vec<D3D12_RAYTRACING_GEOMETRY_DESC>,
@@ -2320,7 +2468,7 @@ fn record_static_upgrades(
 
     // Allocate fresh slab slices and swap into `AS_MAP` in one batched write lock,
     // deferring reclamation of replaced Frame-0 slices until 2 TLAS epochs complete.
-    let mut built_items: Vec<(usize, u64, u64)> = Vec::with_capacity(prepared.len());
+    let mut built_items: Vec<(usize, u64, u64, u64, u64)> = Vec::with_capacity(prepared.len());
     {
         let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
         for (idx, item) in prepared.iter().enumerate() {
@@ -2331,6 +2479,7 @@ fn record_static_upgrades(
                 continue;
             };
             let generation = state.bump_gen();
+            let slice_size = slice.size;
             let entry = HostAs {
                 buffer,
                 slice,
@@ -2346,7 +2495,7 @@ fn record_static_upgrades(
             if let Some(old) = map.insert(item.guest_key, entry) {
                 state.retire_as(&old);
             }
-            built_items.push((idx, item.guest_key, gpu_va));
+            built_items.push((idx, item.guest_key, gpu_va, generation, slice_size));
         }
     }
     if built_items.is_empty() {
@@ -2354,11 +2503,19 @@ fn record_static_upgrades(
     }
 
     let (_, scratch_gpu) = sub.ensure_scratch(host, max_scratch)?;
+    let compact_info = if compact_static_blas() && sub.compact_queries.len() < COMPACT_INFO_SLOTS {
+        sub.ensure_compact_info(host)
+    } else {
+        None
+    };
     let (allocator, list) = state.take_list(host)?;
     name(&list, || "victory dxr static upgrade".into());
     let list4: ID3D12GraphicsCommandList4 = list.cast().ok()?;
 
-    // SAFETY: idle allocator/list; upload, vertex, scratch, and slab buffers live through submission.
+    let mut new_queries: Vec<CompactQueryRecord> = Vec::new();
+    let first_slot = sub.compact_queries.len();
+
+    // SAFETY: idle allocator/list; upload, vertex, scratch, compact info, and slab buffers live through submission.
     let recorded: windows::core::Result<()> = unsafe {
         (|| {
             allocator.Reset()?;
@@ -2370,7 +2527,14 @@ fn record_static_upgrades(
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )]);
-            for &(idx, _, gpu_va) in &built_items {
+            if let Some((uav_buf, _, _)) = &compact_info {
+                list.ResourceBarrier(&[transition(
+                    uav_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            for &(idx, guest_key, gpu_va, generation, slice_size) in &built_items {
                 let item = &prepared[idx];
                 let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
                     Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
@@ -2387,8 +2551,51 @@ fn record_static_upgrades(
                     SourceAccelerationStructureData: 0,
                     ScratchAccelerationStructureData: scratch_gpu,
                 };
-                list4.BuildRaytracingAccelerationStructure(&desc, None);
+                let postbuild = if let Some((_, uav_gpu, _)) = &compact_info
+                    && first_slot + new_queries.len() < COMPACT_INFO_SLOTS
+                {
+                    let slot = (first_slot + new_queries.len()) as u32;
+                    new_queries.push(CompactQueryRecord {
+                        guest_key,
+                        generation,
+                        uncompacted_size: slice_size,
+                        slot,
+                    });
+                    Some([D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                        DestBuffer: uav_gpu + u64::from(slot) * 8,
+                        InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+                    }])
+                } else {
+                    None
+                };
+                list4.BuildRaytracingAccelerationStructure(
+                    &desc,
+                    postbuild.as_ref().map(|p| p.as_slice()),
+                );
                 list.ResourceBarrier(&[uav_barrier(None)]);
+            }
+            if let Some((uav_buf, _, rb_buf)) = &compact_info {
+                if !new_queries.is_empty() {
+                    list.ResourceBarrier(&[transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let off = (first_slot as u64) * 8;
+                    let len = (new_queries.len() as u64) * 8;
+                    list.CopyBufferRegion(rb_buf, off, uav_buf, off, len);
+                    list.ResourceBarrier(&[transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                } else {
+                    list.ResourceBarrier(&[transition(
+                        uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
             }
             list.ResourceBarrier(&[transition(
                 &verts_buf,
@@ -2403,21 +2610,168 @@ fn record_static_upgrades(
         state.free_lists.push((allocator, list));
         return None;
     }
-    for &(_, guest_key, host_va) in &built_items {
+    sub.compact_queries.extend(new_queries);
+    for &(_, guest_key, host_va, _, _) in &built_items {
         state.insert_blas_hash(guest_key, host_va);
     }
     let upg_geoms: u64 = built_items
         .iter()
-        .map(|&(idx, _, _)| prepared[idx].host_geoms.len() as u64)
+        .map(|&(idx, _, _, _, _)| prepared[idx].host_geoms.len() as u64)
         .sum();
     let upg_non_opaque: u64 = built_items
         .iter()
-        .flat_map(|&(idx, _, _)| prepared[idx].host_geoms.iter())
+        .flat_map(|&(idx, _, _, _, _)| prepared[idx].host_geoms.iter())
         .filter(|g| (g.Flags.0 & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE.0) == 0)
         .count() as u64;
     STATS[STAT_UPG_GEOMS].fetch_add(upg_geoms, Ordering::Relaxed);
     STATS[STAT_UPG_NON_OPAQUE].fetch_add(upg_non_opaque, Ordering::Relaxed);
     STATS[STAT_UPGRADED_STATIC].fetch_add(built_items.len() as u64, Ordering::Relaxed);
+    let out: ID3D12CommandList = list.cast().ok()?;
+    sub.lists.push((allocator, list));
+    Some(out)
+}
+
+/// Drains up to `MAX_COMPACTIONS_PER_SUB` queued static BLAS compactions, copies them
+/// into smaller slab slices via `COPY_MODE_COMPACT`, updates `AS_MAP` and the GPU hash
+/// table, and retires the old uncompacted slices under the `tlas_build_epoch + 2` invariant.
+fn record_static_compactions(
+    host: &Host,
+    state: &mut DxrState,
+    sub: &mut DxrSubmission,
+) -> Option<ID3D12CommandList> {
+    const ALLOW_COMPACTION: u32 =
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION.0 as u32;
+    struct PreparedCompaction {
+        guest_key: u64,
+        generation: u64,
+        src_va: u64,
+        dst_buf: ID3D12Resource,
+        dst_slice: SlabSlice,
+        dst_va: u64,
+        flags: u32,
+    }
+    let mut batch: Vec<PreparedCompaction> = Vec::new();
+    {
+        let map = as_map().read().unwrap_or_else(|e| e.into_inner());
+        while batch.len() < MAX_COMPACTIONS_PER_SUB {
+            let Some((guest_key, generation, compacted_size)) = state.pending_compactions.pop_front() else {
+                break;
+            };
+            if batch.iter().any(|b| b.guest_key == guest_key) {
+                continue;
+            }
+            let Some(entry) = map.get(&guest_key) else {
+                continue;
+            };
+            if entry.kind != AsKind::Blas
+                || !entry.built
+                || entry.generation != generation
+                || (entry.flags & ALLOW_COMPACTION) == 0
+                || !should_compact(entry.slice.size, compacted_size)
+            {
+                continue;
+            }
+            let Some((dst_buf, dst_slice, dst_va)) = state.slabs.alloc(host, compacted_size) else {
+                break;
+            };
+            if dst_slice.size >= entry.slice.size {
+                SlabAllocator::free_in_slabs(&mut state.slabs.slabs, dst_slice);
+                continue;
+            }
+            batch.push(PreparedCompaction {
+                guest_key,
+                generation,
+                src_va: entry.gpu_va,
+                dst_buf,
+                dst_slice,
+                dst_va,
+                flags: entry.flags & !ALLOW_COMPACTION,
+            });
+        }
+    }
+    if batch.is_empty() {
+        return None;
+    }
+
+    let Some((allocator, list)) = state.take_list(host) else {
+        for item in batch {
+            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+        }
+        return None;
+    };
+    name(&list, || "victory dxr static compact".into());
+    let Ok(list4) = list.cast::<ID3D12GraphicsCommandList4>() else {
+        for item in batch {
+            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+        }
+        state.free_lists.push((allocator, list));
+        return None;
+    };
+
+    // SAFETY: idle allocator/list; all source and destination AS slabs stay resident and
+    // source slices remain unretired until `tlas_build_epoch + 2` and `sub_seq + 2`.
+    let recorded: windows::core::Result<()> = unsafe {
+        (|| {
+            allocator.Reset()?;
+            list.Reset(&allocator, None)?;
+            for item in &batch {
+                list4.CopyRaytracingAccelerationStructure(
+                    item.dst_va,
+                    item.src_va,
+                    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+                );
+            }
+            list.ResourceBarrier(&[uav_barrier(None)]);
+            list.Close()
+        })()
+    };
+    if let Err(e) = recorded {
+        tracing::warn!(error = %e, "dxr: static BLAS compaction list failed");
+        for item in batch {
+            SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+        }
+        state.free_lists.push((allocator, list));
+        return None;
+    }
+
+    let mut swapped = 0u64;
+    {
+        let mut map = as_map().write().unwrap_or_else(|e| e.into_inner());
+        for item in &batch {
+            let Some(cur) = map.get(&item.guest_key) else {
+                SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+                continue;
+            };
+            if cur.generation != item.generation {
+                SlabAllocator::free_in_slabs(&mut state.slabs.slabs, item.dst_slice);
+                continue;
+            }
+            // Preserve `generation` so any in-flight multi-geometry upgrade decoded from
+            // Frame-0 readback still replaces a compacted Frame-0 BLAS cleanly.
+            let old = cur.clone();
+            map.insert(
+                item.guest_key,
+                HostAs {
+                    buffer: item.dst_buf.clone(),
+                    slice: item.dst_slice,
+                    gpu_va: item.dst_va,
+                    kind: AsKind::Blas,
+                    flags: item.flags,
+                    num_instances: 0,
+                    built: true,
+                    generation: old.generation,
+                    topo_hash: old.topo_hash,
+                    update_scratch_bytes: old.update_scratch_bytes,
+                },
+            );
+            state.retire_as(&old);
+            state.insert_blas_hash(item.guest_key, item.dst_va);
+            swapped += 1;
+        }
+    }
+    if swapped > 0 {
+        STATS[STAT_COMPACTED].fetch_add(swapped, Ordering::Relaxed);
+    }
     let out: ID3D12CommandList = list.cast().ok()?;
     sub.lists.push((allocator, list));
     Some(out)
@@ -2528,6 +2882,8 @@ fn record_ops(
     let mut hash_in_srv = false;
     let mut host_inst_in_srv = false;
     let mut extract_in_srv = false;
+    let compact_start_slot = sub.compact_queries.len();
+    let mut compact_uav_active: Option<(ID3D12Resource, ID3D12Resource)> = None;
     let mut recorded_any = false;
 
     // SAFETY: allocator/list are idle; all buffers referenced are kept in `sub` or slabs.
@@ -2577,6 +2933,7 @@ fn record_ops(
                             *dest_va,
                             *size_bytes,
                             &mut extract_in_srv,
+                            &mut compact_uav_active,
                         ) {
                             recorded_any = true;
                         }
@@ -2611,16 +2968,42 @@ fn record_ops(
                     }
                 }
             }
+            if let Some((uav_buf, rb_buf)) = compact_uav_active.take() {
+                let count = sub.compact_queries.len().saturating_sub(compact_start_slot);
+                if count > 0 {
+                    list.ResourceBarrier(&[transition(
+                        &uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let off = (compact_start_slot as u64) * 8;
+                    let len = (count as u64) * 8;
+                    list.CopyBufferRegion(&rb_buf, off, &uav_buf, off, len);
+                    list.ResourceBarrier(&[transition(
+                        &uav_buf,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                } else {
+                    list.ResourceBarrier(&[transition(
+                        &uav_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
             list.Close()
         })()
     };
 
     if let Err(e) = res {
         tracing::warn!(error = %e, "dxr: command list recording failed");
+        sub.compact_queries.truncate(compact_start_slot);
         state.free_lists.push((allocator, list));
         return None;
     }
     if !recorded_any {
+        sub.compact_queries.truncate(compact_start_slot);
         state.free_lists.push((allocator, list));
         return None;
     }
@@ -3011,6 +3394,7 @@ unsafe fn record_extract_static_blas(
     dest_va: u64,
     size_bytes: u64,
     extract_in_srv: &mut bool,
+    compact_uav_active: &mut Option<(ID3D12Resource, ID3D12Resource)>,
 ) -> bool {
     let key = dest_va & !0xFF;
     if key == 0 {
@@ -3063,7 +3447,7 @@ unsafe fn record_extract_static_blas(
             },
         },
     };
-    let build_flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    let build_flags = static_blas_build_flags();
     let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
         Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
         Flags: build_flags,
@@ -3179,13 +3563,43 @@ unsafe fn record_extract_static_blas(
         )]);
         *extract_in_srv = true;
 
+        let compact_postbuild = if compact_static_blas()
+            && sub.compact_queries.len() < COMPACT_INFO_SLOTS
+            && let Some((uav_buf, uav_gpu, rb_buf)) = sub.ensure_compact_info(host)
+        {
+            if compact_uav_active.is_none() {
+                list.ResourceBarrier(&[transition(
+                    &uav_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                *compact_uav_active = Some((uav_buf, rb_buf));
+            }
+            let slot = sub.compact_queries.len() as u32;
+            sub.compact_queries.push(CompactQueryRecord {
+                guest_key: key,
+                generation: host_dst.generation,
+                uncompacted_size: host_dst.slice.size,
+                slot,
+            });
+            Some([D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                DestBuffer: uav_gpu + u64::from(slot) * 8,
+                InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+            }])
+        } else {
+            None
+        };
+
         let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: host_dst.gpu_va,
             Inputs: inputs,
             SourceAccelerationStructureData: 0,
             ScratchAccelerationStructureData: scratch_gpu,
         };
-        list4.BuildRaytracingAccelerationStructure(&desc, None);
+        list4.BuildRaytracingAccelerationStructure(
+            &desc,
+            compact_postbuild.as_ref().map(|p| p.as_slice()),
+        );
         list.ResourceBarrier(&[uav_barrier(None)]);
     }
     state.insert_blas_hash(key, host_dst.gpu_va);
@@ -3896,5 +4310,48 @@ mod tests {
         assert_eq!(dynamic_geom_flags(opaque.0 as u32), opaque);
         assert_eq!(dynamic_geom_flags((opaque | no_dup).0 as u32), opaque | no_dup);
         assert_eq!(static_geom_flags(false), no_dup);
+    }
+
+    #[test]
+    fn should_compact_filters_trivial_and_invalid_savings() {
+        // Zero, equal, or larger compacted sizes are rejected.
+        assert!(!should_compact(65_536, 0));
+        assert!(!should_compact(65_536, 65_536));
+        assert!(!should_compact(65_536, 70_000));
+        // Saving <= 4 KiB (even after 256B alignment) is rejected.
+        assert!(!should_compact(16_384, 12_288));
+        assert!(!should_compact(16_384, 12_033)); // aligns to 12_288 -> saves 4096
+        // Small BLAS saving > 4 KiB and >= 10% compacts.
+        assert!(should_compact(16_384, 8_192));
+        assert!(should_compact(65_536, 32_768));
+        // Large BLAS saving only 8 KiB (< 10% and < 64 KiB) is skipped.
+        assert!(!should_compact(1 << 20, (1 << 20) - 8192));
+        // Large BLAS saving >= 64 KiB compacts even if under 10%.
+        assert!(should_compact(4 << 20, (4 << 20) - 128 * 1024));
+    }
+
+    #[test]
+    fn compaction_retires_old_blas_slice_until_tlas_epoch_plus_two() {
+        let mut alloc = SlabAllocator::<usize>::default();
+        let make = |_slab_size: u64, slab_idx: usize| -> Option<(usize, u64)> {
+            Some((slab_idx, (slab_idx as u64 + 1) << 32))
+        };
+
+        // Simulate uncompacted static BLAS (256 KiB) followed by async compaction to 128 KiB.
+        let (_, uncompacted, _) = alloc.alloc_with(256 * 1024, make).unwrap();
+        assert!(should_compact(uncompacted.size, 128 * 1024));
+        let (_, compacted, _) = alloc.alloc_with(128 * 1024, make).unwrap();
+        assert_eq!(compacted.offset, 256 * 1024);
+        assert_eq!(compacted.size, 128 * 1024);
+
+        // Old uncompacted slice retired at tlas_epoch=5, sub_seq=10 -> releases at (7, 12).
+        alloc.retire(uncompacted, 7, 12);
+        assert_eq!(alloc.drain_retired(6, 12), 0);
+        assert_eq!(alloc.drain_retired(7, 11), 0);
+        assert_eq!(alloc.drain_retired(7, 12), 1);
+
+        // Reclaimed 256 KiB hole is immediately reused by the next static BLAS allocation.
+        let (_, reused, _) = alloc.alloc_with(256 * 1024, make).unwrap();
+        assert_eq!(reused, uncompacted);
     }
 }
